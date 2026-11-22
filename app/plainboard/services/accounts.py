@@ -34,7 +34,7 @@ from . import permissions
 from . import settings as settings_service
 from . import users as user_service
 from .errors import NotFound, ServiceError
-from .model_choice import equivalent_model
+from . import model_choice
 
 AUTH_MODES = {"claude_code": ("oauth_token", "api_key", "runner_login"), "codex": ("chatgpt", "api_key")}
 # Every other provider is an endpoint (ProviderInfo.endpoint): which ones exist is the runner's list, not the app's.
@@ -366,18 +366,21 @@ async def route(session: AsyncSession, agent: Agent, catalog: list[ProviderInfo]
     """The provider and models for the agent's next turn. Its own, unless the installation switches
     providers (setting ``switch_providers``), every subscription the agent may use on its own provider
     is used up, and another provider has a subscription with room the agent may use: then that
-    provider, with its models of the same size (``model_choice.equivalent_model``). Of several such
+    provider, with its models of the same class and strength (``model_choice.models_of``, which
+    also chooses the model of an agent that names none on its own provider). Of several such
     providers, the first in the runner's list. An agent or project that names its subscription stays
     on it, and API keys are never switched to (they cost money per token). Endpoints are no target:
     which of their models is as good is not known. The account for the turn: ``account_for``."""
-    own = Route(agent.provider, agent.model, agent.summary_model)
-    if not catalog or not await settings_service.get(session, "switch_providers"):
+    values = await settings_service.get_all(session)
+    classes, summary_strength = values["model_classes"], values["default_summary_strength"]
+    own = Route(agent.provider, *model_choice.models_of(agent, catalog, classes, agent.provider, summary_strength))
+    if not catalog or not values["switch_providers"]:
         return own
     project = await session.get(Project, agent.project_id)
     if agent.account_id or (project is not None and project.account_id):
         return own
     found = await limits_service.windows(session)
-    mine = await _candidates(session, agent.provider, agent)
+    mine = await _candidates(session, agent.provider, agent, own.model)
     if not mine or not all(used_up_now(a, found) for a in mine):
         return own
     for provider in catalog:
@@ -387,8 +390,7 @@ async def route(session: AsyncSession, agent: Agent, catalog: list[ProviderInfo]
         if free:
             return Route(
                 provider.name,
-                equivalent_model(catalog, agent.model, provider.name) or agent.model,
-                equivalent_model(catalog, agent.summary_model, provider.name) or agent.summary_model,
+                *model_choice.models_of(agent, catalog, classes, provider.name, summary_strength),
                 switched=True,
                 efforts=tuple(provider.efforts),
             )
@@ -455,10 +457,10 @@ async def pick(
     return best if -rank(best)[1] > -rank(last)[1] * MARGIN else last
 
 
-async def other_with_room(session: AsyncSession, provider: str, agent: Agent, conv: Conversation | None, used_up: str) -> Account | None:
-    """Another account for a turn the account ``used_up`` (by key) was turned away on; None if
-    there is none that is not used up as well."""
-    account = await pick(session, provider, agent, conv)
+async def other_with_room(session: AsyncSession, provider: str, agent: Agent, conv: Conversation | None, used_up: str, model: str | None = None) -> Account | None:
+    """Another account for a turn (on ``model``) the account ``used_up`` (by key) was turned away on;
+    None if there is none that is not used up as well."""
+    account = await pick(session, provider, agent, conv, model=model)
     if account is None or account.key == used_up or used_up_now(account, await limits_service.windows(session)):
         return None
     return account

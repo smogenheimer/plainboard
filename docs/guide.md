@@ -150,12 +150,23 @@ The set-up asks for these; later they are under **PlainBoard settings → Subscr
   every subscription is used up.
 - **Settings → General → Switch to another provider when a subscription is used up**: an agent whose
   own provider has no subscription with room runs on another provider's subscription (Codex is used
-  up: Claude takes over), on that provider's model of the same size, until its own is free again. The
+  up: Claude takes over), on that provider's model of the same class and strength, until its own is
+  free again. The
   other provider cannot take up the session, so the agent starts from the conversation's summary and
   its last messages. Agents and projects that name their subscription stay on it, and API keys are
   never switched to. Off (the default): the agent waits until its own provider is free again.
 - A project can name the subscription its agents run on (**Project settings → Team**), and an agent
   can have its own (**Team**).
+- **A model, or a class and a strength.** An agent names its model, or leaves the choice to
+  PlainBoard (**Team → Model → By strength**): then it names a strength (small, medium, large, extra
+  large) and a class, what the model is for (allround, coding, vision, or a class of your own). It
+  runs on its provider's best model of that class and strength; if the class has none that strong,
+  on the next smaller one. The same rule finds the model on another provider. **Settings → Models**
+  holds the classes: a score from 0 to 100 per model says that it belongs to a class and how good it
+  is in it, so an all-round model can be the better vision model. You keep the scores; **Fill empty
+  scores from Arena** reads Arena's public leaderboards once as a start and never changes a score
+  you gave. Nothing is measured while agents work. New agents get a class and a strength instead of
+  a model where the defaults there say so. The thinking effort is separate from all of this.
 - An admin can limit a project to some subscriptions (**Project settings → Team → Subscriptions this
   project may use**). Its agents then run on those only: no choice inside the project gets around
   it, and a used-up subscription is not replaced by one from outside. For a project you share with

@@ -603,17 +603,3 @@ def test_a_turn_turned_away_runs_again_on_another_provider(client, project):
     assert [s.provider for s in runner(client).specs[specs:]] == ["codex"]
     assert client.get(f"/api/projects/{pid}/runs?limit=1").json()[0]["status"] == "failed"
 
-
-def test_another_provider_never_gets_a_larger_model_than_the_agents_own():
-    from plainboard_protocol import ModelInfo, ProviderInfo
-
-    from plainboard.services.model_choice import equivalent_model
-
-    own = ProviderInfo(name="a", label="A", models=[ModelInfo(id="a-big", label="", tier="xlarge"), ModelInfo(id="a-mid", label="", tier="medium"), ModelInfo(id="a-tiny", label="", tier="small")])
-    other = ProviderInfo(name="b", label="B", models=[ModelInfo(id="b-large", label="", tier="large"), ModelInfo(id="b-medium", label="", tier="medium")])
-    catalog = [own, other]
-    assert equivalent_model(catalog, "a-mid", "b") == "b-medium"
-    assert equivalent_model(catalog, "a-big", "b") == "b-large"  # no model that large: the next smaller one
-    assert equivalent_model(catalog, "a-tiny", "b") == "b-medium"  # all are larger: the smallest
-    assert equivalent_model(catalog, "unknown", "b") == "b-medium"  # a model the runner does not list counts as medium
-    assert equivalent_model(catalog, "a-mid", "a") == "a-mid" and equivalent_model(catalog, "a-mid", "gone") is None

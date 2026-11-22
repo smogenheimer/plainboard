@@ -463,18 +463,24 @@ class SecretOut(ORM):
 # --- agents ---------------------------------------------------------------------------------
 
 
+Strength = Literal["small", "medium", "large", "xlarge", ""]  # "": none
+
+
 class AgentCreate(BaseModel):
     name: str = Field(min_length=1, max_length=100)
     role: str = ""
     description: str = ""
     instructions: str = ""
     provider: str | None = None
-    model: str | None = None
+    model: str | None = None  # "": by class and strength
+    model_class: str | None = None  # "" or None: allround
+    strength: Strength | None = None
     effort: str | None = None
     toolset: ToolsetName = "full"
     context_limit_tokens: int | None = Field(default=None, ge=5000)
     keep_recent_messages: int | None = Field(default=None, ge=0, le=50)
-    summary_model: str | None = None
+    summary_model: str | None = None  # "": by strength
+    summary_strength: Strength | None = None
     summary_effort: str | None = None  # "" or None: the installation's
     max_turns: int | None = Field(default=None, ge=1)
     color: str | None = None
@@ -490,12 +496,15 @@ class AgentUpdate(BaseModel):
     description: str | None = None
     instructions: str | None = None
     provider: str | None = None
-    model: str | None = None
+    model: str | None = None  # "": by class and strength
+    model_class: str | None = None  # "" or None: allround
+    strength: Strength | None = None
     effort: str | None = None
     toolset: ToolsetName | None = None
     context_limit_tokens: int | None = Field(default=None, ge=5000)
     keep_recent_messages: int | None = Field(default=None, ge=0, le=50)
-    summary_model: str | None = None
+    summary_model: str | None = None  # "": by strength
+    summary_strength: Strength | None = None
     summary_effort: str | None = None  # "" or None: the installation's
     max_turns: int | None = Field(default=None, ge=1)
     enabled: bool | None = None
@@ -517,11 +526,14 @@ class AgentOut(ORM):
     instructions: str
     provider: str
     model: str
+    model_class: str | None
+    strength: str | None
     effort: str | None
     toolset: str
     context_limit_tokens: int
     keep_recent_messages: int
     summary_model: str
+    summary_strength: str | None
     summary_effort: str | None
     max_turns: int | None
     enabled: bool

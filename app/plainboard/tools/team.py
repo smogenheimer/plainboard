@@ -15,8 +15,10 @@ from ..services import accounts as account_service
 from ..services import agents as agent_service
 from ..services import board as board_service
 from ..services import landings as landing_service
+from ..services import model_choice
 from ..services import projects as project_service
 from ..services import repositories as repo_service
+from ..services import settings as settings_service
 from ..services.errors import NotFound
 from ..orchestration.context import render_message
 from ..orchestration.runner_client import RunnerError
@@ -35,7 +37,9 @@ class CreateAgentArgs(BaseModel):
     description: str = Field(description="Area of responsibility; keep it narrow")
     instructions: str = Field(default="", description="Extra standing instructions")
     provider: str | None = Field(default=None, description="a provider of list_models; default from settings")
-    model: str | None = Field(default=None, description="Model id of that provider; default from settings")
+    model: str | None = Field(default=None, description="Model id of that provider; default from settings. Or leave it out and give strength")
+    model_class: str | None = Field(default=None, description="What the model is for: a class of list_models; default allround")
+    strength: Literal["small", "medium", "large", "xlarge"] | None = Field(default=None, description="Model size instead of a model: the best of that class and size is chosen")
     effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
     toolset: ToolsetName = Field(default="full", description="full = coding agent; board = coordination and small tasks, smaller prompt")
     context_limit_tokens: int | None = Field(default=None, ge=5000, description="Compress context above this size")
@@ -49,7 +53,9 @@ class UpdateAgentArgs(BaseModel):
     description: str | None = None
     instructions: str | None = None
     provider: str | None = Field(default=None, description="a provider of list_models")
-    model: str | None = None
+    model: str | None = Field(default=None, description="'' = choose by model_class and strength")
+    model_class: str | None = None
+    strength: Literal["small", "medium", "large", "xlarge"] | None = None
     effort: Literal["low", "medium", "high", "xhigh", "max"] | None = None
     toolset: ToolsetName | None = None
     context_limit_tokens: int | None = Field(default=None, ge=5000)
@@ -122,10 +128,10 @@ async def _catalog(ctx: ToolContext, provider: str | None) -> list[ProviderInfo]
     return catalog
 
 
-CLASSES = ("xlarge", "large", "medium", "small")  # strongest first
+STRONGEST_FIRST = tuple(reversed(model_choice.SIZES))
 
 
-@tool("list_models", "The models an agent can run on, per provider, each with its class (xlarge > large > medium > small).", roles=(MANAGER,))
+@tool("list_models", "The models an agent can run on, per provider, each with its strength (xlarge > large > medium > small), and the model classes.", roles=(MANAGER,))
 async def list_models(ctx: ToolContext, _args) -> str:
     try:
         catalog = await account_service.catalog(ctx.session, await ctx.runs.runner.providers())
@@ -134,9 +140,13 @@ async def list_models(ctx: ToolContext, _args) -> str:
     subscribed = {a.provider for a in await account_service.list_accounts(ctx.session) if a.enabled}
     lines = []
     for provider in catalog:
-        models = sorted(provider.models, key=lambda m: CLASSES.index(m.tier) if m.tier in CLASSES else len(CLASSES))
+        models = sorted(provider.models, key=lambda m: STRONGEST_FIRST.index(m.tier) if m.tier in STRONGEST_FIRST else len(STRONGEST_FIRST))
         listed = ", ".join(f"{m.id} ({m.tier})" for m in models) or "-"
         lines.append(f"{provider.name}{'' if provider.name in subscribed else ' [no subscription set up]'}: {listed}")
+    classes = model_choice.clean(await settings_service.get(ctx.session, "model_classes"))
+    for name, scores in classes.items():  # a class nobody scored holds every model
+        best = sorted(((score, model) for per in scores.values() for model, score in per.items()), reverse=True)
+        lines.append(f"class {name}: " + (", ".join(f"{model} {score:g}" for score, model in best) or "every model"))
     return "\n".join(lines) or "No provider."
 
 
@@ -147,7 +157,7 @@ async def list_agents(ctx: ToolContext, _args) -> str:
     repos = await repo_service.list_for_project(ctx.session, ctx.project.id)
     names = {a.id: ", ".join(r.name for r in repo_service.accessible(a, repos)) for a in agents}
     return "\n".join(
-        f"{a.slug} | {a.name} | {a.role} | {a.model} | {a.status}{'' if a.enabled else ' (disabled)'} | {truncate(a.description, 120)}"
+        f"{a.slug} | {a.name} | {a.role} | {model_choice.label(a)} | {a.status}{'' if a.enabled else ' (disabled)'} | {truncate(a.description, 120)}"
         + (f" | repos: {names[a.id] or 'none'}" if repos and not a.is_manager else "")
         for a in outs
     )
@@ -166,7 +176,7 @@ async def create_agent(ctx: ToolContext, args: CreateAgentArgs) -> str:
     access = await apply_repo_access(ctx, agent, args.repositories) if args.repositories is not None else "all repositories"
     members = len([a for a in await agent_service.list_for_project(ctx.session, ctx.project.id) if not a.is_manager])
     crowded = " Each member starts without context and adds handovers: keep the team to those whose area nobody else covers." if members > 4 else ""
-    return f"Created agent {agent.slug} ({agent.model}; {access}). The team now has {members} members.{crowded}"
+    return f"Created agent {agent.slug} ({model_choice.label(agent)}; {access}). The team now has {members} members.{crowded}"
 
 
 @tool("update_agent", "Change an agent's configuration (model, role, instructions, enabled ...).", UpdateAgentArgs, roles=(MANAGER,))

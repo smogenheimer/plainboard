@@ -13,7 +13,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..models import Account, Agent, Assignment, Landing, TrainStatus, AssignmentStatus, Comment, Conversation, FlowEvent, InboxItem, Message, Run, RunStatus, Task, TaskStatus, TaskTransition, Train, utcnow
 from ..schemas import StatsAgent, StatsDay, StatsOut, StatsPeriod, StatsVersion
 from . import version as version_service
-from . import timing
+from . import model_choice, timing
 
 
 async def overview(session: AsyncSession, project_id: int, days: int = 30, now: datetime | None = None) -> StatsOut:
@@ -242,7 +242,7 @@ async def work_report(session: AsyncSession, project_id: int, days: int = 14) ->
                 "manager": a.is_manager,
                 "enabled": a.enabled,
                 "provider": a.provider,
-                "model": a.model,
+                "model": model_choice.label(a),
                 "effort": a.effort,
                 "toolset": a.toolset,
                 "instruction_chars": len(a.instructions),

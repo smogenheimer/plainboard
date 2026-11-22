@@ -75,10 +75,10 @@ LOGIN_TIMEOUT_SECONDS = 15 * 60
 MODELS_TTL_SECONDS = 3600
 
 MODELS = [
-    ModelInfo(id="gpt-6.1-sol", label="GPT-6.1 Sol", tier="large"),
-    ModelInfo(id="gpt-6-astra", label="GPT-6 Astra", tier="xlarge"),
-    ModelInfo(id="gpt-6.1-terra", label="GPT-6.1 Terra", tier="medium"),
-    ModelInfo(id="gpt-6-luna", label="GPT-6 Luna", tier="small"),
+    ModelInfo(id="gpt-6.1-sol", label="GPT-6.1 Sol", tier="large", arena="GPT-6.1 Sol"),
+    ModelInfo(id="gpt-6-astra", label="GPT-6 Astra", tier="xlarge", arena="GPT-6 Astra"),
+    ModelInfo(id="gpt-6.1-terra", label="GPT-6.1 Terra", tier="medium", arena="GPT-6.1 Terra"),
+    ModelInfo(id="gpt-6-luna", label="GPT-6 Luna", tier="small", arena="GPT-6 Luna"),
 ]
 TIER_HINTS = {"astra": "xlarge", "sol": "large", "terra": "medium", "luna": "small"}
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]

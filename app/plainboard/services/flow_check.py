@@ -41,7 +41,7 @@ from ..models import (
     TrainStatus,
     utcnow,
 )
-from . import own_notes
+from . import model_choice, own_notes
 from .timing import duration
 from .util import truncate
 
@@ -366,7 +366,7 @@ async def _cost(session, project_id, agents, since, now) -> list[Finding]:
             "cost",
             45,
             f"{agent.name} made {round(100 * cost / total)} % of the cost (${cost:.0f} of ${total:.0f})",
-            f"Model {agent.model}, effort {agent.effort or 'default'}, {round((context or 0) / 1000)}k tokens of context per turn on average.",
+            f"Model {model_choice.label(agent)}, effort {agent.effort or 'default'}, {round((context or 0) / 1000)}k tokens of context per turn on average.",
             "Every turn re-reads its context: order its work in smaller pieces, and check whether all of it needs that model and effort (update_agent, or effort per assignment).",
         )
     ]

@@ -13,8 +13,10 @@ from ..orchestration.prompts import PINNED_BUDGET_CHARS
 from ..schemas import AccessKeyOut, CheckOut, LimitsOut, PauseOut, PublicApiKeyIn, SettingsOut, SettingsUpdate, UsageOut
 from ..services import access_keys as access_key_service
 from ..services import accounts as account_service
+from ..services import arena as arena_service
 from ..services import db_read as db_read_service
 from ..services import limits as limits_service
+from ..services import model_choice
 from ..services import pause as pause_service
 from ..services import settings as settings_service
 from ..services import usage as usage_service
@@ -149,6 +151,24 @@ async def put_settings(body: SettingsUpdate, session: Session, runs: Runs, reque
     if "update_check" in body.values:
         background.add_task(request.app.state.updates.tick)  # switched on: don't wait hours for the first answer
     return await get_settings(session)
+
+
+class ModelClassesIn(BaseModel):
+    classes: dict[str, Any] | None = None  # as the form holds them, saved or not
+
+
+@router.post("/settings/model-classes/arena")
+async def fill_model_classes(body: ModelClassesIn, runner: Runner) -> dict[str, Any]:
+    """The classes with their empty scores filled from Arena's leaderboards. Nothing is saved: the
+    form shows the result, and the user keeps or changes it."""
+    try:
+        classes = model_choice.clean(body.classes)
+        catalog = await runner.providers()
+    except ValueError as exc:
+        raise ServiceError(str(exc)) from exc
+    except RunnerError as exc:
+        raise ServiceError("The models cannot be read right now: the runner does not answer.") from exc
+    return {"classes": model_choice.fill(classes, catalog, await arena_service.ratings(model_choice.FIXED))}
 
 
 class SshKeyIn(BaseModel):

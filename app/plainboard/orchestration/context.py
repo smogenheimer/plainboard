@@ -199,6 +199,8 @@ class ContextManager:
         values = await settings_service.get_all(session)
         # The summary is written where the agent's turns run right now: its own provider may be used up.
         route = await account_service.route(session, agent, await self.runners.catalog())
+        if not route.summary_model:  # chosen by strength, and the providers cannot be read right now: next time
+            return False
         account = await account_service.account_for(session, route, agent, conv, summary=True)
         credentials = settings_service.credentials(values, account=account_service.fields(account))
         summary = conv.summary
@@ -235,7 +237,7 @@ class ContextManager:
             role="system",
             kind="summary",
             content=summary or "",
-            meta={"tokens_before": tokens_before, "covered_until": conv.summary_until_message_id, "model": agent.summary_model},
+            meta={"tokens_before": tokens_before, "covered_until": conv.summary_until_message_id, "model": route.summary_model},
         )
         session.add(marker)
         await session.commit()

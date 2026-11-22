@@ -104,11 +104,11 @@ SLOW_TOOL_SECONDS = 120
 TIMED_TOOLS = ("start_job", "wait_job", "ask_agent")
 
 MODELS = [
-    ModelInfo(id="claude-opus-5-5", label="Claude Opus 5.5", tier="large"),
-    ModelInfo(id="claude-sonnet-5-5", label="Claude Sonnet 5.5", tier="medium"),
-    ModelInfo(id="claude-haiku-5-5", label="Claude Haiku 5.5", tier="small"),
-    ModelInfo(id="claude-fable-5-2", label="Claude Fable 5.2", tier="xlarge"),
-    ModelInfo(id="claude-fable-5-1", label="Claude Fable 5.1", tier="xlarge"),
+    ModelInfo(id="claude-opus-5-5", label="Claude Opus 5.5", tier="large", arena="Claude Opus 5.5"),
+    ModelInfo(id="claude-sonnet-5-5", label="Claude Sonnet 5.5", tier="medium", arena="Claude Sonnet 5.5"),
+    ModelInfo(id="claude-haiku-5-5", label="Claude Haiku 5.5", tier="small", arena="Claude Haiku 5.5"),
+    ModelInfo(id="claude-fable-5-2", label="Claude Fable 5.2", tier="xlarge", arena="Claude Fable 5.2"),
+    ModelInfo(id="claude-fable-5-1", label="Claude Fable 5.1", tier="xlarge", arena="Claude Fable 5.1"),
 ]
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
 # What Claude Code says when a turn is turned away because a plan limit is used up, e.g. "You've hit

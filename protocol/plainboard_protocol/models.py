@@ -17,6 +17,7 @@ class ModelInfo(BaseModel):
     id: str
     label: str
     tier: Literal["small", "medium", "large", "xlarge"] = "medium"
+    arena: str | None = None  # what Arena's leaderboards call the model, without the effort in brackets
 
 
 class EndpointInfo(BaseModel):

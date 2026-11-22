@@ -705,6 +705,25 @@
     "filter": "Filter",
     "testNeedsModel": "Name a model first"
   },
+  "modelChoice": {
+    "byStrength": "By strength: PlainBoard chooses the model",
+    "strength": "Strength",
+    "strengthDefault": "Strength: the one from the PlainBoard settings",
+    "size": { "small": "Small", "medium": "Medium", "large": "Large", "xlarge": "Extra large" },
+    "class": "Model class",
+    "classOption": "Class: {{name}}",
+    "classHint": "What the model is for. It decides which model is chosen by strength, and which one stands in on another provider.",
+    "classesTitle": "Model classes",
+    "classesHint": "A score from 0 to 100 says a model belongs to a class and how good it is in it; empty: it does not belong. Of the models of one strength the highest score is chosen. A class without any score holds every model.",
+    "model": "Model",
+    "scoreOf": "Score of {{model}} in {{name}}",
+    "newClass": "New class, e.g. research",
+    "addClass": "Add class",
+    "removeClass": "Remove the class {{name}}",
+    "arena": "Fill empty scores from Arena",
+    "arenaBusy": "Reading Arena…",
+    "arenaHint": "Reads Arena's public leaderboards once (text, web development, vision) and fills only the empty fields of allround, coding and vision. Nothing is saved until you save, and nothing about this installation is sent."
+  },
   "settings": {
     "memberChat": "Allow direct messages to members",
     "memberChatHint": "Off: you talk to the manager, and members' conversations can only be read. Agents still talk to each other, and schedules and assignments are not affected.",

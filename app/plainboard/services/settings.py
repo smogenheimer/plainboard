@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import os
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Any
 
@@ -13,6 +14,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..models import Setting
 from ..security import decrypt, encrypt
+from . import model_choice
 
 
 @dataclass(frozen=True)
@@ -21,6 +23,15 @@ class SettingDef:
     secret: bool = False
     env: str | None = None  # environment fallback
     managed: bool = False  # set by its own endpoint, not through the settings form
+    clean: Callable[[Any], Any] | None = None  # checks a new value and gives it its stored form; ValueError if it is none
+
+
+def _strength(value: Any) -> str | None:
+    if value in (None, ""):
+        return None
+    if value not in model_choice.SIZES:
+        raise ValueError(f"Unknown strength: {value}")
+    return value
 
 
 SETTINGS: dict[str, SettingDef] = {
@@ -34,6 +45,15 @@ SETTINGS: dict[str, SettingDef] = {
     "default_manager_model": SettingDef("claude-sonnet-5-5"),
     "default_worker_model": SettingDef("claude-sonnet-5-5"),
     "default_summary_model": SettingDef("claude-haiku-5-5"),
+    # New agents get a class and a strength instead of the model above, where a strength is set here
+    # (services/model_choice.py). The class: None is allround. Summaries are always allround.
+    "default_manager_class": SettingDef(None),
+    "default_worker_class": SettingDef(None),
+    "default_manager_strength": SettingDef(None, clean=_strength),
+    "default_worker_strength": SettingDef(None, clean=_strength),
+    "default_summary_strength": SettingDef(None, clean=_strength),
+    # class -> provider -> model -> score (0..100): which models belong to a class and how good each is in it.
+    "model_classes": SettingDef(None, clean=model_choice.clean),
     # How long a model thinks before it acts, by what it does. The manager has many short turns; a
     # member's turn is the work itself, and a summary is what an agent knows afterwards.
     "default_manager_effort": SettingDef("medium"),
@@ -96,6 +116,8 @@ async def update(session: AsyncSession, values: dict[str, Any], *, managed: bool
         if definition.managed and not managed:
             continue  # the form sends back what it was given; these have their own endpoint
         row = await session.get(Setting, key) or Setting(key=key, secret=definition.secret)
+        if definition.clean is not None:
+            value = definition.clean(value)
         if definition.secret:
             row.value = encrypt(value) if value else None
         else:

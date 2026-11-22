@@ -12,6 +12,7 @@ import { Button, ErrorText, Field, FieldRow, IconButton, Input, PageHead, Select
 import { useStored } from "../../lib/hooks";
 import { equivalentModel } from "../../lib/models";
 import { DefaultModels } from "./DefaultModels";
+import { ModelClasses } from "./ModelClasses";
 import { GithubTokenField } from "./GithubTokenField";
 import { AccountEditor } from "./AccountEditor";
 import { AccountsEditor } from "./AccountsEditor";
@@ -88,7 +89,7 @@ export function SettingsDialog({ open, onClose, section }: { open: boolean; onCl
     await save(["git_author_name", "git_author_email"], githubToken === null ? {} : { github_token: githubToken });
     setGithubToken(null);
   };
-  const MODELS = ["default_provider", "default_manager_model", "default_worker_model", "default_summary_model", "default_manager_effort", "default_worker_effort", "default_summary_effort", "default_context_limit", "default_keep_recent"];
+  const MODELS = ["default_provider", "default_manager_model", "default_worker_model", "default_summary_model", "default_manager_effort", "default_worker_effort", "default_summary_effort", "default_context_limit", "default_keep_recent", "default_manager_strength", "default_worker_strength", "default_summary_strength", "default_manager_class", "default_worker_class", "model_classes"];
   const PACE = ["max_parallel_runs", "manager_parallel_limit"];
   const GENERAL = ["timezone", "member_chat", "switch_providers", "update_check"];
   const CLEANUP = ["storage_notify_percent", "storage_emergency_percent", "cleanup", "cleanup_memory_free_percent"];
@@ -192,6 +193,7 @@ export function SettingsDialog({ open, onClose, section }: { open: boolean; onCl
                   <Input type="number" min={0} max={50} value={values.default_keep_recent ?? 6} onChange={(e) => set({ default_keep_recent: Number(e.target.value) })} />
                 </Field>
               </FieldRow>
+              <ModelClasses providers={providers} value={values.model_classes} onChange={(model_classes) => set({ model_classes })} />
               <SaveRow dirty={dirty(...MODELS)} onSave={() => save(MODELS)} />
             </div>
           ),

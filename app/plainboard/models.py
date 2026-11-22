@@ -335,12 +335,17 @@ class Agent(Timestamps, Base):
     description: Mapped[str] = mapped_column(Text, default="")  # area of responsibility
     instructions: Mapped[str] = mapped_column(Text, default="")  # extra system prompt
     provider: Mapped[str] = mapped_column(String(50), default="claude_code")
+    # The model, or "": then class and strength decide (services/model_choice.py). With a model
+    # they only say what stands in for it on another provider.
     model: Mapped[str] = mapped_column(String(100))
+    model_class: Mapped[str | None] = mapped_column(String(40))  # None: allround
+    strength: Mapped[str | None] = mapped_column(String(20))  # small..xlarge; None: the model's size
     effort: Mapped[str | None] = mapped_column(String(20))
     toolset: Mapped[str] = mapped_column(String(20), default="full")
     context_limit_tokens: Mapped[int] = mapped_column(Integer, default=350000)
     keep_recent_messages: Mapped[int] = mapped_column(Integer, default=6)
     summary_model: Mapped[str] = mapped_column(String(100), default="claude-haiku-5-5")
+    summary_strength: Mapped[str | None] = mapped_column(String(20))  # for a summary_model of ""; None: the installation's
     summary_effort: Mapped[str | None] = mapped_column(String(20))  # None: the installation's (default_summary_effort)
     max_turns: Mapped[int | None] = mapped_column(Integer)
     enabled: Mapped[bool] = mapped_column(Boolean, default=True)

@@ -122,11 +122,14 @@ export interface Agent {
   instructions: string;
   provider: string;
   model: string;
+  model_class: string | null;
+  strength: string | null;
   effort: string | null;
   toolset: Toolset;
   context_limit_tokens: number;
   keep_recent_messages: number;
   summary_model: string;
+  summary_strength: string | null;
   summary_effort: string | null;
   max_turns: number | null;
   enabled: boolean;

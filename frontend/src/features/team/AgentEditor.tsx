@@ -10,18 +10,36 @@ import { formatTokens } from "../../lib/format";
 import { equivalentModel } from "../../lib/models";
 import { useShell } from "../layout/shell-context";
 import { allowedAccounts, useUsableAccounts } from "../projects/ProjectAccounts";
+import { ClassSelect, StrengthSelect } from "./ModelChoice";
 
 const CUSTOM = "__custom__";
+const CHOSEN = "__chosen__";
 
-export function ModelSelect({ provider, value, onChange }: { provider?: ProviderInfo; value: string; onChange: (v: string) => void }) {
+/** A model of the provider. `chosen`/`onChosen`: no model, PlainBoard chooses one by strength (and class);
+    the option is offered where `onChosen` is given. */
+export function ModelSelect({
+  provider,
+  value,
+  onChange,
+  chosen = false,
+  onChosen,
+}: {
+  provider?: ProviderInfo;
+  value: string;
+  onChange: (v: string) => void;
+  chosen?: boolean;
+  onChosen?: (on: boolean) => void;
+}) {
   const { t } = useTranslation();
   const known = provider?.models.some((m) => m.id === value) ?? false;
   const [custom, setCustom] = useState(!known && !!value);
   return (
     <div className="space-y-1.5">
       <Select
-        value={custom ? CUSTOM : value}
+        value={chosen ? CHOSEN : custom ? CUSTOM : value}
         onChange={(e) => {
+          onChosen?.(e.target.value === CHOSEN);
+          if (e.target.value === CHOSEN) return;
           if (e.target.value === CUSTOM) setCustom(true);
           else {
             setCustom(false);
@@ -29,7 +47,8 @@ export function ModelSelect({ provider, value, onChange }: { provider?: Provider
           }
         }}
       >
-        {!value && <option value="">{t("team.defaultModel")}</option>}
+        {!value && !chosen && <option value="">{t("team.defaultModel")}</option>}
+        {onChosen && <option value={CHOSEN}>{t("modelChoice.byStrength")}</option>}
         {provider?.models.map((m) => (
           <option key={m.id} value={m.id}>
             {m.label}
@@ -37,7 +56,7 @@ export function ModelSelect({ provider, value, onChange }: { provider?: Provider
         ))}
         <option value={CUSTOM}>{t("team.customModel")}</option>
       </Select>
-      {custom && <Input value={value} placeholder="model-id" onChange={(e) => onChange(e.target.value)} />}
+      {custom && !chosen && <Input value={value} placeholder="model-id" onChange={(e) => onChange(e.target.value)} />}
     </div>
   );
 }
@@ -62,11 +81,17 @@ export function AgentEditor({ agent, onClose }: { agent?: Agent; onClose: () => 
     instructions: agent?.instructions ?? "",
     provider: agent?.provider ?? defaults.default_provider ?? "claude_code",
     model: agent?.model ?? "",
+    // No model: PlainBoard chooses one of the class and strength (lib/models.ts, services/model_choice.py).
+    chosen: agent ? !agent.model : false,
+    model_class: agent?.model_class ?? "",
+    strength: agent?.strength ?? "medium",
     effort: agent?.effort ?? defaults.default_worker_effort ?? "",
     toolset: agent?.toolset ?? "full",
     context_limit_tokens: agent?.context_limit_tokens ?? defaults.default_context_limit ?? 350000,
     keep_recent_messages: agent?.keep_recent_messages ?? defaults.default_keep_recent ?? 6,
     summary_model: agent?.summary_model ?? "",
+    summary_chosen: agent ? !agent.summary_model : false,
+    summary_strength: agent?.summary_strength ?? "",
     summary_effort: agent?.summary_effort ?? "",
     max_turns: agent?.max_turns ?? "",
     enabled: agent?.enabled ?? true,
@@ -86,10 +111,15 @@ export function AgentEditor({ agent, onClose }: { agent?: Agent; onClose: () => 
   const save = async () => {
     setBusy(true);
     setError(null);
+    const { chosen, summary_chosen, ...fields } = form;
+    const unset = agent ? "" : null; // an agent that exists is told to forget the value, a new one gets the installation's
     const body = {
-      ...form,
-      model: form.model || null,
-      summary_model: form.summary_model || null,
+      ...fields,
+      model: chosen ? "" : form.model || null,
+      model_class: form.model_class || unset,
+      strength: chosen ? form.strength : unset,
+      summary_model: summary_chosen ? "" : form.summary_model || null,
+      summary_strength: (summary_chosen && form.summary_strength) || unset,
       effort: form.effort || (agent ? "" : null),
       summary_effort: form.summary_effort || (agent ? "" : null),
       max_turns: form.max_turns === "" ? null : Number(form.max_turns),
@@ -188,7 +218,13 @@ export function AgentEditor({ agent, onClose }: { agent?: Agent; onClose: () => 
             </Field>
           )}
           <Field label={t("team.model")} hint={t("team.modelHint")}>
-            <ModelSelect provider={provider} value={form.model} onChange={(model) => set({ model })} />
+            <div className="space-y-1.5">
+              <ModelSelect provider={provider} value={form.model} onChange={(model) => set({ model })} chosen={form.chosen} onChosen={(chosen) => set({ chosen })} />
+              {form.chosen && <StrengthSelect value={form.strength} onChange={(strength) => set({ strength })} />}
+            </div>
+          </Field>
+          <Field label={t("modelChoice.class")} hint={t("modelChoice.classHint")}>
+            <ClassSelect classes={defaults.model_classes} value={form.model_class} onChange={(model_class) => set({ model_class })} />
           </Field>
           <Field label={t("team.effort")} hint={t("team.effortHint")}>
             <Select value={form.effort ?? ""} onChange={(e) => set({ effort: e.target.value })}>
@@ -289,7 +325,16 @@ export function AgentEditor({ agent, onClose }: { agent?: Agent; onClose: () => 
             </Field>
             <Field group label={t("team.summaryModel")} hint={t("team.summaryModelHint")}>
               <div className="space-y-1.5">
-                <ModelSelect provider={provider} value={form.summary_model} onChange={(summary_model) => set({ summary_model })} />
+                <ModelSelect
+                  provider={provider}
+                  value={form.summary_model}
+                  onChange={(summary_model) => set({ summary_model })}
+                  chosen={form.summary_chosen}
+                  onChosen={(summary_chosen) => set({ summary_chosen })}
+                />
+                {form.summary_chosen && (
+                  <StrengthSelect value={form.summary_strength} onChange={(summary_strength) => set({ summary_strength })} empty={t("modelChoice.strengthDefault")} />
+                )}
                 <Select aria-label={t("team.summaryEffort")} value={form.summary_effort} onChange={(e) => set({ summary_effort: e.target.value })}>
                   <option value="">{t("team.summaryEffortDefault", { effort: defaults.default_summary_effort || t("team.effortDefault") })}</option>
                   {[...(provider?.efforts ?? []), ...(form.summary_effort && !provider?.efforts.includes(form.summary_effort) ? [form.summary_effort] : [])].map((e) => (

@@ -12,10 +12,17 @@ from . import settings as settings_service
 from . import own_notes as own_note_service
 from . import todos as todo_service
 from .errors import NotFound, ServiceError
+from . import model_choice
 from .model_choice import equivalent_model
 from .util import slugify
 
-NULLABLE_FIELDS = {"effort", "summary_effort", "max_turns", "account_id"}
+NULLABLE_FIELDS = {"effort", "summary_effort", "max_turns", "account_id", "model_class", "strength", "summary_strength"}
+EMPTY_IS_NONE = ("effort", "summary_effort", "model_class", "strength", "summary_strength")
+
+
+async def _check_class(session: AsyncSession, name: str | None) -> None:
+    if name and not model_choice.known(await settings_service.get(session, "model_classes"), name):
+        raise ServiceError(f"Unknown model class: {name}")
 PALETTE = ["#6366f1", "#0ea5e9", "#10b981", "#f59e0b", "#ef4444", "#8b5cf6", "#ec4899", "#14b8a6", "#84cc16", "#f97316"]
 
 
@@ -49,14 +56,33 @@ async def _set_repositories(session: AsyncSession, agent: Agent, ids: list[int])
 async def create(
     session: AsyncSession, project_id: int, data: AgentCreate, *, is_manager: bool = False, catalog: list[ProviderInfo] | None = None
 ) -> Agent:
-    """``catalog`` (the runner's providers) lets an agent on another provider than the default get that provider's models."""
+    """``catalog`` (the runner's providers) lets an agent on another provider than the default get that provider's models.
+    Without a model the agent gets the installation's: a class and a strength where it sets a strength
+    (``default_*_strength``) or the agent is given one, else the default model."""
     s = await settings_service.get_all(session)
+    role = "manager" if is_manager else "worker"
     provider = data.provider or s["default_provider"]
-    model = data.model or (s["default_manager_model"] if is_manager else s["default_worker_model"])
-    summary_model = data.summary_model or s["default_summary_model"]
-    if catalog and provider != s["default_provider"]:
-        model = data.model or equivalent_model(catalog, model, provider) or model
-        summary_model = data.summary_model or equivalent_model(catalog, summary_model, provider) or summary_model
+    model_class = data.model_class or None
+    strength, summary_strength = data.strength or None, data.summary_strength or None
+    await _check_class(session, model_class)
+    if data.model:
+        model = data.model
+    elif strength or model_class or s[f"default_{role}_strength"]:
+        model = ""  # by class and strength (model_choice)
+        strength = strength or s[f"default_{role}_strength"] or model_choice.DEFAULT_STRENGTH
+        model_class = model_class or s[f"default_{role}_class"] or None
+    else:
+        model = s[f"default_{role}_model"]
+        if catalog and provider != s["default_provider"]:
+            model = equivalent_model(catalog, model, provider) or model
+    if data.summary_model:
+        summary_model = data.summary_model
+    elif summary_strength or s["default_summary_strength"]:
+        summary_model = ""  # by strength; the agent's own, else the installation's as it is then
+    else:
+        summary_model = s["default_summary_model"]
+        if catalog and provider != s["default_provider"]:
+            summary_model = equivalent_model(catalog, summary_model, provider) or summary_model
     await account_service.check_pin(session, data.account_id, provider, project_id)
     count = await session.scalar(select(func.count(Agent.id)).where(Agent.project_id == project_id)) or 0
     agent = Agent(
@@ -69,11 +95,14 @@ async def create(
         instructions=data.instructions,
         provider=provider,
         model=model,
+        model_class=model_class,
+        strength=strength,
         effort=data.effort if data.effort is not None else s["default_manager_effort" if is_manager else "default_worker_effort"],
         toolset=data.toolset,
         context_limit_tokens=data.context_limit_tokens or int(s["default_context_limit"]),
         keep_recent_messages=data.keep_recent_messages if data.keep_recent_messages is not None else int(s["default_keep_recent"]),
         summary_model=summary_model,
+        summary_strength=summary_strength,
         summary_effort=data.summary_effort or None,
         max_turns=data.max_turns,
         color=data.color or PALETTE[count % len(PALETTE)],
@@ -120,7 +149,7 @@ async def update(session: AsyncSession, agent: Agent, data: AgentUpdate, catalog
     if fields.get("provider") and fields["provider"] != agent.provider:
         if catalog:  # keep the models' size on the new provider
             for key in ("model", "summary_model"):
-                if not fields.get(key):
+                if key not in fields and getattr(agent, key):  # one chosen by class and strength is chosen again
                     fields[key] = equivalent_model(catalog, getattr(agent, key), fields["provider"]) or getattr(agent, key)
         # The old provider's session means nothing to the new one: start fresh from summary + recent messages.
         conv = await conversation_for(session, agent.id)
@@ -135,12 +164,15 @@ async def update(session: AsyncSession, agent: Agent, data: AgentUpdate, catalog
         agent.slug = await _unique_slug(session, agent.project_id, fields["name"], exclude_id=agent.id)
     if agent.is_manager and fields.get("enabled") is False:
         raise ServiceError("The manager cannot be disabled")
+    await _check_class(session, fields.get("model_class"))
     for key, value in fields.items():
-        if key in ("effort", "summary_effort") and value == "":
+        if key in EMPTY_IS_NONE and value == "":
             value = None
         if value is None and key not in NULLABLE_FIELDS:
             continue  # "not provided" for required columns
         setattr(agent, key, value)
+    if not agent.model and not agent.strength:  # the model was taken away: a strength has to say what it runs on
+        agent.strength = await settings_service.get(session, f"default_{'manager' if agent.is_manager else 'worker'}_strength") or model_choice.DEFAULT_STRENGTH
     if mcp_ids is not None:
         await _set_mcp_servers(session, agent, mcp_ids)
     if repo_ids is not None:

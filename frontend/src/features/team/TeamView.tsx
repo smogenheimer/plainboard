@@ -5,6 +5,7 @@ import { useMe, useRepositories, useUsage } from "../../api/queries";
 import type { Agent } from "../../api/types";
 import { AgentDot, AgentSquare, Badge, Button, PageHead } from "../../components/ui";
 import { formatBytes, formatCost, formatTokens } from "../../lib/format";
+import { modelLabel } from "../../lib/models";
 import { useShell } from "../layout/shell-context";
 import { AgentEditor } from "./AgentEditor";
 import { OwnNotesDialog } from "./OwnNotesDialog";
@@ -59,7 +60,7 @@ export function TeamView() {
               <div className="col-start-3 min-w-0 xl:col-start-auto">
                 <p className="line-clamp-2 text-fg-2">{agent.description || t("team.noDescription")}</p>
                 <div className="mt-1.5 flex flex-wrap items-center gap-1.5 text-fg-3">
-                  <Badge>{agent.model}</Badge>
+                  <Badge>{modelLabel(agent)}</Badge>
                   {agent.effort && <Badge>{agent.effort}</Badge>}
                   <Badge>{t(`toolset.${agent.toolset}`)}</Badge>
                   <span className="whitespace-nowrap" title={t("team.contextTitle")}>

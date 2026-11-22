@@ -863,6 +863,8 @@ class RunManager:
                     return
                 manager = await agent_service.get_manager(s, task.project_id)
                 route = await account_service.route(s, manager, await self.runners.catalog())
+                if not route.summary_model:  # chosen by strength, and the providers cannot be read right now
+                    return
                 account = await account_service.account_for(s, route, manager, summary=True)
                 values = await settings_service.get_all(s)
                 credentials = settings_service.credentials(values, account=account_service.fields(account))
@@ -1416,6 +1418,8 @@ class RunManager:
                 board = prompts.assignment_opening(facts, earlier, fresh)
             catalog = await self.runners.catalog()
             route = await account_service.route(s, agent, catalog)
+            if not route.model:
+                raise RuntimeError("The agent's model is chosen by class and strength, and the providers cannot be read right now: the runner does not answer.")
             if conv.provider_session_id and (before := await account_service.session_provider(s, conv)) and before != route.provider:
                 # The session belongs to the provider the last turn ran on: the other one starts from summary + recent messages.
                 log.info("Run %s: %s runs on %s instead of %s", run.id, agent.slug, route.provider, before)
@@ -1552,7 +1556,7 @@ class RunManager:
             if run is None or agent is None or run.status != RunStatus.RUNNING:
                 return None
             conv = await agent_service.conversation_for(s, agent.id)
-            account = await account_service.other_with_room(s, spec.provider, agent, conv, ctx.account_key)
+            account = await account_service.other_with_room(s, spec.provider, agent, conv, ctx.account_key, spec.model)
             if account is None:
                 return await self._switch_provider(s, spec, ctx, run, agent, conv)
             log.info("Run %s: account %s is used up, the turn runs again on %s", run.id, ctx.account_key, account.key)

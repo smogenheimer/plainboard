@@ -13,6 +13,7 @@ import { useMentionPicker, useReadMentionsOf } from "../../components/Mentions";
 import { AgentSquare, IconButton, Select, Spinner } from "../../components/ui";
 import { formatCost, formatTokens } from "../../lib/format";
 import { useStored } from "../../lib/hooks";
+import { modelLabel } from "../../lib/models";
 import { useNow } from "../../lib/time";
 import { useShell } from "../layout/shell-context";
 import { LimitsRing } from "./LimitsRing";
@@ -164,7 +165,7 @@ export function ChatPanel({
             onChange={(e) => onSelectAgent(Number(e.target.value))}
             aria-label={t("chat.selectAgent")}
             trigger={
-              <span className="flex h-8 items-center gap-2" title={`${agent.role} · ${agent.model}`}>
+              <span className="flex h-8 items-center gap-2" title={`${agent.role} · ${modelLabel(agent)}`}>
                 <AgentSquare agent={agent} />
                 <span className="truncate font-extrabold">{agent.name}</span>
                 <ChevronDown className="size-3.5 shrink-0 text-fg-3" />
