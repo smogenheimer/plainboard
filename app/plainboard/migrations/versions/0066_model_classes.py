@@ -1,13 +1,13 @@
 """an agent can name a class and a strength instead of a model
 
-Revision ID: 0064
-Revises: 0063
+Revision ID: 0066
+Revises: 0065
 """
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0064"
-down_revision = "0063"
+revision = "0066"
+down_revision = "0065"
 branch_labels = None
 depends_on = None
 
