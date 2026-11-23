@@ -490,3 +490,25 @@ async def test_expired_oauth_token_triggers_refresh_before_limits_probe(tmp_path
         token = await provider._access_token(tmp_path, Credentials(antigravity_auth_mode="google"), client)
     assert refreshed == [tmp_path]
     assert token == ("fresh-token", None)
+
+
+async def test_antigravity_check_uses_plain_prompt_and_short_timeout(monkeypatch):
+    provider = AntigravityProvider()
+    seen = []
+
+    async def fake_complete(spec, home, *, timeout=180):
+        seen.append((spec.system_prompt, spec.prompt, spec.effort, timeout))
+        return antigravity.CompletionResult(text="OK", input_tokens=10, output_tokens=2)
+
+    monkeypatch.setattr(provider, "_complete", fake_complete)
+    res = await provider.check(
+        antigravity.CompletionSpec(
+            provider="antigravity",
+            model="gemini-3.8-flash",
+            system_prompt="You are a connectivity check. Reply with exactly: OK",
+            prompt="Reply with OK.",
+            credentials=Credentials(antigravity_auth_mode="google", antigravity_account="acct1"),
+        )
+    )
+    assert res.ok and res.detail == "gemini-3.8-flash: OK"
+    assert seen == [("", "Say OK", "minimal", 45)]

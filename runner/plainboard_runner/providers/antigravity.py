@@ -1824,7 +1824,9 @@ class AntigravityProvider(Provider):
             return await self._complete(spec, home)
 
     async def check(self, spec: CompletionSpec) -> CheckResult:
-        fast = spec.model_copy(update={"effort": spec.effort or "minimal"})
+        # Antigravity's backend tarpits synthetic "connectivity check" system prompts with HTTP 429
+        # retries; use a plain minimal prompt so Settings -> Test completes cleanly in seconds.
+        fast = spec.model_copy(update={"system_prompt": "", "prompt": "Say OK", "effort": spec.effort or "minimal"})
         try:
             async with self._home(fast.credentials) as home:
                 result = await self._complete(fast, home, timeout=45)
@@ -1862,6 +1864,7 @@ class AntigravityProvider(Provider):
                         "session/prompt",
                         {"sessionId": session_id, "prompt": [{"type": "text", "text": prompt_text}]},
                     )
+                    prompt_fut.add_done_callback(lambda f: f.exception() if not f.cancelled() else None)
                     deadline = time.monotonic() + timeout
                     next_task: asyncio.Task[dict[str, Any] | None] | None = None
                     try:
