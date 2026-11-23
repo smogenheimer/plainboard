@@ -202,6 +202,8 @@ class ContextManager:
 
         values = await settings_service.get_all(session)
         account = await account_service.pick(session, agent.provider, agent, conv, model=agent.summary_model)
+        if account is None and (why := await account_service.shut_out(session, agent.provider, agent)):
+            raise RuntimeError(why)
         credentials = settings_service.credentials(values, account=account_service.fields(account))
         summary = conv.summary
         cost = 0.0

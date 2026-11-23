@@ -47,6 +47,7 @@ from plainboard_protocol import (
     ACCOUNT_KEY_PATTERN,
     DEFAULT_ACCOUNT,
     AssistantTextEvent,
+    CheckResult,
     CompactionEvent,
     CompletionResult,
     CompletionSpec,
@@ -222,12 +223,12 @@ def parse_version(version: str | None) -> tuple[int, int, int] | None:
 
 
 def guess_tier(model_id: str) -> str:
-    low = model_id.lower()
-    if any(k in low for k in ("neon", "astra", "fable", "ultra")):
+    tokens = set(re.split(r"[^a-z0-9]+", model_id.lower()))
+    if tokens & {"neon", "astra", "fable", "ultra"}:
         return "xlarge"
-    if any(k in low for k in ("carbon", "pro", "opus", "sol")):
+    if tokens & {"carbon", "pro", "opus", "sol"}:
         return "large"
-    if any(k in low for k in ("flash", "haiku", "mini", "nano", "luna", "lite")):
+    if tokens & {"flash", "haiku", "mini", "nano", "luna", "lite"}:
         return "small"
     return "medium"
 
@@ -1822,7 +1823,16 @@ class AntigravityProvider(Provider):
         async with self._home(spec.credentials) as home:
             return await self._complete(spec, home)
 
-    async def _complete(self, spec: CompletionSpec, home: Path) -> CompletionResult:
+    async def check(self, spec: CompletionSpec) -> CheckResult:
+        fast = spec.model_copy(update={"effort": spec.effort or "minimal"})
+        try:
+            async with self._home(fast.credentials) as home:
+                result = await self._complete(fast, home, timeout=45)
+            return CheckResult(ok=True, detail=f"{fast.model}: {result.text.strip()[:80]}")
+        except Exception as exc:
+            return CheckResult(ok=False, detail=str(exc)[:500])
+
+    async def _complete(self, spec: CompletionSpec, home: Path, *, timeout: float = 180) -> CompletionResult:
         session_id: str | None = None
         with tempfile.TemporaryDirectory(prefix="plainboard-agy-complete-") as cwd:
             server = AcpServer(home, spec.credentials, cwd=Path(cwd))
@@ -1852,12 +1862,16 @@ class AntigravityProvider(Provider):
                         "session/prompt",
                         {"sessionId": session_id, "prompt": [{"type": "text", "text": prompt_text}]},
                     )
+                    deadline = time.monotonic() + timeout
                     next_task: asyncio.Task[dict[str, Any] | None] | None = None
                     try:
                         while not prompt_fut.done():
+                            remaining = deadline - time.monotonic()
+                            if remaining <= 0:
+                                raise AntigravityError("Antigravity completion timed out.")
                             if next_task is None:
                                 next_task = asyncio.create_task(server.next())
-                            done, _ = await asyncio.wait({prompt_fut, next_task}, timeout=180, return_when=asyncio.FIRST_COMPLETED)
+                            done, _ = await asyncio.wait({prompt_fut, next_task}, timeout=remaining, return_when=asyncio.FIRST_COMPLETED)
                             if not done:
                                 raise AntigravityError("Antigravity completion timed out.")
                             if next_task in done:

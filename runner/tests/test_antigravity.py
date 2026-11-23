@@ -309,6 +309,10 @@ def test_models_thinking_level_skills_and_cleanup(tmp_path):
     }
     models = models_from_setup(setup)
     assert [(m.id, m.tier) for m in models] == [("gemini-4-neon", "xlarge"), ("claude-opus-5-5", "large")]
+    # Word-boundary tier matching: "gemini" must not match "mini" as "small".
+    assert antigravity.guess_tier("gemini-4-hydrogen") == "medium"
+    assert antigravity.guess_tier("gemini-3.8-flash") == "small"
+    assert antigravity.guess_tier("gpt-5-mini") == "small"
     thinking_opt = setup["configOptions"][1]
     assert match_thinking_level("high", thinking_opt) == "high"
     assert match_thinking_level("max", thinking_opt) == "high"
