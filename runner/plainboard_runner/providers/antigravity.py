@@ -181,6 +181,15 @@ DAILY_QUOTA_ENDPOINT = "https://daily-cloudcode-pa.googleapis.com"
 PROD_QUOTA_ENDPOINT = "https://cloudcode-pa.googleapis.com"
 QUOTA_ENDPOINTS = (DAILY_QUOTA_ENDPOINT, PROD_QUOTA_ENDPOINT)
 SUMMARY_WINDOW_SECONDS = {"5h": 5 * 3600, "weekly": 7 * 24 * 3600}
+PLAN_KEEP_SECONDS = 3600
+PLAN_TIERS: dict[str, tuple[str, float | None]] = {
+    "g1-ultra-tier": ("Google AI Ultra", 5.0),
+    "g1-pro-tier": ("Google AI Pro", 1.0),
+    "standard-tier": ("Standard", 1.0),
+    "free-tier": ("Free", None),
+}
+_SUMMARY_FAMILY_ORDER = {"gemini": 0, "shared": 1, "argon": 2, "carbon": 3}
+_SUMMARY_PERIOD_ORDER = {"five_hour": 0, "seven_day": 1}
 
 # Tool normalization
 MCP_TITLE_RE = re.compile(r"^Run(?:ning)?\s+mcp_([A-Za-z0-9_-]+?)_([A-Za-z0-9_]+)\??$")
@@ -681,6 +690,16 @@ def _bucket_window_name(bucket_id: str, window_kind: str) -> str:
     return f"antigravity_{family}_{suffix}"
 
 
+def _summary_window_sort_key(window: LimitWindow) -> tuple[int, int, str]:
+    rest = window.name.removeprefix("antigravity_")
+    for period, period_rank in _SUMMARY_PERIOD_ORDER.items():
+        suffix = f"_{period}"
+        if rest.endswith(suffix):
+            family = rest[: -len(suffix)]
+            return (_SUMMARY_FAMILY_ORDER.get(family, 99), period_rank, window.name)
+    return (99, 99, window.name)
+
+
 def parse_summary_windows(response: dict[str, Any], requested_at: float) -> list[LimitWindow]:
     """Parse ``v1internal:retrieveUserQuotaSummary`` into PlainBoard ``LimitWindow`` objects."""
     groups = response.get("groups") or []
@@ -707,7 +726,23 @@ def parse_summary_windows(response: dict[str, Any], requested_at: float) -> list
                 resets_at=resets_at,
                 status="rejected" if used >= 1.0 else None,
             )
-    return list(windows.values())
+    return sorted(windows.values(), key=_summary_window_sort_key)
+
+
+def parse_plan_info(data: dict[str, Any]) -> tuple[str | None, float | None]:
+    """Extract Antigravity subscription tier name and relative size from ``v1internal:loadCodeAssist``."""
+    for key in ("paidTier", "currentTier"):
+        tier = data.get(key)
+        if not isinstance(tier, dict):
+            continue
+        tier_id = str(tier.get("id") or "").strip().lower()
+        name = str(tier.get("name") or "").strip()
+        if tier_id in PLAN_TIERS:
+            default_name, size = PLAN_TIERS[tier_id]
+            return (default_name if tier_id == "free-tier" else (name or default_name)), size
+        if name:
+            return name, None
+    return None, None
 
 
 def parse_model_quota_windows(response: dict[str, Any]) -> list[LimitWindow]:
@@ -1605,6 +1640,8 @@ class AntigravityProvider(Provider):
         self._logins: dict[str, CodeLogin] = {}
         self._own_logins: dict[str, CodeLogin] = {}
         self._emails: dict[str, str] = {}
+        self._plans: dict[str, tuple[float, str | None, float | None]] = {}
+        self._refresh_locks: dict[str, asyncio.Lock] = {}
 
     def info(self) -> ProviderInfo:
         models = self._models[1] if self._models else MODELS
@@ -1858,31 +1895,56 @@ class AntigravityProvider(Provider):
             output_tokens=mapper.output_tokens,
         )
 
+    async def _refresh_oauth_token(self, home: Path, creds: Credentials) -> None:
+        """Ask ``agy acp`` to refresh an expired CLI 1.5 ``antigravity-oauth-token`` on disk."""
+        lock = self._refresh_locks.setdefault(str(home), asyncio.Lock())
+        async with lock:
+            with tempfile.TemporaryDirectory(prefix="plainboard-agy-refresh-") as cwd:
+                async with AcpServer(home, creds, cwd=Path(cwd)) as server:
+                    await server.authenticate()
+
+    async def _access_token(self, home: Path, creds: Credentials | None, client: httpx.AsyncClient, *, force_refresh: bool = False) -> tuple[str, str | None] | None:
+        if not force_refresh:
+            resolved = await read_stored_access_token(home, client)
+            if resolved:
+                return resolved
+        if creds is None or not has_stored_oauth_login(home):
+            return None
+        try:
+            await self._refresh_oauth_token(home, creds)
+        except Exception as exc:
+            log.debug("Could not refresh Antigravity OAuth token: %s", exc)
+            return None
+        return await read_stored_access_token(home, client)
+
     async def limits(self, credentials: Credentials) -> list[LimitWindow]:
         mode = credentials.antigravity_auth_mode
         if mode == "api_key" or (mode == "own_login" and not credentials.login_files):
             return []
         async with self._home(credentials) as home:
-            return await self._limits_for_home(home)
+            return await self._limits_for_home(home, credentials)
 
-    async def _limits_for_home(self, home: Path) -> list[LimitWindow]:
+    async def _limits_for_home(self, home: Path, creds: Credentials | None = None) -> list[LimitWindow]:
         async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
-            resolved = await read_stored_access_token(home, client)
+            resolved = await self._access_token(home, creds, client)
             if not resolved:
                 return []
-            access_token, project_id = resolved
-            headers = {
-                "Authorization": f"Bearer {access_token}",
-                "User-Agent": quota_user_agent(),
-            }
-            body = {"project": project_id} if project_id else {}
 
-            async def _fetch(operation: str) -> list[LimitWindow]:
+            async def _fetch(operation: str, access_token: str, project_id: str | None) -> tuple[list[LimitWindow], bool]:
+                headers = {
+                    "Authorization": f"Bearer {access_token}",
+                    "User-Agent": quota_user_agent(),
+                }
+                body = {"project": project_id} if project_id else {}
                 merged: dict[str, LimitWindow] = {}
+                unauthorized = False
                 for endpoint in QUOTA_ENDPOINTS:
                     requested_at = time.time()
                     try:
                         resp = await client.post(f"{endpoint}/v1internal:{operation}", headers=headers, json=body, timeout=10)
+                        if resp.status_code == 401:
+                            unauthorized = True
+                            continue
                         if resp.status_code != 200:
                             continue
                         data = resp.json()
@@ -1891,9 +1953,52 @@ class AntigravityProvider(Provider):
                     parsed = parse_summary_windows(data, requested_at) if operation == "retrieveUserQuotaSummary" else parse_model_quota_windows(data)
                     for win in parsed:
                         merged.setdefault(win.name, win)
-                return list(merged.values())
+                return sorted(merged.values(), key=_summary_window_sort_key), unauthorized
 
-            return await _fetch("retrieveUserQuotaSummary") or await _fetch("fetchAvailableModels")
+            windows, unauthorized = await _fetch("retrieveUserQuotaSummary", *resolved)
+            if not windows and unauthorized and creds is not None:
+                if refreshed := await self._access_token(home, creds, client, force_refresh=True):
+                    resolved = refreshed
+                    windows, _ = await _fetch("retrieveUserQuotaSummary", *resolved)
+            if windows:
+                return windows
+            fallback, _ = await _fetch("fetchAvailableModels", *resolved)
+            return fallback
+
+    async def plan(self, credentials: Credentials) -> tuple[str | None, float | None]:
+        mode = credentials.antigravity_auth_mode
+        if mode == "api_key" or (mode == "own_login" and not credentials.login_files):
+            return None, None
+        cache_key = f"{mode}:{credentials.login_account if mode == 'own_login' else credentials.antigravity_account}"
+        cached = self._plans.get(cache_key)
+        if cached and time.time() - cached[0] < PLAN_KEEP_SECONDS:
+            return cached[1], cached[2]
+        async with self._home(credentials) as home, httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
+            resolved = await self._access_token(home, credentials, client)
+            if not resolved:
+                return (cached[1], cached[2]) if cached else (None, None)
+            access_token, _project_id = resolved
+            headers = {
+                "Authorization": f"Bearer {access_token}",
+                "User-Agent": quota_user_agent(),
+            }
+            for endpoint in QUOTA_ENDPOINTS:
+                try:
+                    resp = await client.post(
+                        f"{endpoint}/v1internal:loadCodeAssist",
+                        headers=headers,
+                        json={"metadata": {"ideType": "ANTIGRAVITY"}},
+                        timeout=10,
+                    )
+                    if resp.status_code != 200:
+                        continue
+                    name, size = parse_plan_info(resp.json())
+                    if name or size:
+                        self._plans[cache_key] = (time.time(), name, size)
+                        return name, size
+                except Exception:
+                    continue
+        return (cached[1], cached[2]) if cached else (None, None)
 
     async def _lookup_email(self, key: str, home: Path) -> str:
         if cached := self._emails.get(key):
@@ -2001,6 +2106,7 @@ class AntigravityProvider(Provider):
         login = self._code_login(key)
         await login.cancel()
         self._emails.pop(key, None)
+        self._plans.pop(f"google:{key}", None)
         acp_dir = login.home / "antigravity-acp"
         for name in SIGN_IN_FILES:
             (acp_dir / name).unlink(missing_ok=True)

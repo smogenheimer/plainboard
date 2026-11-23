@@ -124,6 +124,25 @@ async def record(session: AsyncSession, account_key: str, windows: list[LimitWin
     await session.commit()
 
 
+async def clear(session: AsyncSession, account_key: str) -> None:
+    """Drop stored limits and plan for an account (e.g. after signing out or deleting it)."""
+    row, accounts = await _stored(session)
+    changed = False
+    if account_key in accounts:
+        del accounts[account_key]
+        row.value = json.dumps({"accounts": accounts})
+        session.add(row)
+        changed = True
+    plan_row, plans = await _plans(session)
+    if account_key in plans:
+        del plans[account_key]
+        plan_row.value = json.dumps(plans)
+        session.add(plan_row)
+        changed = True
+    if changed:
+        await session.commit()
+
+
 # The plans of the accounts, by key: {"name", "size", "checked_at"}. A setting of its own, so that
 # storing one never races with a turn's limit report.
 PLANS_KEY = "provider_plans"

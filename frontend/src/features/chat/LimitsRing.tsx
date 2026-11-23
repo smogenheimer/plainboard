@@ -25,15 +25,39 @@ function useProjectLimits() {
  * for the windows, resets and forecast. Sits under every composer, so usage is always in view. */
 export function LimitsRing() {
   const data = useProjectLimits();
+  const [openKey, setOpenKey] = useState<string | null>(null);
+  const ref = useRef<HTMLDivElement>(null);
+
+  useEffect(() => {
+    if (!openKey) return;
+    const onMouseDown = (e: MouseEvent) => !ref.current?.contains(e.target as Node) && setOpenKey(null);
+    const onKeyDown = (e: KeyboardEvent) => e.key === "Escape" && setOpenKey(null);
+    document.addEventListener("mousedown", onMouseDown);
+    document.addEventListener("keydown", onKeyDown);
+    return () => {
+      document.removeEventListener("mousedown", onMouseDown);
+      document.removeEventListener("keydown", onKeyDown);
+    };
+  }, [openKey]);
+
   if (!data) return null;
   const known = data.accounts.filter((a) => a.windows.length);
-  if (!known.length) return <Ring available={data.accounts.some((a) => a.available)} />;
+  const available = data.accounts.some((a) => a.available);
+  const activeAccount = openKey && openKey !== "empty" ? known.find((a) => String(a.account_id) === openKey) : undefined;
+  const showMenu = openKey === "empty" ? !known.length : !!activeAccount;
+
   return (
-    <>
-      {known.map((account) => (
-        <Ring key={account.account_id} account={account} />
-      ))}
-    </>
+    <div ref={ref} className="relative flex flex-wrap items-center justify-end gap-x-2">
+      {known.length ? (
+        known.map((account) => {
+          const key = String(account.account_id);
+          return <RingButton key={key} account={account} open={openKey === key} onToggle={() => setOpenKey(openKey === key ? null : key)} />;
+        })
+      ) : (
+        <RingButton open={openKey === "empty"} onToggle={() => setOpenKey(openKey === "empty" ? null : "empty")} />
+      )}
+      {showMenu && <LimitsPopover account={activeAccount} available={available} />}
+    </div>
   );
 }
 
@@ -48,7 +72,12 @@ export function LimitsList() {
     <>
       {known.map((account) => (
         <div key={account.account_id} className="space-y-3 border-b border-line px-2.5 py-2.5">
-          {known.length > 1 && <p className="font-semibold">{account.label}</p>}
+          {(known.length > 1 || account.plan) && (
+            <div className="flex items-baseline justify-between gap-2">
+              {known.length > 1 && <p className="font-semibold">{account.label}</p>}
+              {account.plan && <span className="text-fg-3">{account.plan}</span>}
+            </div>
+          )}
           {account.windows.map((window) => (
             <LimitRow key={window.name} window={window} forecast={account.forecasts.find((f) => f.name === window.name)} />
           ))}
@@ -59,18 +88,8 @@ export function LimitsList() {
   );
 }
 
-function Ring({ account, available = true }: { account?: AccountLimits; available?: boolean }) {
+function RingButton({ account, open, onToggle }: { account?: AccountLimits; open: boolean; onToggle: () => void }) {
   const { t } = useTranslation();
-  const [open, setOpen] = useState(false);
-  const ref = useRef<HTMLDivElement>(null);
-
-  useEffect(() => {
-    if (!open) return;
-    const close = (e: MouseEvent) => !ref.current?.contains(e.target as Node) && setOpen(false);
-    document.addEventListener("mousedown", close);
-    return () => document.removeEventListener("mousedown", close);
-  }, [open]);
-
   const windows = account?.windows ?? [];
   const forecasts = account?.forecasts ?? [];
   const highest = Math.max(0, ...windows.map((w) => w.utilization));
@@ -86,24 +105,43 @@ function Ring({ account, available = true }: { account?: AccountLimits; availabl
     (stale ? ` · ${t("chat.limits.updated", { when: timeAgo(fromUnix(account.updated_at!)) })}` : "");
 
   return (
-    <div ref={ref} className="relative shrink-0">
-      <button type="button" onClick={() => setOpen(!open)} aria-label={label} aria-expanded={open} title={label} className="flex h-6 items-center gap-1.5 rounded-sm px-1 text-fg-3 hover:bg-sunk hover:text-fg touch:h-9">
-        <svg viewBox="0 0 20 20" className={clsx("size-4 shrink-0 -rotate-90", stale && "opacity-40")} aria-hidden>
-          <circle cx="10" cy="10" r="8" fill="none" stroke="currentColor" strokeWidth="3" className="text-line-2" />
-          <circle cx="10" cy="10" r="8" fill="none" stroke="currentColor" strokeWidth="3" pathLength={100} strokeDasharray={`${Math.min(percent(highest), 100)} 100`} className={stroke[ringTone]} />
-        </svg>
-        {account && <span className="max-w-24 truncate">{account.label}</span>}
-      </button>
-      {open && (
-        <div data-part="menu" className="absolute right-0 bottom-full z-20 mb-2 w-64 max-w-[calc(100vw-1.5rem)] space-y-3 rounded-sm bg-bg p-3 shadow-lg ring-1 ring-line-2">
-          {account && <p className="font-semibold">{account.label}</p>}
-          {windows.map((window) => (
-            <LimitRow key={window.name} window={window} forecast={forecasts.find((f) => f.name === window.name)} />
-          ))}
-          {!windows.length && <p className="text-fg-3">{t(available ? "chat.limits.unknown" : "chat.limits.noPlan")}</p>}
-          {account?.updated_at && <p className="text-fg-3">{t("chat.limits.updated", { when: timeAgo(fromUnix(account.updated_at)) })}</p>}
+    <button
+      type="button"
+      onClick={onToggle}
+      aria-label={label}
+      aria-expanded={open}
+      title={label}
+      className={clsx(
+        "flex h-6 shrink-0 items-center gap-1.5 rounded-sm px-1 text-fg-3 hover:bg-sunk hover:text-fg touch:h-9",
+        open && "bg-sunk text-fg",
+      )}
+    >
+      <svg viewBox="0 0 20 20" className={clsx("size-4 shrink-0 -rotate-90", stale && "opacity-40")} aria-hidden>
+        <circle cx="10" cy="10" r="8" fill="none" stroke="currentColor" strokeWidth="3" className="text-line-2" />
+        <circle cx="10" cy="10" r="8" fill="none" stroke="currentColor" strokeWidth="3" pathLength={100} strokeDasharray={`${Math.min(percent(highest), 100)} 100`} className={stroke[ringTone]} />
+      </svg>
+      {account && <span className="max-w-24 truncate">{account.label}</span>}
+    </button>
+  );
+}
+
+function LimitsPopover({ account, available = true }: { account?: AccountLimits; available?: boolean }) {
+  const { t } = useTranslation();
+  const windows = account?.windows ?? [];
+  const forecasts = account?.forecasts ?? [];
+  return (
+    <div data-part="menu" className="scroll-thin absolute right-0 bottom-full z-20 mb-2 max-h-[70vh] w-64 max-w-[calc(100vw-1.5rem)] space-y-3 overflow-y-auto rounded-sm bg-bg p-3 shadow-lg ring-1 ring-line-2">
+      {account && (
+        <div className="flex items-baseline justify-between gap-2">
+          <p className="font-semibold">{account.label}</p>
+          {account.plan && <span className="truncate text-fg-3">{account.plan}</span>}
         </div>
       )}
+      {windows.map((window) => (
+        <LimitRow key={window.name} window={window} forecast={forecasts.find((f) => f.name === window.name)} />
+      ))}
+      {!windows.length && <p className="text-fg-3">{t(available ? "chat.limits.unknown" : "chat.limits.noPlan")}</p>}
+      {account?.updated_at && <p className="text-fg-3">{t("chat.limits.updated", { when: timeAgo(fromUnix(account.updated_at)) })}</p>}
     </div>
   );
 }

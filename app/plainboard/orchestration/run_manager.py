@@ -974,13 +974,42 @@ class RunManager:
         finally:
             self._state_tasks.pop(task_id, None)
 
-    def refresh_limits(self) -> None:
-        """Ask for the plan limits in the background, at most every five minutes, and only accounts
-        that have not just reported them. Uses no tokens, or a handful (see services/limits.py)."""
-        if self._limits_task and not self._limits_task.done() or (self._limits_asked and time.monotonic() - self._limits_asked < 300):
+    def refresh_limits(self, *, force: bool = False) -> None:
+        """Ask for the plan limits in the background, at most every five minutes (unless ``force``),
+        and only accounts that have not just reported them. Uses no tokens, or a handful (see services/limits.py)."""
+        if self._limits_task and not self._limits_task.done():
+            return
+        if not force and self._limits_asked and time.monotonic() - self._limits_asked < 300:
             return
         self._limits_asked = time.monotonic()
         self._limits_task = asyncio.create_task(self._refresh_limits(), name="limits-refresh")
+
+    def schedule_account_limits(self, account_id: int) -> None:
+        """Refresh one subscription's limits in the background without tripping the global cooldown."""
+        task = asyncio.create_task(self.refresh_account_limits(account_id), name=f"limits-refresh-{account_id}")
+        self._resting.add(task)
+        task.add_done_callback(self._resting.discard)
+
+    async def refresh_account_limits(self, account_id: int) -> None:
+        """Read and store one subscription's limits and plan immediately (e.g. right after sign-in)."""
+        try:
+            async with self._sm() as s:
+                try:
+                    account = await account_service.get(s, account_id)
+                except NotFound:
+                    return
+                if not account.enabled or not account_service.has_plan(account):
+                    return
+                values = await settings_service.get_all(s)
+                report = await self.runner.limits(account.provider, settings_service.credentials(values, account=account_service.fields(account)))
+                if report.windows:
+                    await limits_service.record(s, account.key, report.windows, complete=report.complete)
+                if report.plan or report.plan_size:
+                    await limits_service.record_plan(s, account.key, report.plan, report.plan_size)
+                if account_service.own_login(account):
+                    await account_service.take_sign_ins(s, self.runner)
+        except Exception:
+            log.warning("Could not refresh limits for account %s", account_id, exc_info=True)
 
     async def _refresh_limits(self) -> None:
         async with self._sm() as s:

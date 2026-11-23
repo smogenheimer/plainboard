@@ -549,12 +549,27 @@ def test_antigravity_accounts_signin_credentials_and_cleanup(client, project):
     assert google["provider"] == "antigravity" and google["auth_mode"] == "google"
     assert client.post("/api/accounts", json={"provider": "antigravity", "auth_mode": "chatgpt"}).status_code == 400
 
-    # Headless Google OAuth flow: start returns login_url + needs_code, submitting code signs in and invalidates cached models.
+    # Headless Google OAuth flow: start returns login_url + needs_code, submitting code signs in,
+    # invalidates cached models, and immediately reads Antigravity plan limits without waiting for the cooldown.
+    runner(client).limit_windows = [
+        LimitWindow(name="antigravity_gemini_five_hour", utilization=0.25, resets_at=1_900_000_000),
+        LimitWindow(name="antigravity_gemini_seven_day", utilization=0.1, resets_at=1_900_500_000),
+    ]
+    client.app_ref.state.runs._limits_asked = 1e12  # simulate active 5-minute global cooldown
     started = client.post(f"/api/accounts/{google['id']}/signin").json()
     assert started["needs_code"] is True and started["login_url"].startswith("https://accounts.google.com/")
     finished = client.post(f"/api/accounts/{google['id']}/signin/code", json={"code": "4/0A-code"}).json()
     assert finished["signed_in"] is True and finished["detail"] == "user@example.com"
     assert getattr(runner(client), "providers_forgotten", 0) >= 1
+    agy_limits = limits_of(client, google["id"])
+    assert [w["name"] for w in agy_limits["windows"]] == ["antigravity_gemini_five_hour", "antigravity_gemini_seven_day"]
+    assert agy_limits["windows"][0]["utilization"] == 0.25
+
+    # Signing out clears stored limits for the account.
+    assert client.delete(f"/api/accounts/{google['id']}/signin").json()["signed_in"] is False
+    assert limits_of(client, google["id"])["windows"] == []
+    assert client.post(f"/api/accounts/{google['id']}/signin").json()["needs_code"] is True
+    assert client.post(f"/api/accounts/{google['id']}/signin/code", json={"code": "4/0A-code"}).json()["signed_in"] is True
 
     # Agent on Antigravity receives isolated account key and equivalent models.
     dev = make_dev(client, pid, provider="antigravity")

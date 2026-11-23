@@ -252,13 +252,25 @@ def test_quota_summary_and_model_fallback_parsing():
             },
         ]
     }
-    windows = {w.name: w for w in parse_summary_windows(summary, requested_at=now)}
-    assert set(windows) == {"antigravity_gemini_five_hour", "antigravity_gemini_seven_day", "antigravity_carbon_five_hour", "antigravity_shared_seven_day"}
+    parsed = parse_summary_windows(summary, requested_at=now)
+    # 5-hour windows come before weekly windows within each family (matching Claude and Codex).
+    assert [w.name for w in parsed] == [
+        "antigravity_gemini_five_hour",
+        "antigravity_gemini_seven_day",
+        "antigravity_shared_seven_day",
+        "antigravity_carbon_five_hour",
+    ]
+    windows = {w.name: w for w in parsed}
     assert windows["antigravity_gemini_five_hour"].utilization == 0.4 and windows["antigravity_gemini_five_hour"].status is None
     assert windows["antigravity_gemini_seven_day"].utilization == 1.0 and windows["antigravity_gemini_seven_day"].status == "rejected"
     assert windows["antigravity_carbon_five_hour"].resets_at is None  # untouched rolling window omitted
     assert windows["antigravity_shared_seven_day"].utilization == 0.25
     assert "antigravity/hub/2.24.0" in quota_user_agent()
+
+    # Plan tier detection from loadCodeAssist (paidTier wins over currentTier).
+    assert antigravity.parse_plan_info({"currentTier": {"id": "free-tier", "name": "Antigravity"}, "paidTier": {"id": "g1-pro-tier", "name": "Google AI Pro"}}) == ("Google AI Pro", 1.0)
+    assert antigravity.parse_plan_info({"paidTier": {"id": "g1-ultra-tier", "name": "Google AI Ultra"}}) == ("Google AI Ultra", 5.0)
+    assert antigravity.parse_plan_info({"currentTier": {"id": "free-tier", "name": "Antigravity"}}) == ("Free", None)
 
     fallback = parse_model_quota_windows(
         {
@@ -454,3 +466,23 @@ async def test_own_login_home_syncs_refreshed_oauth_token():
     assert "own-agy" in waiting
     assert '"refreshed"' in waiting["own-agy"].files["antigravity-oauth-token"]
     SIGN_INS.forget("own-agy")
+
+
+async def test_expired_oauth_token_triggers_refresh_before_limits_probe(tmp_path, monkeypatch):
+    acp_dir = tmp_path / "antigravity-acp"
+    acp_dir.mkdir(parents=True)
+    tok_path = acp_dir / "antigravity-oauth-token"
+    tok_path.write_text('{"token":{"access_token":"expired","expiry":"2020-01-01T00:00:00Z"}}', encoding="utf-8")
+
+    provider = AntigravityProvider()
+    refreshed = []
+
+    async def fake_refresh(home, creds):
+        refreshed.append(home)
+        tok_path.write_text('{"token":{"access_token":"fresh-token","expiry":"2099-01-01T00:00:00Z"}}', encoding="utf-8")
+
+    monkeypatch.setattr(provider, "_refresh_oauth_token", fake_refresh)
+    async with antigravity.httpx.AsyncClient() as client:
+        token = await provider._access_token(tmp_path, Credentials(antigravity_auth_mode="google"), client)
+    assert refreshed == [tmp_path]
+    assert token == ("fresh-token", None)
