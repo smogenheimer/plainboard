@@ -9,17 +9,15 @@ import type { Account, CheckResult } from "../../api/types";
 import { Button, ErrorText, IconButton, Input, Toggle } from "../../components/ui";
 import { smallModel } from "../../lib/models";
 import { CheckBadge } from "./SettingsDialog";
-import { AntigravitySignIn } from "./AntigravitySignIn";
-import { CodexSignIn } from "./CodexSignIn";
+import { SignIn } from "./SignIn";
 
 const MODES: Record<string, string[]> = {
   claude_code: ["api_key", "oauth_token", "runner_login"],
   codex: ["chatgpt", "api_key"],
   antigravity: ["google", "api_key"],
 };
-// A person's own subscription takes a token or a key: a sign-in on the runner is the installation's (services/accounts.OWN_MODES).
-const OWN_MODES = ["oauth_token", "api_key"];
-const modesOf = (provider: string, own: boolean) => MODES[provider].filter((mode) => !own || OWN_MODES.includes(mode));
+// The text of a sign-in kind: a person's own Claude login is made in the browser, the installation's in the runner's terminal.
+const modeText = (provider: string, mode: string, own: boolean) => `${MODE_TEXTS[provider]}.${mode}${own && provider === "claude_code" && mode === "runner_login" ? "Own" : ""}`;
 const SHARES = ["private", "people", "everyone"] as const;
 // i18n group of the sign-in kinds per provider
 const MODE_TEXTS: Record<string, string> = {
@@ -64,7 +62,7 @@ export function AccountsEditor({ provider, own = false }: { provider: string; ow
       ))}
       {mine.length > 1 && <p className="text-fg-3">{t("accounts.rotationHint")}</p>}
       {adds && (
-        <Button size="sm" icon={<Plus className="size-3.5" />} onClick={() => run(() => api.post("/accounts", { provider, auth_mode: modesOf(provider, own)[0] }))}>
+        <Button size="sm" icon={<Plus className="size-3.5" />} onClick={() => run(() => api.post("/accounts", { provider, auth_mode: MODES[provider][0] }))}>
           {t("accounts.add")}
         </Button>
       )}
@@ -78,7 +76,8 @@ function AccountCard({ account, onChange }: { account: Account; onChange: (actio
   const { t } = useTranslation();
   const meta = useMeta();
   const me = useMe();
-  const modes = modesOf(account.provider, account.owner_id != null);
+  const modes = MODES[account.provider]; // a person's own has every sign-in too: one in the browser is kept for it alone
+  const own = account.owner_id != null;
   const limits = useLimits();
   const detected = limits.data?.accounts.find((entry) => entry.account_id === account.id);
   const [label, setLabel] = useState(account.label);
@@ -131,8 +130,8 @@ function AccountCard({ account, onChange }: { account: Account; onChange: (actio
               account.auth_mode === mode ? "bg-sunk ring-fg" : "ring-line hover:bg-sunk",
             )}
           >
-            <div className="font-medium">{t(`${MODE_TEXTS[account.provider]}.${mode}`)}</div>
-            <div className="text-fg-3">{t(`${MODE_TEXTS[account.provider]}.${mode}Hint`)}</div>
+            <div className="font-medium">{t(modeText(account.provider, mode, own))}</div>
+            <div className="text-fg-3">{t(`${modeText(account.provider, mode, own)}Hint`)}</div>
           </button>
         ))}
       </div>
@@ -161,13 +160,14 @@ function AccountCard({ account, onChange }: { account: Account; onChange: (actio
           </span>
         </div>
       )}
-      {account.auth_mode === "runner_login" && (
+      {account.auth_mode === "runner_login" && own && <SignIn accountId={account.id} provider={account.provider} />}
+      {account.auth_mode === "runner_login" && !own && (
         <p className="rounded-sm bg-sunk p-3 text-fg-2">
           {t("settings.runnerLoginHint")} <code className="font-mono">docker compose exec -it runner claude</code>
         </p>
       )}
-      {account.provider === "codex" && account.auth_mode === "chatgpt" && <CodexSignIn accountId={account.id} />}
-      {account.provider === "antigravity" && account.auth_mode === "google" && <AntigravitySignIn accountId={account.id} />}
+      {account.provider === "codex" && account.auth_mode === "chatgpt" && <SignIn accountId={account.id} provider={account.provider} />}
+      {account.provider === "antigravity" && account.auth_mode === "google" && <SignIn accountId={account.id} provider={account.provider} />}
       {account.auth_mode !== "api_key" && (
         <label className="block space-y-1">
           <span className="block font-medium text-fg-2">{t("accounts.planSize")}</span>
@@ -209,7 +209,7 @@ function AccountCard({ account, onChange }: { account: Account; onChange: (actio
 }
 
 /** Who else may use a person's own subscription: nobody, some people, or everyone here. */
-function Sharing({ account, patch }: { account: Account; patch: (body: Record<string, unknown>) => Promise<boolean> }) {
+export function Sharing({ account, patch }: { account: Account; patch: (body: Record<string, unknown>) => Promise<boolean> }) {
   const { t } = useTranslation();
   const people = (useDirectory().data ?? []).filter((p) => p.id !== account.owner_id);
   const toggle = (id: number) =>

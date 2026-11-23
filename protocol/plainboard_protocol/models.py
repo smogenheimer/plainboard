@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import hashlib
+import json
 from typing import Annotated, Any, Literal, Union
 
 from pydantic import BaseModel, Field, TypeAdapter
@@ -41,19 +43,24 @@ class ProviderInfo(BaseModel):
 class Credentials(BaseModel):
     """Secrets forwarded per run. Never persisted by the runner."""
 
-    claude_auth_mode: Literal["oauth_token", "api_key", "runner_login"] = "oauth_token"
+    # "own_login": a person's own sign-in (Claude's browser sign-in, Codex's ChatGPT sign-in), kept by the app:
+    # ``login_files`` are written to a private folder only while runs of ``login_account`` go on (runner signins.py).
+    # Never the runner's home, so a runner that does not know this mode refuses the run instead.
+    claude_auth_mode: Literal["oauth_token", "api_key", "runner_login", "own_login"] = "oauth_token"
     claude_oauth_token: str | None = None
     anthropic_api_key: str | None = None
     openai_api_key: str | None = None
     # "chatgpt": the ChatGPT subscription signed in on the runner; "api_key": openai_api_key.
-    codex_auth_mode: Literal["chatgpt", "api_key"] = "chatgpt"
+    codex_auth_mode: Literal["chatgpt", "api_key", "own_login"] = "chatgpt"
     # Which of the runner's Codex sign-ins to use: every account has its own Codex home.
     codex_account: str = Field(default=DEFAULT_ACCOUNT, pattern=ACCOUNT_KEY_PATTERN)
-    # "google": Google account OAuth signed in on the runner; "api_key": gemini_api_key.
-    antigravity_auth_mode: Literal["google", "api_key"] = "google"
+    # "google": Google account OAuth signed in on the runner; "api_key": gemini_api_key; "own_login": per-user OAuth files.
+    antigravity_auth_mode: Literal["google", "api_key", "own_login"] = "google"
     # Which of the runner's Antigravity sign-ins to use: every account has its own isolated GEMINI_HOME.
     antigravity_account: str = Field(default=DEFAULT_ACCOUNT, pattern=ACCOUNT_KEY_PATTERN)
     gemini_api_key: str | None = None
+    login_account: str = Field(default=DEFAULT_ACCOUNT, pattern=ACCOUNT_KEY_PATTERN)
+    login_files: dict[str, str] | None = None  # file name -> content; None: no own sign-in
     # A provider that is an endpoint (ProviderInfo.endpoint): the account's address, empty for the usual one, and its key.
     endpoint_url: str = ""
     endpoint_key: str | None = None
@@ -175,8 +182,29 @@ class ProviderAccount(BaseModel):
     detail: str = ""  # e.g. the account's email and plan
     login_url: str | None = None  # device or browser sign-in: open this ...
     login_code: str | None = None  # ... and enter this code (device sign-in, e.g. Codex)
-    login_input: bool = False  # ... and paste back the code/URL from the page (e.g. Antigravity)
     login_error: str | None = None
+    needs_code: bool = False  # the page shows a code/URL after signing in, to be typed in here (Claude, Antigravity)
+
+
+def files_digest(files: dict[str, str] | None) -> str:
+    """What a set of sign-in files is, to tell versions apart; "" for none."""
+    return hashlib.sha256(json.dumps(files, sort_keys=True).encode()).hexdigest() if files else ""
+
+
+class SignInFiles(BaseModel):
+    """An own sign-in the runner holds for the app: a finished sign-in (``base`` ""), or what a run, a limit
+    check or a completion changed (a refreshed token), derived from the version with digest ``base``."""
+
+    provider: str
+    account: str
+    files: dict[str, str]
+    base: str = ""
+    digest: str = ""
+
+
+class SignInAck(BaseModel):
+    account: str
+    digest: str
 
 
 class ToolCallResult(BaseModel):

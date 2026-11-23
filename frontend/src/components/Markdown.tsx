@@ -11,6 +11,7 @@ import { isVideoName } from "../lib/media";
 import { Lightbox } from "./Lightbox";
 import { VideoThumb } from "./VideoThumb";
 import { linkMentions, MentionChip, usePeopleMap } from "./Mentions";
+import { MermaidBlock } from "./MermaidBlock";
 
 // Not inside words, URL paths or entities ("a#1", "x/#1", "&#1"), but "#1/#2" links both.
 const TICKET_REF = /(?<![\w#&])(?<![^\s\d]\/)#(\d+)\b/g;
@@ -69,6 +70,26 @@ function linkTickets() {
     });
   };
   return walk;
+}
+
+type CodeNode = MdNode & { lang?: string; position?: { start: { offset?: number }; end: { offset?: number } }; data?: { hProperties?: Record<string, unknown> } };
+const CLOSING_FENCE = /(`{3,}|~{3,})\s*$/;
+
+/** Remark plugin: marks a ```mermaid block whose closing fence is not written yet (a streaming answer),
+ * so it is not drawn half-done. */
+function markOpenMermaid() {
+  return (tree: MdNode, file: { value: unknown }) => {
+    const source = String(file.value);
+    const walk = (node: CodeNode) => {
+      if (node.type === "code" && node.lang === "mermaid") {
+        const lines = source.slice(node.position?.start.offset ?? 0, node.position?.end.offset ?? source.length).split("\n");
+        const open = lines.length < 2 || !CLOSING_FENCE.test(lines[lines.length - 1]);
+        node.data = { ...node.data, hProperties: { ...node.data?.hProperties, dataMermaid: open ? "open" : "closed" } };
+      }
+      node.children?.forEach(walk);
+    };
+    walk(tree);
+  };
 }
 
 function TicketLink({ number, children, className }: { number: number; children: ReactNode; className?: string }) {
@@ -232,7 +253,12 @@ function MdLink({ node: _node, ...props }: ComponentProps<"a"> & { node?: unknow
 const MD_COMPONENTS: Components = {
   a: MdLink,
   img: ({ src, alt }) => (typeof src === "string" ? <ZoomableImage src={src} alt={alt ?? ""} /> : null),
-  pre: ({ node, children }) => <CodeBlock text={(node ? hastText(node) : "").replace(/\r?\n$/, "")}>{children}</CodeBlock>,
+  pre: ({ node, children }) => {
+    const text = (node ? hastText(node) : "").replace(/\r?\n$/, "");
+    const block = <CodeBlock text={text}>{children}</CodeBlock>;
+    const mermaid = (node?.children[0] as { properties?: { dataMermaid?: string } } | undefined)?.properties?.dataMermaid;
+    return mermaid ? <MermaidBlock code={text} open={mermaid === "open"} fallback={block} /> : block;
+  },
   table: ({ node: _node, ...props }) => (
     <div className="scroll-thin overflow-x-auto">
       <table {...props} />
@@ -244,7 +270,7 @@ const MD_COMPONENTS: Components = {
 export const Markdown = memo(function Markdown({ children, className }: { children: string; className?: string }) {
   const people = usePeopleMap();
   const mentions = useMemo(() => linkMentions(people), [people]);
-  const plugins = useMemo(() => [remarkGfm, linkTickets, mentions], [mentions]);
+  const plugins = useMemo(() => [remarkGfm, linkTickets, markOpenMermaid, mentions], [mentions]);
   return (
     <div className={clsx("prose-chat break-words", className)}>
       <ReactMarkdown remarkPlugins={plugins} components={MD_COMPONENTS}>

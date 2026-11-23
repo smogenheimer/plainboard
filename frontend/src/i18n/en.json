@@ -788,7 +788,9 @@
       "oauth_token": "Own Claude login (token)",
       "oauth_tokenHint": "From claude setup-token",
       "runner_login": "Own Claude login (container)",
-      "runner_loginHint": "Interactive claude login"
+      "runner_loginHint": "Interactive claude login",
+      "runner_loginOwn": "Own Claude login (browser)",
+      "runner_loginOwnHint": "Sign in with your Claude account"
     },
     "oauthToken": "Claude login token",
     "apiKey": "Anthropic API key",
@@ -809,6 +811,11 @@
     "codexDeviceCode": "Open this page, sign in with your ChatGPT account and enter the code:",
     "codexWaiting": "Waiting for the sign-in…",
     "codexCancel": "Cancel",
+    "claudeSignIn": "Sign in with Claude",
+    "claudeOpenPage": "Open this page and sign in with your Claude account. The page then shows a code: copy all of it and enter it here.",
+    "claudeCode": "Code from the page",
+    "claudeSendCode": "Sign in",
+    "signedIn": "Signed in.",
     "codexOwnLoginNotice": "Uses your own ChatGPT account. Whether this is allowed for third-party tools depends on OpenAI's terms for your plan.",
     "antigravity": "Antigravity",
     "antigravityHint": "Google accounts and Gemini API keys for agents that run on Google's Antigravity CLI (Gemini, Claude and GPT models depending on your plan).",
@@ -1128,7 +1135,7 @@
     "own": {
       "label": "My subscriptions",
       "description": "Your own subscriptions and API keys, for your projects and whom you share them with.",
-      "hint": "Your projects run on these, besides what an admin allows you. Only you and admins can change or delete them; a token or key is never shown again. Your own take a token or an API key: signing in on the runner (Claude login, ChatGPT sign-in) is only for the installation's subscriptions, because every agent on a runner could read such a sign-in.",
+      "hint": "Your projects run on these, besides what an admin allows you. Only you and admins can change or delete them; a token or key is never shown again. A sign-in in the browser (Claude login, ChatGPT) is kept for that subscription only and goes to the runner only while one of its turns runs, never into the runner's shared home.",
       "peoples": "People's own subscriptions",
       "peoplesHint": "Added by people for their projects. You can change, share and delete them; their tokens and keys are not shown to you either."
     },
@@ -1595,5 +1602,12 @@
     "add": "Add language",
     "hint": "Every change is saved at once. Removing a language keeps its texts on the tickets: they come back when you add it again.",
     "confirmRemove": "{{count}} tickets have customer texts in {{language}}. Remove the language anyway? The texts stay stored and come back when you add {{language}} again."
+  },
+  "markdown": {
+    "diagram": "Diagram",
+    "enlargeDiagram": "Show diagram large",
+    "showCode": "Show code",
+    "showDiagram": "Show diagram",
+    "diagramError": "The diagram could not be drawn: {{error}}"
   }
 }

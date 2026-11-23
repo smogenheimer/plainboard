@@ -47,6 +47,7 @@ class JobWatcher:
             await self._runs.check_turns()  # turns the runner lost: the same kind of look
             await self._runs.check_runners()  # external runners that stay away
             await self._runs.settle_open_assignments()  # none stays open for good with nothing left to wait for
+            await self._runs.check_sign_ins()  # people's own sign-ins a runner refreshed
         except Exception:
             log.exception("Turn check failed")
         async with self._sm() as s:

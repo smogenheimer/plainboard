@@ -94,6 +94,7 @@ from .tunnel import Tunnel
 log = logging.getLogger(__name__)
 
 MAX_ASK_DEPTH = 3
+SIGN_INS_SECONDS = 60  # how often the runners are asked for people's own sign-ins that were refreshed (check_sign_ins)
 ASK_TIMEOUT_SECONDS = 900
 ASK_BUSY_TIMEOUT_SECONDS = 120  # the teammate is in a turn of unknown length, so don't block the asker for long
 CANCEL_GRACE_SECONDS = 15
@@ -226,6 +227,8 @@ class RunManager:
         self._lost: set[int] = set()  # turns being ended because the runner lost them
         self._limits_asked = 0.0
         self._limits_task: asyncio.Task[None] | None = None
+        self._sign_ins_asked = 0.0
+        self._sign_in_tasks: set[asyncio.Task[None]] = set()
         self._state_tasks: dict[int, asyncio.Task[None]] = {}  # tickets whose state is being rewritten
         self._resting: set[asyncio.Task[None]] = set()  # paused projects whose turns and jobs are being stopped
         self._run_tasks: set[asyncio.Task[None]] = set()  # every turn's task until it is done
@@ -305,6 +308,33 @@ class RunManager:
             await s.execute(update(Runner).where(Runner.id.in_(due)).values(last_seen_at=utcnow()))
             await s.commit()
         self._seen.update(dict.fromkeys(due, now))
+
+    async def check_sign_ins(self, force: bool = False) -> None:
+        """Keep what the runners hold of people's own sign-ins (a limit check or a completion may have
+        refreshed one), at most every ``SIGN_INS_SECONDS`` (the job watcher's look), and only while there are any."""
+        if not force and time.monotonic() - self._sign_ins_asked < SIGN_INS_SECONDS:
+            return
+        self._sign_ins_asked = time.monotonic()
+        async with self._sm() as s:
+            if not await account_service.any_own_login(s):
+                return
+            for runner_id in self.runners.in_use():
+                if self.runners.connected(runner_id):
+                    await account_service.take_sign_ins(s, self.runners.client(runner_id))
+
+    def _take_sign_ins_soon(self, project_id: int) -> None:
+        """A turn on an own sign-in ended: what it refreshed is kept at once, not only at the next look."""
+
+        async def take() -> None:
+            try:
+                async with self._sm() as s:
+                    await account_service.take_sign_ins(s, self.runners.of(project_id))
+            except Exception:
+                log.exception("Could not keep the sign-ins of project %s's runner", project_id)
+
+        task = asyncio.create_task(take(), name=f"sign-ins-{project_id}")
+        self._sign_in_tasks.add(task)
+        task.add_done_callback(self._sign_in_tasks.discard)
 
     async def check_runners(self) -> None:
         """An external runner that stays away: the managers of its projects hear it once (job_watcher's look).
@@ -965,6 +995,8 @@ class RunManager:
                 if report.windows:
                     await limits_service.record(s, account.key, report.windows, complete=report.complete)
                 await limits_service.record_plan(s, account.key, report.plan, report.plan_size)
+            if any(account_service.own_login(a) for a in accounts):
+                await account_service.take_sign_ins(s, self.runner)
 
     async def wind_down(self, s: AsyncSession, agent: Agent, reason: str = "", *, jobs_end: bool = False) -> bool:
         """Let an agent finish safely: drop what it has not started and tell its running turn to wrap up.
@@ -1316,12 +1348,14 @@ class RunManager:
 
     async def _execute(self, run_id: int, agent_id: int) -> None:
         ctx: RunContext | None = None
+        own_login = False
         self._preparing.add(run_id)
         try:
             prepared = await self._prepare(run_id)
             if prepared is None:
                 return
             spec, ctx = prepared
+            own_login = spec.credentials.login_files is not None
             await self._sync_uploads(ctx.project_id, spec.prompt)
             for attempt in range(RUNNER_TRIES):
                 try:
@@ -1358,6 +1392,8 @@ class RunManager:
         finally:
             if ctx:
                 self._tokens.pop(ctx.token, None)
+                if own_login:
+                    self._take_sign_ins_soon(ctx.project_id)
             self._running.pop(run_id, None)
             self._unlimited.discard(run_id)
             self._cancel_requested.discard(run_id)

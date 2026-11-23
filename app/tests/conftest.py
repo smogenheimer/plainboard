@@ -103,6 +103,7 @@ class FakeRunner:
 
     def __init__(self, base_url: str):
         self.specs: list[RunSpec] = []
+        self.sign_in_outbox = {}
         self.completions: list[CompletionSpec] = []
         self.notices: list[tuple[int, str]] = []
         self.limit_windows: list[LimitWindow] = []
@@ -368,23 +369,63 @@ class FakeRunner:
     def forget_providers(self) -> None:
         self.providers_forgotten = getattr(self, "providers_forgotten", 0) + 1
 
-    async def provider_account(self, provider: str, key: str, action: str | None = None, *, code: str = ""):
+    # People's own sign-ins (runner signins.py): one in progress per account key, and what waits for the app.
+    sign_in_outbox: dict  # account key -> SignInFiles
+    sign_in_files = {".credentials.json": '{"claudeAiOauth": {"accessToken": "sk-ant-oat-olga", "refreshToken": "sk-ant-ort-olga"}}'}
+
+    async def provider_account(self, provider, key, action=None, own=False):
         from plainboard_protocol import ProviderAccount
 
-        self.account_actions = getattr(self, "account_actions", []) + [(provider, key, action, code)]
+        self.account_actions = getattr(self, "account_actions", []) + [(provider, key, action, own)]
+        if own:
+            if action == "login":
+                self.signing_in = (provider, key, True)
+                url = "https://accounts.google.com/o/oauth2/auth?state=test" if provider == "antigravity" else "https://claude.example/oauth"
+                return ProviderAccount(login_url=url, needs_code=True)
+            if action == "logout":
+                self.sign_in_outbox.pop(key, None)
+                return ProviderAccount()
+            if getattr(self, "signing_in", None) == (provider, key, True):
+                url = "https://accounts.google.com/o/oauth2/auth?state=test" if provider == "antigravity" else "https://claude.example/oauth"
+                return ProviderAccount(login_url=url, needs_code=True)
+            return ProviderAccount()
         signed = getattr(self, "signed_in_accounts", set())
         self.signed_in_accounts = signed
         if action == "logout":
             signed.discard((provider, key))
             return ProviderAccount()
         if action == "login":
-            if code:
-                signed.add((provider, key))
-                return ProviderAccount(signed_in=True, detail="user@example.com")
+            self.signing_in = (provider, key, False)
             if provider == "antigravity":
-                return ProviderAccount(signed_in=False, login_url="https://accounts.google.com/o/oauth2/auth?state=test", login_input=True)
+                return ProviderAccount(signed_in=False, login_url="https://accounts.google.com/o/oauth2/auth?state=test", needs_code=True)
             return ProviderAccount(signed_in=False, login_url="https://auth.openai.com/device", login_code="ABCD-1234")
         return ProviderAccount(signed_in=(provider, key) in signed, detail="user@example.com" if (provider, key) in signed else "")
+
+    async def provider_login_code(self, provider, key, code):
+        from plainboard_protocol import ProviderAccount, SignInFiles, files_digest
+
+        signing = getattr(self, "signing_in", None)
+        own = bool(signing and signing[1] == key and signing[2])
+        url = "https://accounts.google.com/o/oauth2/auth?state=test" if provider == "antigravity" else "https://claude.example/oauth"
+        if code != "good#code" and not (provider == "antigravity" and code.startswith("4/")):
+            return ProviderAccount(login_url=url, needs_code=True, login_error="That doesn't look like the full code.")
+        self.signing_in = None
+        if own:
+            files = {"antigravity-oauth-token": '{"token":{"access_token":"ya29.own"}}'} if provider == "antigravity" else self.sign_in_files
+            self.sign_in_outbox[key] = SignInFiles(provider=provider, account=key, files=files, digest=files_digest(files))
+            return ProviderAccount(signed_in=True)
+        signed = getattr(self, "signed_in_accounts", set())
+        self.signed_in_accounts = signed
+        signed.add((provider, key))
+        return ProviderAccount(signed_in=True, detail="user@example.com")
+
+    async def sign_ins(self):
+        return list(self.sign_in_outbox.values())
+
+    async def ack_sign_ins(self, acks):
+        for ack in acks:
+            if (entry := self.sign_in_outbox.get(ack.account)) is not None and entry.digest == ack.digest:
+                del self.sign_in_outbox[ack.account]
 
     async def provider_models(self, provider, credentials):
         self.models_asked = (provider, credentials)

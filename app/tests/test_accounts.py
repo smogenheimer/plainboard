@@ -549,10 +549,10 @@ def test_antigravity_accounts_signin_credentials_and_cleanup(client, project):
     assert google["provider"] == "antigravity" and google["auth_mode"] == "google"
     assert client.post("/api/accounts", json={"provider": "antigravity", "auth_mode": "chatgpt"}).status_code == 400
 
-    # Headless Google OAuth flow: start returns login_url + login_input, submitting code signs in and invalidates cached models.
+    # Headless Google OAuth flow: start returns login_url + needs_code, submitting code signs in and invalidates cached models.
     started = client.post(f"/api/accounts/{google['id']}/signin").json()
-    assert started["login_input"] is True and started["login_url"].startswith("https://accounts.google.com/")
-    finished = client.post(f"/api/accounts/{google['id']}/signin", json={"code": "4/0A-code"}).json()
+    assert started["needs_code"] is True and started["login_url"].startswith("https://accounts.google.com/")
+    finished = client.post(f"/api/accounts/{google['id']}/signin/code", json={"code": "4/0A-code"}).json()
     assert finished["signed_in"] is True and finished["detail"] == "user@example.com"
     assert getattr(runner(client), "providers_forgotten", 0) >= 1
 

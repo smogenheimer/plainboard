@@ -12,13 +12,15 @@ account only when another one is clearly better (``MARGIN``).
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import time
 import uuid
 from datetime import timedelta
 from typing import Any
 
-from plainboard_protocol import LimitWindow, ModelInfo, ProviderInfo
+from plainboard_protocol import LimitWindow, ModelInfo, ProviderInfo, SignInAck, files_digest
 from sqlalchemy import func, select, update as sql_update
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -37,9 +39,11 @@ AUTH_MODES = {
 }
 # Every other provider is an endpoint (ProviderInfo.endpoint): which ones exist is the runner's list, not the app's.
 ENDPOINT_MODES = ("api_key",)
-# What a person who is no admin may add: a token or key that travels with the run. A sign-in on the runner
-# (runner_login, Codex's ChatGPT sign-in, Antigravity's Google sign-in) lives in the runner's home, which every agent on it can read: not one's own.
-OWN_MODES = ("oauth_token", "api_key")
+# A sign-in in the browser (Claude's runner_login, Codex's ChatGPT sign-in, Antigravity's Google sign-in).
+# The installation's lives in the runner's home. A person's own is never there, since every agent on the
+# runner reads that home: its files are kept here, encrypted like a token, and go with each run of it into
+# a private folder (runner signins.py), from which refreshed ones come back (``take_sign_ins``).
+LOGIN_MODES = ("runner_login", "chatgpt", "google")
 LABELS = {"claude_code": "Claude", "codex": "Codex", "antigravity": "Antigravity"}
 ENV_SECRETS = {
     ("claude_code", "oauth_token"): "CLAUDE_CODE_OAUTH_TOKEN",
@@ -58,11 +62,26 @@ HOUR = 3600
 WEEK_HOURS = 7 * 24
 
 
-def _check_mode(provider: str, mode: str, own: bool = False) -> None:
+log = logging.getLogger(__name__)
+
+
+def _check_mode(provider: str, mode: str) -> None:
     if mode not in AUTH_MODES.get(provider, ENDPOINT_MODES):
         raise ServiceError(f"Unknown sign-in for {provider}: {mode}")
-    if own and mode not in OWN_MODES:
-        raise ServiceError("Your own subscriptions take a token or an API key; a sign-in on the runner is for the installation's (an admin's).")
+
+
+def own_login(account: Account) -> bool:
+    """A person's own browser sign-in: kept here, never in the runner's home."""
+    return account.owner_id is not None and account.auth_mode in LOGIN_MODES
+
+
+def login_files(account: Account) -> dict[str, str]:
+    """The files of an own sign-in; none while it is not signed in."""
+    try:
+        files = json.loads(decrypt(account.secret_enc) or "{}")
+    except ValueError:
+        return {}
+    return {str(k): str(v) for k, v in files.items()} if isinstance(files, dict) else {}
 
 
 def _models(names: list[str]) -> list[str]:
@@ -148,7 +167,9 @@ async def create(session: AsyncSession, data: AccountCreate, name: str = "", use
     """``name``: what the provider is called, for the label of an account that got none. ``user``: who
     adds it; an admin's is the installation's, anyone else's their own (``Account.owner_id``)."""
     own = user is not None and not user.is_admin
-    _check_mode(data.provider, data.auth_mode, own)
+    _check_mode(data.provider, data.auth_mode)
+    if own and data.auth_mode in LOGIN_MODES and data.secret:
+        raise ServiceError("This subscription is signed in in the browser, not with a token.")
     count = len(await list_accounts(session, data.provider))
     label = data.label.strip() or ((name or LABELS.get(data.provider) or data.provider) + (f" {count + 1}" if count else ""))
     account = Account(
@@ -174,10 +195,12 @@ async def update(session: AsyncSession, account: Account, data: AccountUpdate) -
     """Whoever changes it may manage it (``managed``). Shared with fewer people: projects that may no longer
     use it choose automatically again (``release``)."""
     if data.auth_mode is not None and data.auth_mode != account.auth_mode:
-        _check_mode(account.provider, data.auth_mode, account.owner_id is not None)
+        _check_mode(account.provider, data.auth_mode)
         account.auth_mode = data.auth_mode
         if data.secret is None:
             account.secret_enc = None  # a token is no API key
+    if data.secret and own_login(account):
+        raise ServiceError("This subscription is signed in in the browser, not with a token.")
     if data.secret is not None:
         account.secret_enc = encrypt(data.secret)
     if data.label is not None and data.label.strip():
@@ -405,13 +428,22 @@ def fields(account: Account | None) -> dict[str, Any]:
     """The account's part of the run's ``Credentials``."""
     if account is None:
         return {}
+    if own_login(account):  # its files only, never a token field: a runner that does not know "own_login" refuses the run
+        mode_field = {"claude_code": "claude_auth_mode", "codex": "codex_auth_mode", "antigravity": "antigravity_auth_mode"}[account.provider]
+        own = {mode_field: "own_login", "login_account": account.key, "login_files": login_files(account)}
+        own |= {"claude_oauth_token": None, "anthropic_api_key": None, "openai_api_key": None, "gemini_api_key": None}
+        if account.provider == "codex":
+            own["codex_account"] = account.key
+        elif account.provider == "antigravity":
+            own["antigravity_account"] = account.key
+        return own
     value = secret(account)
-    if account.provider == "claude_code":
-        return {"claude_auth_mode": account.auth_mode, "claude_oauth_token" if account.auth_mode == "oauth_token" else "anthropic_api_key": value}
+    if account.provider == "claude_code":  # login_files: none of another account's, after a switch (run_manager._switch_account)
+        return {"claude_auth_mode": account.auth_mode, "claude_oauth_token" if account.auth_mode == "oauth_token" else "anthropic_api_key": value, "login_files": None}
     if account.provider == "codex":
-        return {"codex_auth_mode": account.auth_mode, "codex_account": account.key, "openai_api_key": value}
+        return {"codex_auth_mode": account.auth_mode, "codex_account": account.key, "openai_api_key": value, "login_files": None}
     if account.provider == "antigravity":
-        return {"antigravity_auth_mode": account.auth_mode, "antigravity_account": account.key, "gemini_api_key": value}
+        return {"antigravity_auth_mode": account.auth_mode, "antigravity_account": account.key, "gemini_api_key": value, "login_files": None}
     return {"endpoint_url": account.endpoint_url, "endpoint_key": value, "endpoint_context": account.context_tokens}
 
 
@@ -433,3 +465,33 @@ async def catalog(session: AsyncSession, providers: list[ProviderInfo]) -> list[
         if models:
             out.append(provider.model_copy(update={"models": models}))
     return out
+
+
+async def any_own_login(session: AsyncSession) -> bool:
+    return await session.scalar(select(Account.id).where(Account.owner_id.is_not(None), Account.auth_mode.in_(LOGIN_MODES)).limit(1)) is not None
+
+
+async def take_sign_ins(session: AsyncSession, runner: Any) -> int:
+    """Keep what a runner holds of people's own sign-ins: a finished sign-in, or files a run refreshed. One
+    derived from an older version than the one kept here is dropped: the newest wins. Returns how many were kept."""
+    try:
+        waiting = await runner.sign_ins()
+    except Exception as exc:  # away, or a runner from before own sign-ins
+        log.debug("No sign-ins from the runner: %s", exc)
+        return 0
+    if not waiting:
+        return 0
+    kept, acks = 0, []
+    for entry in waiting:
+        account = await session.scalar(select(Account).where(Account.key == entry.account))
+        if account is not None and own_login(account) and account.provider == entry.provider and entry.files:
+            if not entry.base or entry.base == files_digest(login_files(account) or None):
+                account.secret_enc = encrypt(json.dumps(entry.files))
+                kept += 1
+        acks.append(SignInAck(account=entry.account, digest=entry.digest))
+    await session.commit()
+    try:
+        await runner.ack_sign_ins(acks)
+    except Exception as exc:
+        log.info("Sign-ins kept, the runner did not take the acknowledgement: %s", exc)
+    return kept

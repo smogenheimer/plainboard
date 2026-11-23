@@ -28,15 +28,11 @@ def test_a_person_adds_an_own_subscription_that_only_their_projects_use_and_nobo
     friend(client)
     friend(client, "bob")
     as_friend(client)
-    refused = client.post("/api/accounts", json={**TOKEN, "auth_mode": "runner_login"})
-    assert refused.status_code == 400 and "token or an API key" in refused.json()["detail"]
-    assert client.post("/api/accounts", json={"provider": "codex", "auth_mode": "chatgpt"}).status_code == 400
     resp = client.post("/api/accounts", json={**TOKEN, "label": "Olga's", "secret": "tok-olga"})
     assert resp.status_code == 201, resp.text
     own = resp.json()
     assert own["owner_id"] is not None and own["share"] == "private" and own["can_manage"] and own["secret_set"]
     assert "tok-olga" not in resp.text and all("tok-olga" not in str(a) for a in client.get("/api/accounts").json())
-    assert client.patch(f"/api/accounts/{own['id']}", json={"auth_mode": "runner_login"}).status_code == 400
     pid = client.post("/api/projects", json={"name": "Olga's", "account_id": own["id"]}).json()["id"]
     assert ids(client, pid) == installation | {own["id"]}
     dev = client.post(f"/api/projects/{pid}/agents", json={"name": "Dev", "role": "Developer", "description": "x"}).json()
@@ -117,3 +113,69 @@ def test_a_deleted_own_subscription_or_person_releases_what_ran_on_it(client, pr
     assert sum("'Gone' was deleted" in text for text in inbox(client, project["id"])) == 1
     assert client.delete(f"/api/users/{olga['id']}").status_code == 204
     assert later["id"] not in {a["id"] for a in client.get("/api/accounts").json()}
+
+
+def test_own_browser_sign_ins_are_kept_per_subscription_and_only_reach_its_runs(client, project):
+    """Claude's browser sign-in and Codex's ChatGPT sign-in for someone who is no admin: made in a private
+    folder on the runner, kept here encrypted, never shown, and sent only with that subscription's runs."""
+    from plainboard_protocol import SignInFiles, files_digest
+
+    runner = client.app_ref.state.runner
+    friend(client)
+    as_friend(client)
+    claude = client.post("/api/accounts", json={"provider": "claude_code", "auth_mode": "runner_login", "label": "Olga's login"})
+    assert claude.status_code == 201, claude.text
+    claude = claude.json()
+    codex = client.post("/api/accounts", json={"provider": "codex", "auth_mode": "chatgpt"})
+    assert codex.status_code == 201, codex.text
+    assert client.patch(f"/api/accounts/{claude['id']}", json={"secret": "a token"}).status_code == 400  # signed in in the browser only
+    token = client.post("/api/accounts", json={**TOKEN, "label": "Olga's token", "secret": "tok-olga"}).json()
+
+    url = f"/api/accounts/{claude['id']}/signin"
+    assert client.get(url).json()["signed_in"] is False
+    started = client.post(url).json()
+    assert started["needs_code"] and started["login_url"]
+    refused = client.post(f"{url}/code", json={"code": "half"}).json()
+    assert refused["login_error"] and not refused["signed_in"]
+    done = client.post(f"{url}/code", json={"code": "good#code"})
+    assert done.status_code == 200 and done.json()["signed_in"], done.text
+    assert not runner.sign_in_outbox  # kept here, so the runner forgets it
+    secrets = ("sk-ant-oat-olga", "sk-ant-ort-olga")
+    for path in ("/api/accounts", url, "/api/limits", f"/api/projects/{project['id']}/accounts"):
+        resp = client.get(path)
+        assert not [x for x in secrets if x in resp.text], path
+    assert next(a for a in client.get("/api/accounts").json() if a["id"] == claude["id"])["secret_set"]
+
+    # Its runs get the files in a private folder ("own_login"), no token; another subscription's runs never get them.
+    pid = client.post("/api/projects", json={"name": "Olga's", "account_id": claude["id"]}).json()["id"]
+    dev = client.post(f"/api/projects/{pid}/agents", json={"name": "Dev", "role": "Developer", "description": "x"}).json()
+    assert client.post(f"/api/agents/{dev['id']}/messages", json={"text": "SAY hi"}).status_code == 202
+    wait_for(lambda: idle(client, pid))
+    creds = runner.specs[-1].credentials
+    assert creds.claude_auth_mode == "own_login" and creds.login_files == runner.sign_in_files and creds.login_account != "default"
+    assert creds.claude_oauth_token is None and creds.anthropic_api_key is None
+    assert client.patch(f"/api/projects/{pid}", json={"account_id": token["id"]}).status_code == 200
+    assert client.post(f"/api/agents/{dev['id']}/messages", json={"text": "SAY again"}).status_code == 202
+    wait_for(lambda: idle(client, pid))
+    other = runner.specs[-1].credentials
+    assert other.claude_oauth_token == "tok-olga" and other.login_files is None and "sk-ant" not in runner.specs[-1].model_dump_json()
+
+    # A run refreshed the token: kept. One derived from an older version comes too late and is dropped.
+    stored = runner.sign_in_files
+    fresh = {".credentials.json": '{"claudeAiOauth": {"accessToken": "sk-ant-oat-new"}}'}
+    key = creds.login_account
+    runner.sign_in_outbox[key] = SignInFiles(provider="claude_code", account=key, files=fresh, base=files_digest(stored), digest=files_digest(fresh))
+    client.portal.call(client.app_ref.state.runs.check_sign_ins, True)
+    stale = {".credentials.json": '{"claudeAiOauth": {"accessToken": "sk-ant-oat-old"}}'}
+    runner.sign_in_outbox[key] = SignInFiles(provider="claude_code", account=key, files=stale, base=files_digest(stored), digest=files_digest(stale))
+    client.portal.call(client.app_ref.state.runs.check_sign_ins, True)
+    assert not runner.sign_in_outbox
+    assert client.patch(f"/api/projects/{pid}", json={"account_id": claude["id"]}).status_code == 200
+    assert client.post(f"/api/agents/{dev['id']}/messages", json={"text": "SAY third"}).status_code == 202
+    wait_for(lambda: idle(client, pid))
+    assert runner.specs[-1].credentials.login_files == fresh
+
+    # Signed out: gone here as well. Codex's own ChatGPT sign-in works the same way.
+    assert client.delete(url).json()["signed_in"] is False
+    assert not next(a for a in client.get("/api/accounts").json() if a["id"] == claude["id"])["secret_set"]
+    assert client.post(f"/api/accounts/{codex.json()['id']}/signin").status_code == 200

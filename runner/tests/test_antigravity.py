@@ -434,3 +434,23 @@ async def test_turn_runner_permissions_steering_and_urgent_interrupt(tmp_path, m
     prompts = [p["prompt"][0]["text"] for m, p in server.requests if m == "session/prompt"]
     assert len(prompts) == 2 and "Stop now" in prompts[1]
     assert events[-1].type == "result" and not events[-1].is_error and events[-1].text == "Stopped cleanly."
+
+
+async def test_own_login_home_syncs_refreshed_oauth_token():
+    from plainboard_runner.signins import SIGN_INS
+
+    SIGN_INS.forget("own-agy")
+    provider = AntigravityProvider()
+    creds = Credentials(
+        antigravity_auth_mode="own_login",
+        login_account="own-agy",
+        login_files={"antigravity-oauth-token": '{"token":{"access_token":"old"}}'},
+    )
+    async with provider._home(creds) as home:
+        tok = home / "antigravity-acp" / "antigravity-oauth-token"
+        assert tok.is_file() and '"old"' in tok.read_text()
+        tok.write_text('{"token":{"access_token":"refreshed"}}')
+    waiting = {entry.account: entry for entry in SIGN_INS.waiting()}
+    assert "own-agy" in waiting
+    assert '"refreshed"' in waiting["own-agy"].files["antigravity-oauth-token"]
+    SIGN_INS.forget("own-agy")

@@ -15,7 +15,7 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import Response, StreamingResponse
-from plainboard_protocol import ACCOUNT_KEY_PATTERN, DEFAULT_ACCOUNT, BranchRef, CandidatesSpec, CheckResult, CleanupCandidate, CleanupResult, CleanupSpec, CommitRef, CompletionResult, CompletionSpec, Credentials, DeleteSpec, ErrorEvent, GitLogResult, GitLogSpec, GitPresentResult, GitPresentSpec, JobPort, JobTiming, JobSpec, JobState, LimitsEvent, MachineUsage, ProjectFiles, ProviderAccount, ProviderInfo, PullRequestCheck, PullRequestRef, PullRequestState, RepoSpec, RerunRef, RunSpec, SkillFetch, TidyResult, TidySpec, TrainCheckSpec, TrainLandSpec, TrainResult, TrainSpec, TrimSpec, UnpushedSpec, UnpushedWork, UpstreamRef, UpstreamState
+from plainboard_protocol import ACCOUNT_KEY_PATTERN, DEFAULT_ACCOUNT, BranchRef, CandidatesSpec, CheckResult, CleanupCandidate, CleanupResult, CleanupSpec, CommitRef, CompletionResult, CompletionSpec, Credentials, DeleteSpec, ErrorEvent, GitLogResult, GitLogSpec, GitPresentResult, GitPresentSpec, JobPort, JobTiming, JobSpec, JobState, LimitsEvent, MachineUsage, ProjectFiles, ProviderAccount, ProviderInfo, SignInAck, SignInFiles, PullRequestCheck, PullRequestRef, PullRequestState, RepoSpec, RerunRef, RunSpec, SkillFetch, TidyResult, TidySpec, TrainCheckSpec, TrainLandSpec, TrainResult, TrainSpec, TrimSpec, UnpushedSpec, UnpushedWork, UpstreamRef, UpstreamState
 from pydantic import BaseModel, Field
 
 from . import cleanup
@@ -28,6 +28,7 @@ from . import jobs
 from . import notices
 from . import ports
 from . import selfupdate
+from . import signins
 from . import skills
 from . import snapshots
 from . import trains
@@ -35,6 +36,7 @@ from . import translate
 from . import usage
 from .providers import get_provider, list_providers
 from .runlog import Gone, RunLog
+from .signins import SIGN_INS
 from .tool_bridge import ToolBridge
 from .workspace import WorkspaceError, config_args, git_env, prepare_workspace, project_folder, remove_folder, run_cmd
 
@@ -46,6 +48,7 @@ _background: set[asyncio.Task[None]] = set()
 
 @asynccontextmanager
 async def lifespan(_app: FastAPI):
+    signins.remove(signins.ROOT)  # private sign-in folders a former process left (killed mid-run): nothing uses them now
     _background.add(asyncio.create_task(usage.keep_measured()))
     _background.add(asyncio.create_task(usage.keep_sampling()))
     # An external runner connects out to PlainBoard (connect.py); the built-in one is called by the app.
@@ -152,9 +155,10 @@ AccountKey = Query(DEFAULT_ACCOUNT, pattern=ACCOUNT_KEY_PATTERN)
 
 
 @app.get("/providers/{name}/account", response_model=ProviderAccount)
-async def provider_account(name: str, key: str = AccountKey) -> ProviderAccount:
+async def provider_account(name: str, key: str = AccountKey, own: bool = False) -> ProviderAccount:
+    """``own``: a person's own sign-in, made in a private folder (signins.py); a finished one waits in ``/signins``."""
     try:
-        account = await _signin_provider(name).account(key)
+        account = await _signin_provider(name).account(key, own=own)
     except Exception as exc:
         raise HTTPException(502, str(exc)[:1000]) from exc
     if account is None:
@@ -162,17 +166,24 @@ async def provider_account(name: str, key: str = AccountKey) -> ProviderAccount:
     return account
 
 
-class LoginInput(BaseModel):
-    code: str = ""
-
-
 @app.post("/providers/{name}/login", response_model=ProviderAccount)
-async def provider_login(name: str, key: str = AccountKey, body: LoginInput | None = None) -> ProviderAccount:
-    provider = _signin_provider(name)
+async def provider_login(name: str, key: str = AccountKey, own: bool = False) -> ProviderAccount:
     try:
-        if body and body.code.strip():
-            return await provider.submit_login(key, body.code.strip())
-        return await provider.login(key)
+        return await _signin_provider(name).login(key, own=own)
+    except NotImplementedError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except Exception as exc:
+        raise HTTPException(502, str(exc)[:1000]) from exc
+
+
+class LoginCode(BaseModel):
+    code: str = Field(min_length=1, max_length=2000)
+
+
+@app.post("/providers/{name}/login/code", response_model=ProviderAccount)
+async def provider_login_code(name: str, body: LoginCode, key: str = AccountKey) -> ProviderAccount:
+    try:
+        return await _signin_provider(name).login_code(key, body.code)
     except NotImplementedError as exc:
         raise HTTPException(404, str(exc)) from exc
     except ValueError as exc:
@@ -182,13 +193,24 @@ async def provider_login(name: str, key: str = AccountKey, body: LoginInput | No
 
 
 @app.post("/providers/{name}/logout", response_model=ProviderAccount)
-async def provider_logout(name: str, key: str = AccountKey) -> ProviderAccount:
+async def provider_logout(name: str, key: str = AccountKey, own: bool = False) -> ProviderAccount:
     try:
-        return await _signin_provider(name).logout(key)
+        return await _signin_provider(name).logout(key, own=own)
     except NotImplementedError as exc:
         raise HTTPException(404, str(exc)) from exc
     except Exception as exc:
         raise HTTPException(502, str(exc)[:1000]) from exc
+
+
+@app.get("/signins", response_model=list[SignInFiles])
+async def sign_ins() -> list[SignInFiles]:
+    """People's own sign-ins that are new or were refreshed here, for the app to keep (signins.py)."""
+    return SIGN_INS.waiting()
+
+
+@app.post("/signins/ack", status_code=204)
+async def sign_ins_ack(body: list[SignInAck]) -> None:
+    SIGN_INS.ack(body)
 
 
 async def _execute(spec: RunSpec, queue: asyncio.Queue[str | None]) -> None:

@@ -67,9 +67,10 @@ from plainboard_protocol import (
     UsageEvent,
 )
 
-from .. import notices
+from .. import notices, signins
 from ..config import TOOL_RESULT_PREVIEW_CHARS
 from ..mcp_stdio import BRIDGE_FILE_ENV, write_bridge_file
+from ..signins import SIGN_INS
 from ..tool_bridge import ToolBridge
 from ..workspace import tool_env
 from .base import Provider
@@ -78,6 +79,7 @@ log = logging.getLogger(__name__)
 
 ANTIGRAVITY_BIN_ENV = "PLAINBOARD_ANTIGRAVITY_BIN"
 ACCOUNTS_HOME = Path.home() / ".plainboard" / "antigravity-accounts"
+SIGN_IN_FILES = ("antigravity-oauth-token", "acp_token.json")
 BRIDGE_DIR = Path(tempfile.gettempdir()) / "plainboard-bridge"
 MCP_SERVER_NAME = "plainboard"
 MAX_LINE_BYTES = 64 * 1024 * 1024
@@ -1601,6 +1603,7 @@ class AntigravityProvider(Provider):
     def __init__(self) -> None:
         self._models: tuple[float, list[ModelInfo]] | None = None
         self._logins: dict[str, CodeLogin] = {}
+        self._own_logins: dict[str, CodeLogin] = {}
         self._emails: dict[str, str] = {}
 
     def info(self) -> ProviderInfo:
@@ -1649,8 +1652,35 @@ class AntigravityProvider(Provider):
                 remove_session_files(home, session_id)
         return self.info()
 
-    def _home(self, creds: Credentials) -> Path:
-        return account_home(creds.antigravity_account, api_key=creds.antigravity_auth_mode == "api_key")
+    @contextlib.asynccontextmanager
+    async def _home(self, creds: Credentials) -> AsyncIterator[Path]:
+        """Account home: the installation's per-account GEMINI_HOME, or for ``own_login`` a private 0700 folder
+        managed by ``SIGN_INS`` whose token files are synced in/out of ``antigravity-acp/``."""
+        if creds.antigravity_auth_mode == "own_login":
+            if not creds.login_files:
+                raise AntigravityError("This Antigravity subscription is not signed in (Settings → My subscriptions).")
+
+            def _seed_acp(private: Path) -> None:
+                acp_dir = private / "antigravity-acp"
+                acp_dir.mkdir(mode=0o700, parents=True, exist_ok=True)
+                for name in SIGN_IN_FILES:
+                    src = private / name
+                    if src.is_file():
+                        shutil.copy2(src, acp_dir / name)
+
+            async with SIGN_INS.home(self.name, creds.login_account, creds.login_files, SIGN_IN_FILES, prepare=_seed_acp) as private:
+                try:
+                    yield private
+                finally:
+                    acp_dir = private / "antigravity-acp"
+                    for name in SIGN_IN_FILES:
+                        updated = acp_dir / name
+                        if updated.is_file():
+                            tmp = private / f".{name}.sync"
+                            shutil.copy2(updated, tmp)
+                            os.replace(tmp, private / name)
+            return
+        yield account_home(creds.antigravity_account, api_key=creds.antigravity_auth_mode == "api_key")
 
     async def _apply_model_and_effort(
         self,
@@ -1682,7 +1712,11 @@ class AntigravityProvider(Provider):
         return config_options
 
     async def run(self, spec: RunSpec, bridge: ToolBridge) -> AsyncIterator[RunEvent]:
-        home = self._home(spec.credentials)
+        async with self._home(spec.credentials) as home:
+            async for event in self._run(spec, bridge, home):
+                yield event
+
+    async def _run(self, spec: RunSpec, bridge: ToolBridge, home: Path) -> AsyncIterator[RunEvent]:
         bridge_file = BRIDGE_DIR / f"{uuid.uuid4().hex}.json"
         write_bridge_file(bridge_file, spec.bridge, bridge.workspace)
         env = {**tool_env(spec.credentials), **spec.env}
@@ -1736,9 +1770,9 @@ class AntigravityProvider(Provider):
                         yield event
 
                 # While the OAuth access token is guaranteed fresh after a Google turn, report limits.
-                if spec.credentials.antigravity_auth_mode == "google" and result_event and not result_event.is_error:
+                if spec.credentials.antigravity_auth_mode in ("google", "own_login") and result_event and not result_event.is_error:
                     with contextlib.suppress(Exception):
-                        if windows := await asyncio.wait_for(self.limits(spec.credentials), timeout=8):
+                        if windows := await asyncio.wait_for(self._limits_for_home(home), timeout=8):
                             yield LimitsEvent(windows=windows, complete=True)
                 if result_event is not None:
                     yield result_event
@@ -1748,7 +1782,10 @@ class AntigravityProvider(Provider):
             bridge_file.unlink(missing_ok=True)
 
     async def complete(self, spec: CompletionSpec) -> CompletionResult:
-        home = self._home(spec.credentials)
+        async with self._home(spec.credentials) as home:
+            return await self._complete(spec, home)
+
+    async def _complete(self, spec: CompletionSpec, home: Path) -> CompletionResult:
         session_id: str | None = None
         with tempfile.TemporaryDirectory(prefix="plainboard-agy-complete-") as cwd:
             server = AcpServer(home, spec.credentials, cwd=Path(cwd))
@@ -1822,9 +1859,13 @@ class AntigravityProvider(Provider):
         )
 
     async def limits(self, credentials: Credentials) -> list[LimitWindow]:
-        if credentials.antigravity_auth_mode != "google":
+        mode = credentials.antigravity_auth_mode
+        if mode == "api_key" or (mode == "own_login" and not credentials.login_files):
             return []
-        home = account_home(credentials.antigravity_account)
+        async with self._home(credentials) as home:
+            return await self._limits_for_home(home)
+
+    async def _limits_for_home(self, home: Path) -> list[LimitWindow]:
         async with httpx.AsyncClient(timeout=15, follow_redirects=False) as client:
             resolved = await read_stored_access_token(home, client)
             if not resolved:
@@ -1876,13 +1917,28 @@ class AntigravityProvider(Provider):
                 pass
         return ""
 
-    async def account(self, key: str) -> ProviderAccount:
+    async def _end_own_login(self, key: str) -> None:
+        if (login := self._own_logins.pop(key, None)) is not None:
+            await login.cancel()
+            signins.remove(login.home)
+
+    async def account(self, key: str, own: bool = False) -> ProviderAccount:
+        if own:
+            login = self._own_logins.get(key)
+            if login and login.active and login.pending:
+                return ProviderAccount(
+                    signed_in=False,
+                    login_url=login.pending.authorization_url,
+                    needs_code=True,
+                    login_error=login.error,
+                )
+            return ProviderAccount(login_error=login.error if login else None)
         login = self._code_login(key)
         if login.active and login.pending:
             return ProviderAccount(
                 signed_in=False,
                 login_url=login.pending.authorization_url,
-                login_input=True,
+                needs_code=True,
                 login_error=login.error,
             )
         signed_in = has_stored_oauth_login(login.home)
@@ -1891,28 +1947,62 @@ class AntigravityProvider(Provider):
             detail = await self._lookup_email(key, login.home) or "Google account"
         return ProviderAccount(signed_in=signed_in, detail=detail, login_error=login.error)
 
-    async def login(self, key: str) -> ProviderAccount:
+    async def login(self, key: str, own: bool = False) -> ProviderAccount:
+        if own:
+            await self._end_own_login(key)
+            private = signins.private_dir()
+            login = self._own_logins[key] = CodeLogin(private)
+            try:
+                await login.start()
+            except BaseException:
+                self._own_logins.pop(key, None)
+                signins.remove(private)
+                raise
+            return ProviderAccount(
+                signed_in=False,
+                login_url=login.pending.authorization_url if login.pending else None,
+                needs_code=True,
+            )
         login = self._code_login(key)
         await login.start()
         return ProviderAccount(
             signed_in=False,
             login_url=login.pending.authorization_url if login.pending else None,
-            login_input=True,
+            needs_code=True,
         )
 
-    async def submit_login(self, key: str, code: str) -> ProviderAccount:
-        login = self._code_login(key)
-        await login.submit(code)
+    async def login_code(self, key: str, code: str) -> ProviderAccount:
+        own = key in self._own_logins
+        login = self._own_logins.get(key) if own else self._logins.get(key)
+        if login is None or not login.active or not login.pending:
+            return ProviderAccount(login_error="No Antigravity sign-in is in progress. Click Sign in with Google first.")
+        url = login.pending.authorization_url
+        try:
+            await login.submit(code)
+        except ValueError as exc:
+            return ProviderAccount(signed_in=False, login_url=url, needs_code=True, login_error=str(exc))
+        if own:
+            files = signins.read(login.home / "antigravity-acp", SIGN_IN_FILES)
+            self._own_logins.pop(key, None)
+            signins.remove(login.home)
+            if not files:
+                return ProviderAccount(login_error="Google sign-in finished without writing credentials.")
+            SIGN_INS.signed_in(self.name, key, files)
+            return ProviderAccount(signed_in=True)
         self._emails.pop(key, None)
         self._models = None  # refresh live model catalog on next /providers call
         return await self.account(key)
 
-    async def logout(self, key: str) -> ProviderAccount:
+    async def logout(self, key: str, own: bool = False) -> ProviderAccount:
+        if own:
+            await self._end_own_login(key)
+            SIGN_INS.forget(key)
+            return ProviderAccount()
         login = self._code_login(key)
         await login.cancel()
         self._emails.pop(key, None)
         acp_dir = login.home / "antigravity-acp"
-        for name in ("antigravity-oauth-token", "acp_token.json"):
+        for name in SIGN_IN_FILES:
             (acp_dir / name).unlink(missing_ok=True)
         login.error = None
         return ProviderAccount()

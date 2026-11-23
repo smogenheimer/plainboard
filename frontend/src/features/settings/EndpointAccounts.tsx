@@ -4,24 +4,28 @@ import { Plus, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, errorMessage } from "../../api/client";
-import { checks, qk, useAccounts, useMeta } from "../../api/queries";
+import { checks, qk, useAccounts, useMe, useMeta } from "../../api/queries";
 import type { Account, CheckResult, ProviderInfo } from "../../api/types";
 import { Button, ErrorText, Field, IconButton, Input, Select, Textarea, Toggle } from "../../components/ui";
+import { Sharing } from "./AccountsEditor";
 import { CheckBadge } from "./SettingsDialog";
 
 const lines = (text: string) => [...new Set(text.split("\n").map((l) => l.trim()).filter(Boolean))];
 
 /** Accounts of the providers that are an address: a local model server, a model host, a gateway.
-    Each holds where it is, its key and the models it offers. Saved right away; the key is write-only. */
-export function EndpointAccounts() {
+    Each holds where it is, its key and the models it offers. Saved right away; the key is write-only.
+    ``own``: people's own ones, as in AccountsEditor (a non-admin adds their own here, an admin sees everyone's). */
+export function EndpointAccounts({ own = false }: { own?: boolean }) {
   const { t } = useTranslation();
   const qc = useQueryClient();
   const meta = useMeta();
+  const me = useMe();
   const accounts = useAccounts();
   const [error, setError] = useState<unknown>(null);
   const [choice, setChoice] = useState("");
   const endpoints = meta.data?.endpoints ?? [];
-  const mine = (accounts.data ?? []).filter((a) => a.owner_id == null && endpoints.some((p) => p.name === a.provider));
+  const adds = !own || !me?.is_admin;
+  const mine = (accounts.data ?? []).filter((a) => (own ? a.owner_id != null && a.can_manage : a.owner_id == null) && endpoints.some((p) => p.name === a.provider));
   const chosen = endpoints.find((p) => p.name === choice) ?? endpoints[0];
 
   const run = async (action: () => Promise<unknown>) => {
@@ -37,27 +41,29 @@ export function EndpointAccounts() {
     }
   };
 
-  if (!endpoints.length) return null;
+  if (!endpoints.length || (!adds && !mine.length)) return null;
   return (
     <div className="space-y-3">
       {mine.map((account) => (
         <EndpointCard key={account.id} account={account} provider={endpoints.find((p) => p.name === account.provider)!} onChange={run} />
       ))}
-      <div className="flex flex-wrap items-center gap-2">
-        <div className="min-w-0 flex-1 basis-48">
-          <Select aria-label={t("endpoints.choose")} value={chosen?.name ?? ""} onChange={(e) => setChoice(e.target.value)}>
-            {endpoints.map((p) => (
-              <option key={p.name} value={p.name}>
-                {p.label}
-              </option>
-            ))}
-          </Select>
+      {adds && (
+        <div className="flex flex-wrap items-center gap-2">
+          <div className="min-w-0 flex-1 basis-48">
+            <Select aria-label={t("endpoints.choose")} value={chosen?.name ?? ""} onChange={(e) => setChoice(e.target.value)}>
+              {endpoints.map((p) => (
+                <option key={p.name} value={p.name}>
+                  {p.label}
+                </option>
+              ))}
+            </Select>
+          </div>
+          <Button size="md" icon={<Plus className="size-3.5" />} onClick={() => chosen && run(() => api.post("/accounts", { provider: chosen.name, auth_mode: "api_key" }))}>
+            {t("endpoints.add")}
+          </Button>
         </div>
-        <Button size="md" icon={<Plus className="size-3.5" />} onClick={() => chosen && run(() => api.post("/accounts", { provider: chosen.name, auth_mode: "api_key" }))}>
-          {t("endpoints.add")}
-        </Button>
-      </div>
-      {chosen?.endpoint?.hint && <p className="text-fg-3">{chosen.endpoint.hint}</p>}
+      )}
+      {adds && chosen?.endpoint?.hint && <p className="text-fg-3">{chosen.endpoint.hint}</p>}
       <ErrorText error={error} />
     </div>
   );
@@ -65,6 +71,7 @@ export function EndpointAccounts() {
 
 function EndpointCard({ account, provider, onChange }: { account: Account; provider: ProviderInfo; onChange: (action: () => Promise<unknown>) => Promise<boolean> }) {
   const { t } = useTranslation();
+  const me = useMe();
   const [label, setLabel] = useState(account.label);
   const [url, setUrl] = useState(account.endpoint_url);
   const [models, setModels] = useState(account.models.join("\n"));
@@ -138,6 +145,8 @@ function EndpointCard({ account, provider, onChange }: { account: Account; provi
         {provider.label}
         {endpoint.hint && ` · ${endpoint.hint}`}
       </p>
+      {account.owner_id != null && account.owner_id !== me?.id && <p className="text-fg-3">{t("accounts.ownedBy", { name: account.owner_name })}</p>}
+      {account.owner_id != null && <Sharing account={account} patch={patch} />}
       <Field label={t("endpoints.address")} hint={endpoint.url ? t("endpoints.addressHint", { url: endpoint.url }) : t("endpoints.addressNeeded")}>
         <Input value={url} placeholder={endpoint.url || "https://"} onChange={(e) => setUrl(e.target.value)} onBlur={() => url.trim() !== account.endpoint_url && patch({ endpoint_url: url.trim() })} />
       </Field>

@@ -56,18 +56,20 @@ class Provider(ABC):
         """The account's plan: its name and its size as a multiple of the provider's smallest plan. None: not known."""
         return None, None
 
-    async def account(self, key: str) -> ProviderAccount | None:
-        """The subscription signed in on the runner for account ``key``. None: the provider has no sign-in of its own."""
+    async def account(self, key: str, own: bool = False) -> ProviderAccount | None:
+        """The subscription signed in on the runner for account ``key``. None: the provider has no sign-in of its own.
+        ``own``: a person's own sign-in (signins.py): only one in progress; a finished one waits for the app."""
         return None
 
-    async def login(self, key: str) -> ProviderAccount:
+    async def login(self, key: str, own: bool = False) -> ProviderAccount:
         raise NotImplementedError(f"{self.name} has no sign-in")
 
-    async def submit_login(self, key: str, code: str) -> ProviderAccount:
-        raise NotImplementedError(f"{self.name} has no code sign-in")
-
-    async def logout(self, key: str) -> ProviderAccount:
+    async def logout(self, key: str, own: bool = False) -> ProviderAccount:
         raise NotImplementedError(f"{self.name} has no sign-in")
+
+    async def login_code(self, key: str, code: str) -> ProviderAccount:
+        """The code the provider's page showed after signing in, for an own sign-in in progress."""
+        raise NotImplementedError(f"{self.name} takes no sign-in code")
 
     async def check(self, spec: CompletionSpec) -> CheckResult:
         try:

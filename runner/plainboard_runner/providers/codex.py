@@ -4,6 +4,8 @@ Auth: a ChatGPT subscription signed in on the runner (device code from Settings,
 ``codex login --device-auth`` in the runner container), or an OpenAI API key. Every account
 (``Credentials.codex_account``) and an API key each have their own Codex home, so one sign-in never
 replaces another. Homes share their ``sessions`` folder, so a thread resumes under any account.
+A person's own ChatGPT sign-in ("own_login") is never in the runner's home: its ``auth.json`` comes with
+the run and lives in a private home only while the account is in use (signins.py).
 
 Each run starts its own app server. PlainBoard's tools reach Codex as a stdio MCP server
 (:mod:`plainboard_runner.mcp_stdio`); messages for a running turn are steered into it.
@@ -23,7 +25,7 @@ import sys
 import tempfile
 import time
 import uuid
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from pathlib import Path
 from typing import Any
 
@@ -51,9 +53,10 @@ from plainboard_protocol import (
     UsageEvent,
 )
 
-from .. import notices
+from .. import notices, signins
 from ..config import TOOL_RESULT_PREVIEW_CHARS
 from ..mcp_stdio import BRIDGE_FILE_ENV, write_bridge_file
+from ..signins import SIGN_INS
 from ..tool_bridge import ToolBridge
 from ..workspace import tool_env
 from .base import Provider
@@ -64,6 +67,7 @@ CODEX_BIN = os.environ.get("PLAINBOARD_CODEX_BIN", "codex")
 SUBSCRIPTION_HOME = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
 API_KEY_HOME = Path.home() / ".plainboard" / "codex-api-key"
 ACCOUNTS_HOME = Path.home() / ".plainboard" / "codex-accounts"  # further accounts, one home each
+SIGN_IN_FILES = ("auth.json",)  # what a person's own ChatGPT sign-in is (signins.py), with cli_auth_credentials_store "file"
 BRIDGE_DIR = Path(tempfile.gettempdir()) / "plainboard-bridge"
 MCP_SERVER_NAME = "plainboard"
 MAX_LINE_BYTES = 64 * 1024 * 1024  # one line holds a whole item, e.g. a long command output
@@ -509,8 +513,10 @@ class TurnRunner:
 class DeviceLogin:
     """A ChatGPT sign-in with a device code, kept alive in the background until it completes."""
 
-    def __init__(self, home: Path) -> None:
+    def __init__(self, home: Path, finished: Callable[[DeviceLogin, bool], None] | None = None) -> None:
         self.home = home
+        self.finished = finished  # called once the sign-in is over: whether it succeeded
+        self.succeeded = False
         self.server: AppServer | None = None
         self.task: asyncio.Task[None] | None = None
         self.url: str | None = None
@@ -546,12 +552,15 @@ class DeviceLogin:
                     params = message["params"]
                     if not params.get("success"):
                         self.error = params.get("error") or "Sign-in failed"
+                    self.succeeded = bool(params.get("success"))
                     return
         except TimeoutError:
             self.error = "The sign-in code expired"
         finally:
             self.url = self.code = None
             await server.close()
+            if self.finished:
+                self.finished(self, self.succeeded)
 
     async def cancel(self) -> None:
         if self.task and not self.task.done():
@@ -571,6 +580,7 @@ class CodexProvider(Provider):
     def __init__(self) -> None:
         self._models: tuple[float, list[ModelInfo]] | None = None
         self._logins: dict[str, DeviceLogin] = {}
+        self._own_logins: dict[str, DeviceLogin] = {}  # people's own sign-ins in progress, each in a private home
         self._api_key_lock = asyncio.Lock()
 
     def info(self) -> ProviderInfo:
@@ -595,8 +605,19 @@ class CodexProvider(Provider):
             self._logins[key] = DeviceLogin(account_home(key))
         return self._logins[key]
 
-    async def _home(self, creds: Credentials) -> Path:
-        """The Codex home for these credentials. An API key is signed in to its own home."""
+    @contextlib.asynccontextmanager
+    async def _home(self, creds: Credentials) -> AsyncIterator[Path]:
+        """The Codex home for these credentials while the block runs: a person's own sign-in in its private home."""
+        if creds.codex_auth_mode == "own_login":
+            if not creds.login_files:
+                raise RuntimeError("This subscription is not signed in to ChatGPT yet (Settings → My subscriptions).")
+            async with SIGN_INS.home(self.name, creds.login_account, creds.login_files, SIGN_IN_FILES) as home:
+                yield home
+            return
+        yield await self._shared_home(creds)
+
+    async def _shared_home(self, creds: Credentials) -> Path:
+        """The Codex home in the runner's home. An API key is signed in to its own home."""
         if creds.codex_auth_mode != "api_key":
             return account_home(creds.codex_account)
         if not creds.openai_api_key:
@@ -612,7 +633,11 @@ class CodexProvider(Provider):
         return home
 
     async def run(self, spec: RunSpec, bridge: ToolBridge) -> AsyncIterator[RunEvent]:
-        home = await self._home(spec.credentials)
+        async with self._home(spec.credentials) as home:
+            async for event in self._run(spec, bridge, home):
+                yield event
+
+    async def _run(self, spec: RunSpec, bridge: ToolBridge, home: Path) -> AsyncIterator[RunEvent]:
         bridge_file = BRIDGE_DIR / f"{uuid.uuid4().hex}.json"
         write_bridge_file(bridge_file, spec.bridge, bridge.workspace)
         env = {**tool_env(spec.credentials), **spec.env}
@@ -646,7 +671,10 @@ class CodexProvider(Provider):
             bridge_file.unlink(missing_ok=True)
 
     async def complete(self, spec: CompletionSpec) -> CompletionResult:
-        home = await self._home(spec.credentials)
+        async with self._home(spec.credentials) as home:
+            return await self._complete(spec, home)
+
+    async def _complete(self, spec: CompletionSpec, home: Path) -> CompletionResult:
         texts: list[str] = []
         with tempfile.TemporaryDirectory(prefix="plainboard-complete-") as cwd:
             server = AppServer(home, config=COMPLETION_CONFIG, cwd=Path(cwd))
@@ -687,16 +715,23 @@ class CodexProvider(Provider):
         )
 
     async def limits(self, credentials: Credentials) -> list[LimitWindow]:
-        home = account_home(credentials.codex_account)
-        if credentials.codex_auth_mode == "api_key" or not (home / "auth.json").is_file():
+        mode = credentials.codex_auth_mode
+        if mode == "api_key" or (mode == "own_login" and not credentials.login_files):
             return []
-        async with AppServer(home) as server:
+        if mode != "own_login" and not (account_home(credentials.codex_account) / "auth.json").is_file():
+            return []
+        async with self._home(credentials) as home, AppServer(home) as server:
             if not (await server.request("account/read", {"refreshToken": False})).get("account"):
                 return []
             answer = await server.request("account/rateLimits/read", None, timeout=30)
         return limit_windows((answer or {}).get("rateLimits"))
 
-    async def account(self, key: str) -> ProviderAccount:
+    async def account(self, key: str, own: bool = False) -> ProviderAccount:
+        if own:
+            login = self._own_logins.get(key)
+            if login is None:
+                return ProviderAccount()
+            return ProviderAccount(signed_in=login.succeeded, login_url=login.url, login_code=login.code, login_error=login.error)
         login = self._device_login(key)
         state = ProviderAccount(login_url=login.url, login_code=login.code, login_error=login.error)
         if login.active:
@@ -710,12 +745,43 @@ class CodexProvider(Provider):
             state.signed_in, state.detail = True, str(account["type"])
         return state
 
-    async def login(self, key: str) -> ProviderAccount:
+    async def login(self, key: str, own: bool = False) -> ProviderAccount:
+        if own:
+            return await self._own_login(key)
         login = self._device_login(key)
         await login.start()
         return ProviderAccount(login_url=login.url, login_code=login.code)
 
-    async def logout(self, key: str) -> ProviderAccount:
+    async def _own_login(self, key: str) -> ProviderAccount:
+        """A device sign-in into a private home; once it succeeds its auth.json waits for the app and the home goes."""
+        await self._end_own_login(key)
+
+        def finished(login: DeviceLogin, ok: bool) -> None:
+            if ok and (files := signins.read(login.home, SIGN_IN_FILES)):
+                SIGN_INS.signed_in(self.name, key, files)
+            elif ok:
+                login.succeeded, login.error = False, "The sign-in left no credentials"
+            signins.remove(login.home)
+
+        login = self._own_logins[key] = DeviceLogin(signins.private_dir(), finished)
+        try:
+            await login.start()
+        except BaseException:
+            signins.remove(login.home)
+            self._own_logins.pop(key, None)
+            raise
+        return ProviderAccount(login_url=login.url, login_code=login.code)
+
+    async def _end_own_login(self, key: str) -> None:
+        if (login := self._own_logins.pop(key, None)) is not None:
+            await login.cancel()
+            signins.remove(login.home)
+
+    async def logout(self, key: str, own: bool = False) -> ProviderAccount:
+        if own:
+            await self._end_own_login(key)
+            SIGN_INS.forget(key)
+            return ProviderAccount()
         login = self._device_login(key)
         await login.cancel()
         async with AppServer(login.home) as server:

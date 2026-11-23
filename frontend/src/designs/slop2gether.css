@@ -21,6 +21,19 @@
   --del: var(--danger);
   --grad: linear-gradient(100deg, #ffb36b 0%, #ff6d3d 30%, #ff3d8b 62%, #8b5cff 100%);
 }
+/* Data colours (diagrams and charts): the hues of the site's gradient first, then the rest. */
+[data-design="slop2gether"] {
+  --chart-1: oklch(var(--chart-l) var(--chart-c) 295);
+  --chart-2: oklch(var(--chart-l) var(--chart-c) 45);
+  --chart-3: oklch(var(--chart-l) var(--chart-c) 0);
+  --chart-4: oklch(var(--chart-l) var(--chart-c) 70);
+  --chart-5: oklch(var(--chart-l) var(--chart-c) 255);
+  --chart-6: oklch(var(--chart-l) var(--chart-c) 165);
+  --chart-7: oklch(var(--chart-l) var(--chart-c) 330);
+  --chart-8: oklch(var(--chart-l) var(--chart-c) 210);
+  --chart-9: oklch(var(--chart-l) var(--chart-c) 125);
+  --chart-10: oklch(var(--chart-l) var(--chart-c) 20);
+}
 
 [data-theme="slop2gether-dark"] {
   color-scheme: dark;
@@ -38,6 +51,8 @@
   --ok: #34d399;
   --sq-l: 0.74;
   --sq-c: 0.12;
+  --chart-l: 0.74;
+  --chart-c: 0.15;
   --accent: #7c4dff;
   --accent-hover: #8f66ff;
   --accent-fg: #b9a1ff;
@@ -70,6 +85,8 @@
   --ok: #057a55;
   --sq-l: 0.56;
   --sq-c: 0.15;
+  --chart-l: 0.64;
+  --chart-c: 0.17;
   --accent: #6741d9;
   --accent-hover: #7952e8;
   --accent-fg: #5b34cc;

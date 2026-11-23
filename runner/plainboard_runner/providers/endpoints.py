@@ -19,6 +19,7 @@ from __future__ import annotations
 import os
 from collections.abc import AsyncIterator
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal
 
 import httpx
@@ -95,7 +96,7 @@ class EndpointProvider(ClaudeCodeProvider):
             raise RuntimeError(f"{self.endpoint.label}: the address has to start with http:// or https://.")
         return url
 
-    def auth_env(self, creds: Credentials, model: str = "") -> dict[str, str]:
+    def auth_env(self, creds: Credentials, model: str = "", home: Path | None = None) -> dict[str, str]:
         url = self.address(creds)
         if self.endpoint.key and not creds.endpoint_key:
             raise RuntimeError(f"{self.endpoint.label}: no API key is set (Settings, Subscriptions).")

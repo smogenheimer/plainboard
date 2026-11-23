@@ -59,6 +59,8 @@
   /* Lightness and chroma of label squares; the hue comes from the label. */
   --sq-l: 0.74;
   --sq-c: 0.12;
+  --chart-l: 0.74;
+  --chart-c: 0.085;
 }
 [data-theme="stone"] {
   color-scheme: light;
@@ -75,6 +77,23 @@
   --ok: oklch(0.47 0.12 155);
   --sq-l: 0.56;
   --sq-c: 0.15;
+  --chart-l: 0.64;
+  --chart-c: 0.095;
+}
+/* Data colours (diagrams and charts): one lightness and chroma per theme, the hues per design.
+   Fahrplan's are muted and leave out vermilion, which only means "waits for you". */
+:root,
+[data-design="fahrplan"] {
+  --chart-1: oklch(var(--chart-l) var(--chart-c) 250);
+  --chart-2: oklch(var(--chart-l) var(--chart-c) 155);
+  --chart-3: oklch(var(--chart-l) var(--chart-c) 85);
+  --chart-4: oklch(var(--chart-l) var(--chart-c) 305);
+  --chart-5: oklch(var(--chart-l) var(--chart-c) 195);
+  --chart-6: oklch(var(--chart-l) var(--chart-c) 125);
+  --chart-7: oklch(var(--chart-l) var(--chart-c) 350);
+  --chart-8: oklch(var(--chart-l) var(--chart-c) 225);
+  --chart-9: oklch(var(--chart-l) var(--chart-c) 65);
+  --chart-10: oklch(var(--chart-l) var(--chart-c) 275);
 }
 :root,
 [data-theme] {

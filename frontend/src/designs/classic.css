@@ -26,6 +26,19 @@
   --shadow-card: 0 1px 2px rgb(0 0 0 / 0.05);
   --del: var(--danger);
 }
+/* Data colours (diagrams and charts), led by the indigo accent. */
+[data-design="classic"] {
+  --chart-1: oklch(var(--chart-l) var(--chart-c) 277);
+  --chart-2: oklch(var(--chart-l) var(--chart-c) 160);
+  --chart-3: oklch(var(--chart-l) var(--chart-c) 75);
+  --chart-4: oklch(var(--chart-l) var(--chart-c) 350);
+  --chart-5: oklch(var(--chart-l) var(--chart-c) 225);
+  --chart-6: oklch(var(--chart-l) var(--chart-c) 305);
+  --chart-7: oklch(var(--chart-l) var(--chart-c) 130);
+  --chart-8: oklch(var(--chart-l) var(--chart-c) 25);
+  --chart-9: oklch(var(--chart-l) var(--chart-c) 190);
+  --chart-10: oklch(var(--chart-l) var(--chart-c) 50);
+}
 
 /* 2. Themes ----------------------------------------------------------------------------------- */
 
@@ -46,6 +59,8 @@
   --ok: #059669;
   --sq-l: 0.56;
   --sq-c: 0.15;
+  --chart-l: 0.64;
+  --chart-c: 0.15;
   --accent: #4f46e5;
   --accent-hover: #6366f1;
   --accent-fg: #4338ca;
@@ -75,6 +90,8 @@
   --ok: #34d399;
   --sq-l: 0.74;
   --sq-c: 0.12;
+  --chart-l: 0.74;
+  --chart-c: 0.13;
   --accent: #5b54ea;
   --accent-hover: #6f69f0;
   --accent-fg: #a5b4fc;

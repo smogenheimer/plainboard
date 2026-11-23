@@ -8,7 +8,7 @@ import time
 from collections.abc import AsyncIterator
 
 import httpx
-from plainboard_protocol import GitLogResult, GitLogSpec, GitPresentResult, GitPresentSpec, ProjectFiles, TidyResult, TidySpec, CandidatesSpec, CheckResult, CleanupCandidate, CleanupResult, CleanupSpec, CompletionResult, CompletionSpec, Credentials, DeleteSpec, JobPort, JobSpec, JobState, JobTiming, LimitsEvent, MachineUsage, ProviderAccount, ProviderInfo, PullRequestCheck, PullRequestState, RepoSpec, RunEvent, RunSpec, SkillFetch, TrainCheckSpec, TrainLandSpec, TrainResult, TrainSpec, TrimSpec, UnpushedSpec, UnpushedWork, UpstreamState, parse_event
+from plainboard_protocol import GitLogResult, GitLogSpec, GitPresentResult, GitPresentSpec, ProjectFiles, TidyResult, TidySpec, CandidatesSpec, CheckResult, CleanupCandidate, CleanupResult, CleanupSpec, CompletionResult, CompletionSpec, Credentials, DeleteSpec, JobPort, JobSpec, JobState, JobTiming, LimitsEvent, MachineUsage, ProviderAccount, ProviderInfo, SignInAck, SignInFiles, PullRequestCheck, PullRequestState, RepoSpec, RunEvent, RunSpec, SkillFetch, TrainCheckSpec, TrainLandSpec, TrainResult, TrainSpec, TrimSpec, UnpushedSpec, UnpushedWork, UpstreamState, parse_event
 
 from ..services.errors import ServiceError
 
@@ -212,19 +212,50 @@ class RunnerClient:
     def forget_providers(self) -> None:
         self._providers = None
 
-    async def provider_account(self, provider: str, key: str, action: str | None = None, *, code: str = "") -> ProviderAccount:
-        """The subscription of account ``key`` signed in on the runner; ``action`` "login" or "logout" changes it first."""
+    async def provider_account(self, provider: str, key: str, action: str | None = None, own: bool = False) -> ProviderAccount:
+        """The subscription of account ``key`` signed in on the runner; ``action`` "login" or "logout" changes it first.
+        ``own``: a person's own sign-in, made in a private folder there (runner signins.py)."""
+        params: dict[str, str] = {"key": key, **({"own": "true"} if own else {})}
         try:
             if action:
-                payload = {"code": code} if action == "login" and code else None
-                resp = await self._client.post(f"/providers/{provider}/{action}", params={"key": key}, json=payload, timeout=120)
+                resp = await self._client.post(f"/providers/{provider}/{action}", params=params, timeout=60)
             else:
-                resp = await self._client.get(f"/providers/{provider}/account", params={"key": key}, timeout=60)
+                resp = await self._client.get(f"/providers/{provider}/account", params=params, timeout=60)
+        except httpx.HTTPError as exc:
+            raise RunnerError(unreachable(exc)) from exc
+        return ProviderAccount.model_validate(self._answer(resp))
+
+    async def provider_login_code(self, provider: str, key: str, code: str) -> ProviderAccount:
+        """The code the provider's page showed after signing in, for an own sign-in in progress."""
+        try:
+            resp = await self._client.post(f"/providers/{provider}/login/code", params={"key": key}, json={"code": code}, timeout=60)
+        except httpx.HTTPError as exc:
+            raise RunnerError(unreachable(exc)) from exc
+        return ProviderAccount.model_validate(self._answer(resp))
+
+    @staticmethod
+    def _answer(resp: httpx.Response):
+        if resp.status_code >= 400:
+            raise RunnerError(resp.json().get("detail", resp.text)[:1000] if resp.headers.get("content-type", "").startswith("application/json") else resp.text[:1000])
+        return resp.json()
+
+    async def sign_ins(self) -> list[SignInFiles]:
+        """People's own sign-ins the runner holds for the app (new, or refreshed by a run); none from a runner before them."""
+        try:
+            resp = await self._client.get("/signins", timeout=20)
+        except httpx.HTTPError as exc:
+            raise RunnerError(unreachable(exc)) from exc
+        if resp.status_code == 404:
+            return []
+        return [SignInFiles.model_validate(entry) for entry in self._answer(resp)]
+
+    async def ack_sign_ins(self, acks: list[SignInAck]) -> None:
+        try:
+            resp = await self._client.post("/signins/ack", json=[a.model_dump() for a in acks], timeout=20)
         except httpx.HTTPError as exc:
             raise RunnerError(unreachable(exc)) from exc
         if resp.status_code >= 400:
-            raise RunnerError(resp.json().get("detail", resp.text)[:1000] if resp.headers.get("content-type", "").startswith("application/json") else resp.text[:1000])
-        return ProviderAccount.model_validate(resp.json())
+            raise RunnerError(resp.text[:1000])
 
     async def provider_models(self, provider: str, credentials: Credentials) -> list[str]:
         """The models the account in ``credentials`` is offered by its endpoint."""

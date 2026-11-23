@@ -72,6 +72,7 @@ export function SettingsDialog({ open, onClose, section }: { open: boolean; onCl
 
   if (!open || !me) return null;
   const others = (accounts.data ?? []).some((a) => a.owner_id != null);
+  const ownEndpoints = (accounts.data ?? []).some((a) => a.owner_id != null && meta.data?.endpoints?.some((p) => p.name === a.provider));
   const stored = settings.data?.values ?? {};
   const set = (patch: Values) => setValues((v) => ({ ...v, ...patch }));
   const dirty = (...keys: string[]) => keys.some((k) => values[k] !== stored[k]);
@@ -129,6 +130,13 @@ export function SettingsDialog({ open, onClose, section }: { open: boolean; onCl
         <div className="space-y-2">
           <h3 className="font-semibold">{t("settings.antigravity")}</h3>
           <AccountsEditor provider="antigravity" own />
+        </div>
+      )}
+      {!!meta.data?.endpoints?.length && (!me.is_admin || ownEndpoints) && (
+        <div className="space-y-2">
+          <h3 className="font-semibold">{t("endpoints.title")}</h3>
+          {!me.is_admin && <p className="text-fg-3">{t("endpoints.hint")}</p>}
+          <EndpointAccounts own />
         </div>
       )}
     </>

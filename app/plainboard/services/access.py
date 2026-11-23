@@ -105,9 +105,9 @@ RULES: tuple[Rule, ...] = (
     Rule("/api/settings", Need.USER, Need.ADMIN),  # reading shows no secret, and the UI needs the defaults
     Rule("/api/settings/check/github", Need.CREATOR),  # a token typed for a new project; the installation's: admins
     # Everyone adds their own subscriptions; who may change one is its owner or an admin (accounts.managed),
-    # the list holds what the user may use (accounts.visible), secrets are never read back.
+    # the list holds what the user may use (accounts.visible), secrets are never read back. That holds for the
+    # sign-in in the browser too: an own one is kept per subscription, the installation's is an admin's.
     Rule("/api/accounts", Need.USER),
-    Rule("/api/accounts/{account_id}/signin", Need.ADMIN),  # a sign-in on the runner: the installation's only
     Rule("/api/secrets", Need.ADMIN),
     Rule("/api/access-keys", Need.ADMIN),
     Rule("/api/inspect", Need.ADMIN),

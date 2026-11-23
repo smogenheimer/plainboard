@@ -1,10 +1,11 @@
-"""Provider accounts: CRUD, a connectivity check, and the device sign-in of subscriptions on the runner."""
+"""Provider accounts: CRUD, a connectivity check, and the sign-in of subscriptions in the browser: the
+installation's on the runner, a person's own one kept per subscription (``accounts.own_login``)."""
 
 from __future__ import annotations
 
 from fastapi import APIRouter
 from plainboard_protocol import CompletionSpec, ProviderAccount
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 from ..orchestration.runner_client import RunnerError
 from ..schemas import AccountCreate, AccountOut, AccountUpdate, CheckOut
@@ -48,9 +49,13 @@ async def update(account_id: int, body: AccountUpdate, session: Session, who: Wh
 @router.delete("/{account_id}", status_code=204)
 async def delete(account_id: int, session: Session, runner: Runner, who: Who) -> None:
     account = await account_service.managed(session, account_id, who.user)
-    if (account.provider == "codex" and account.auth_mode == "chatgpt") or (account.provider == "antigravity" and account.auth_mode == "google"):
-        try:  # don't leave the subscription signed in on the runner
-            await runner.provider_account(account.provider, account.key, "logout")
+    if (
+        account_service.own_login(account)
+        or (account.provider == "codex" and account.auth_mode == "chatgpt")
+        or (account.provider == "antigravity" and account.auth_mode == "google")
+    ):
+        try:  # don't leave the subscription signed in on the runner, nor a sign-in waiting there
+            await runner.provider_account(account.provider, account.key, "logout", own=account_service.own_login(account))
         except RunnerError:
             pass
     await account_service.delete(session, account)
@@ -71,6 +76,8 @@ async def check(account_id: int, body: CheckIn, session: Session, runner: Runner
         credentials=settings_service.credentials(await settings_service.get_all(session), account=account_service.fields(account)),
     )
     result = await runner.check_provider(spec)
+    if account_service.own_login(account):
+        await account_service.take_sign_ins(session, runner)  # the check may have refreshed it
     return CheckOut(ok=result.ok, detail=result.detail)
 
 
@@ -89,32 +96,52 @@ async def offered_models(account_id: int, session: Session, runner: Runner, who:
         raise ServiceError(str(exc), 502) from exc
 
 
-class SignInIn(BaseModel):
-    code: str = ""
-
-
-async def _signin(session: Session, runner: Runner, account_id: int, action: str | None = None, code: str = "") -> ProviderAccount:
-    account = await account_service.get(session, account_id)
+async def _signin(session: Session, runner: Runner, who: Who, account_id: int, action: str | None = None, code: str | None = None) -> ProviderAccount:
+    """A person's own sign-in is made in a private folder on the runner; once it is done the app keeps its files
+    and the runner forgets them. Signed out: they are gone here too."""
+    account = await account_service.managed(session, account_id, who.user)
+    own = account_service.own_login(account)
     try:
-        result = await runner.provider_account(account.provider, account.key, action, code=code)
+        if code is not None:
+            state = await runner.provider_login_code(account.provider, account.key, code)
+        else:
+            state = await runner.provider_account(account.provider, account.key, action, own=own)
     except RunnerError as exc:
         raise ServiceError(str(exc), 502) from exc
-    if action in ("login", "logout") and (code or action == "logout"):
+    if code is not None or action == "logout":
         runner.forget_providers()
-    return result
+    if not own:
+        return state
+    if action == "logout":
+        account.secret_enc = None
+        await session.commit()
+    else:
+        await account_service.take_sign_ins(session, runner)
+        await session.refresh(account)
+    return state.model_copy(update={"signed_in": bool(account.secret_enc) and not state.login_url})
 
 
 @router.get("/{account_id}/signin", response_model=ProviderAccount)
-async def signin_state(account_id: int, session: Session, runner: Runner) -> ProviderAccount:
-    return await _signin(session, runner, account_id)
+async def signin_state(account_id: int, session: Session, runner: Runner, who: Who) -> ProviderAccount:
+    return await _signin(session, runner, who, account_id)
 
 
 @router.post("/{account_id}/signin", response_model=ProviderAccount)
-async def signin(account_id: int, session: Session, runner: Runner, body: SignInIn | None = None) -> ProviderAccount:
-    """Starts a runner sign-in (returns URL and optional device code), or submits the pasted code/URL."""
-    return await _signin(session, runner, account_id, "login", code=body.code if body else "")
+async def signin(account_id: int, session: Session, runner: Runner, who: Who) -> ProviderAccount:
+    """Starts a sign-in: the answer has the URL to open and the code to enter (Codex), or asks for the code the page
+    shows after signing in (Claude, Antigravity, ``needs_code``)."""
+    return await _signin(session, runner, who, account_id, "login")
+
+
+class CodeIn(BaseModel):
+    code: str = Field(min_length=1, max_length=2000)
+
+
+@router.post("/{account_id}/signin/code", response_model=ProviderAccount)
+async def signin_code(account_id: int, body: CodeIn, session: Session, runner: Runner, who: Who) -> ProviderAccount:
+    return await _signin(session, runner, who, account_id, code=body.code)
 
 
 @router.delete("/{account_id}/signin", response_model=ProviderAccount)
-async def signout(account_id: int, session: Session, runner: Runner) -> ProviderAccount:
-    return await _signin(session, runner, account_id, "logout")
+async def signout(account_id: int, session: Session, runner: Runner, who: Who) -> ProviderAccount:
+    return await _signin(session, runner, who, account_id, "logout")

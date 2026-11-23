@@ -1,7 +1,10 @@
 """Claude Code provider built on the Claude Agent SDK (bundled Claude Code CLI).
 
 Auth: a Claude subscription OAuth token (``claude setup-token``), an Anthropic API key,
-or an interactive ``claude login`` performed inside the runner container.
+or an interactive ``claude login`` performed inside the runner container. A person's own browser
+sign-in ("own_login") is never in the runner's home: ``claude auth login`` runs in a private
+``CLAUDE_CONFIG_DIR``, and its ``.credentials.json`` comes with each run of the account into such a
+folder again (signins.py), whose other entries link to the shared ``~/.claude`` (sessions resume).
 """
 
 from __future__ import annotations
@@ -38,6 +41,7 @@ import httpx
 from claude_agent_sdk.types import RateLimitEvent, RateLimitInfo, StreamEvent
 from plainboard_protocol import (
     AssistantTextEvent,
+    ProviderAccount,
     CompactionEvent,
     CompletionResult,
     CompletionSpec,
@@ -57,8 +61,9 @@ from plainboard_protocol import (
     UsageEvent,
 )
 
-from .. import notices
+from .. import notices, signins
 from ..config import TOOL_RESULT_PREVIEW_CHARS
+from ..signins import SIGN_INS
 from ..tool_bridge import ToolBridge
 from ..workspace import tool_env
 from .base import Provider, ProviderError
@@ -136,7 +141,33 @@ def plan_of(subscription: str | None, tier: str | None) -> tuple[str | None, flo
     return PLAN_TYPES.get(kind, (kind.replace("_", " ").title(), None))
 
 
-def auth_env(creds: Credentials) -> dict[str, str]:
+def shared_home() -> Path:
+    return Path.home() / ".claude"
+
+
+SIGN_IN_FILES = (".credentials.json",)  # what a person's own sign-in is
+CLAUDE_BIN = os.environ.get("PLAINBOARD_CLAUDE_BIN", "claude")
+LOGIN_START_SECONDS = 30
+LOGIN_CODE_SECONDS = 30
+LOGIN_TIMEOUT_SECONDS = 15 * 60
+LOGIN_URL = re.compile(r"https://\S+")
+
+
+def private_config(home: Path) -> None:
+    """A private ``CLAUDE_CONFIG_DIR`` that shares everything of ``~/.claude`` but the sign-in: sessions,
+    plugins and settings stay where every run finds them."""
+    shared = shared_home()
+    (shared / "projects").mkdir(parents=True, exist_ok=True)
+    for entry in shared.iterdir():
+        if entry.name in SIGN_IN_FILES or entry.name == ".claude.json" or (home / entry.name).exists():
+            continue
+        (home / entry.name).symlink_to(entry, target_is_directory=entry.is_dir())
+    if not (home / ".claude.json").exists():
+        signins.write(home, {".claude.json": json.dumps({"hasCompletedOnboarding": True})})
+
+
+def auth_env(creds: Credentials, home: Path | None = None) -> dict[str, str]:
+    """``home``: the private folder of an own sign-in (``ClaudeCodeProvider._home``)."""
     # Turns of one agent are often more than five minutes apart (a job, a teammate, a free slot). With
     # the short cache lifetime, the default with an API key, each of them would write the whole context
     # to the cache again instead of reading it.
@@ -149,8 +180,112 @@ def auth_env(creds: Credentials) -> dict[str, str]:
         if not creds.anthropic_api_key:
             raise RuntimeError("Anthropic API key is not configured (Settings → Claude).")
         env["ANTHROPIC_API_KEY"] = creds.anthropic_api_key
+    elif creds.claude_auth_mode == "own_login":
+        if home is None:  # never the runner's own sign-in in its place
+            raise RuntimeError("A person's own Claude sign-in needs its private folder.")
+        env["CLAUDE_CONFIG_DIR"] = str(home)
     # "runner_login": rely on credentials stored by `claude login` in the runner's home volume.
     return env
+
+
+class ClaudeLogin:
+    """Claude's browser sign-in for a person's own subscription, in a private folder: ``claude auth login``
+    prints the address to open; the page shows a code afterwards, which is typed in here (``code``)."""
+
+    def __init__(self, provider: str, key: str) -> None:
+        self.provider, self.key = provider, key
+        self.home = signins.private_dir()
+        self.proc: asyncio.subprocess.Process | None = None
+        self.output = ""
+        self.url: str | None = None
+        self.error: str | None = None
+        self.succeeded = False
+        self._reader: asyncio.Task[None] | None = None
+        self._ended: asyncio.Task[None] | None = None
+
+    @property
+    def active(self) -> bool:
+        return self.proc is not None and self.proc.returncode is None
+
+    async def start(self) -> None:
+        signins.write(self.home, {".claude.json": json.dumps({"hasCompletedOnboarding": True})})
+        env = {**os.environ, "CLAUDE_CONFIG_DIR": str(self.home), "BROWSER": "false", "DISABLE_AUTOUPDATER": "1"}
+        for name in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY"):
+            env.pop(name, None)
+        self.proc = await asyncio.create_subprocess_exec(
+            CLAUDE_BIN, "auth", "login", "--claudeai", stdin=asyncio.subprocess.PIPE, stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.STDOUT, cwd=str(self.home), env=env
+        )
+        self._reader = asyncio.create_task(self._read())
+        self._ended = asyncio.create_task(self._wait())
+        deadline = time.monotonic() + LOGIN_START_SECONDS
+        while self.url is None and self.active and time.monotonic() < deadline:
+            await asyncio.sleep(0.2)
+        if self.url is None:
+            await self.cancel()
+            raise RuntimeError(f"Claude Code did not offer a sign-in address: {self.last_line() or 'no output'}")
+
+    async def _read(self) -> None:
+        assert self.proc and self.proc.stdout
+        while chunk := await self.proc.stdout.read(4096):
+            self.output = (self.output + chunk.decode(errors="replace"))[-8000:]
+            if self.url is None and (found := LOGIN_URL.search(self.output)):
+                self.url = found.group(0)
+
+    async def _wait(self) -> None:
+        assert self.proc
+        try:
+            await asyncio.wait_for(self.proc.wait(), timeout=LOGIN_TIMEOUT_SECONDS)
+        except TimeoutError:
+            self.error = "The sign-in expired"
+            with contextlib.suppress(ProcessLookupError):
+                self.proc.kill()
+            await self.proc.wait()
+        if self._reader:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(self._reader, timeout=5)
+        files = signins.read(self.home, SIGN_IN_FILES)
+        if self.proc.returncode == 0 and files:
+            SIGN_INS.signed_in(self.provider, self.key, files)
+            self.succeeded = True
+        elif not self.error:
+            self.error = self.last_line() or "Sign-in failed"
+        self.url = None
+        signins.remove(self.home)
+
+    def last_line(self) -> str:
+        lines = [line.strip(" >") for line in re.split(r"[\r\n]+", self.output) if line.strip(" >")]
+        return lines[-1][:300] if lines else ""
+
+    async def code(self, code: str) -> None:
+        if not self.active or not self.proc or not self.proc.stdin:
+            raise RuntimeError("No sign-in is waiting for a code. Start it again.")
+        self.error = None
+        seen = len(self.output)
+        self.proc.stdin.write(code.strip().encode() + b"\n")
+        await self.proc.stdin.drain()
+        deadline = time.monotonic() + LOGIN_CODE_SECONDS
+        heard, quiet = seen, time.monotonic()
+        while self.active and time.monotonic() < deadline:
+            await asyncio.sleep(0.2)
+            if len(self.output) != heard:
+                heard, quiet = len(self.output), time.monotonic()
+            elif heard > seen and time.monotonic() - quiet > 2:
+                break  # it answered and goes on waiting: the code was refused
+        if self.active:
+            said = [line.strip(" >") for line in re.split(r"[\r\n]+", self.output[seen:]) if line.strip(" >")]
+            self.error = said[-1][:300] if said else "Claude Code did not take the code"
+        elif self._ended:
+            with contextlib.suppress(Exception):
+                await asyncio.wait_for(asyncio.shield(self._ended), timeout=10)
+
+    async def cancel(self) -> None:
+        if self.active and self.proc:
+            with contextlib.suppress(ProcessLookupError):
+                self.proc.kill()
+        if self._ended:
+            with contextlib.suppress(BaseException):
+                await self._ended
+        signins.remove(self.home)
 
 
 def context_tokens_from_usage(usage: dict[str, Any] | None) -> int:
@@ -560,22 +695,37 @@ class ClaudeCodeProvider(Provider):
 
     def __init__(self) -> None:
         self._plans: dict[str, tuple[float, str | None, str | None]] = {}  # sign-in -> (when, subscription, tier)
+        self._logins: dict[str, ClaudeLogin] = {}  # people's own sign-ins, by account key
 
     def info(self) -> ProviderInfo:
         return ProviderInfo(name=self.name, label="Claude Agent", models=MODELS, efforts=EFFORTS)
 
-    def auth_env(self, creds: Credentials, model: str = "") -> dict[str, str]:
+    def auth_env(self, creds: Credentials, model: str = "", home: Path | None = None) -> dict[str, str]:
         """What tells Claude Code where the model is and how to sign in. ``model``: what the request
-        runs on, for a provider that has to name it more than once (providers/endpoints.py)."""
-        return auth_env(creds)
+        runs on, for a provider that has to name it more than once (providers/endpoints.py). ``home``:
+        the private folder of an own sign-in (``_home``)."""
+        return auth_env(creds, home)
+
+    @contextlib.asynccontextmanager
+    async def _home(self, creds: Credentials) -> AsyncIterator[Path | None]:
+        """The private folder of a person's own sign-in while the block runs; None for every other sign-in."""
+        if creds.claude_auth_mode != "own_login":
+            yield None
+            return
+        if not creds.login_files:
+            raise RuntimeError("This subscription is not signed in to Claude yet (Settings → My subscriptions).")
+        async with SIGN_INS.home(self.name, creds.login_account, creds.login_files, SIGN_IN_FILES, prepare=private_config) as home:
+            yield home
 
     def skills_folder(self, spec: RunSpec, workspace: Path) -> Path | None:
         # Claude Code loads the skills of its working directory with the project's settings (setting_sources),
         # which only the full toolset reads.
         return workspace / ".claude" / "skills" if spec.toolset == "full" else None
 
-    def _options(self, spec: RunSpec, bridge: ToolBridge, stderr_tail: collections.deque[str], background: BackgroundWork | None = None) -> ClaudeAgentOptions:
-        env = {**tool_env(spec.credentials), **self.auth_env(spec.credentials, spec.model), **spec.env}
+    def _options(
+        self, spec: RunSpec, bridge: ToolBridge, stderr_tail: collections.deque[str], background: BackgroundWork | None = None, home: Path | None = None
+    ) -> ClaudeAgentOptions:
+        env = {**tool_env(spec.credentials), **self.auth_env(spec.credentials, spec.model, home), **spec.env}
         mcp_servers: dict[str, Any] = {s.name: external_mcp_config(s) for s in spec.mcp_servers if s.name != MCP_SERVER_NAME}
         mcp_servers[MCP_SERVER_NAME] = build_mcp_server(bridge)
         timer = ToolTimer()
@@ -616,13 +766,18 @@ class ClaudeCodeProvider(Provider):
         )
 
     async def run(self, spec: RunSpec, bridge: ToolBridge) -> AsyncIterator[RunEvent]:
+        async with self._home(spec.credentials) as home:
+            async for event in self._run(spec, bridge, home):
+                yield event
+
+    async def _run(self, spec: RunSpec, bridge: ToolBridge, home: Path | None) -> AsyncIterator[RunEvent]:
         stderr_tail: collections.deque[str] = collections.deque(maxlen=30)
         mapper = EventMapper()
         background = BackgroundWork(spec.run_id)
         got_result = False
         paused: ResultEvent | None = None  # an end that only paused the turn; the result if nothing follows
         try:
-            async with _started(lambda: self._options(spec, bridge, stderr_tail, background), spec.run_id) as client:
+            async with _started(lambda: self._options(spec, bridge, stderr_tail, background, home), spec.run_id) as client:
                 watch = UrgentNoticeWatch(client, spec.run_id)
                 watchers = [asyncio.create_task(watch.watch()), asyncio.create_task(background.watch(client))]
                 try:
@@ -658,17 +813,18 @@ class ClaudeCodeProvider(Provider):
             yield paused or ResultEvent(is_error=True, error="Claude Code ended without a result", context_tokens=mapper.context_tokens)
 
     async def limits(self, credentials: Credentials) -> list[LimitWindow]:
-        if credentials.claude_auth_mode == "api_key":
+        if credentials.claude_auth_mode == "api_key" or (credentials.claude_auth_mode == "own_login" and not credentials.login_files):
             return []
-        try:
-            windows = await self._usage(credentials)
-        except Exception as exc:
-            log.info("Claude's usage could not be read, asking with a minimal turn: %s", str(exc)[:200])
-            windows = []
-        return windows or await self._limits_of_a_turn(credentials)
+        async with self._home(credentials) as home:
+            try:
+                windows = await self._usage(credentials, home)
+            except Exception as exc:
+                log.info("Claude's usage could not be read, asking with a minimal turn: %s", str(exc)[:200])
+                windows = []
+            return windows or await self._limits_of_a_turn(credentials, home)
 
-    async def _usage(self, credentials: Credentials) -> list[LimitWindow]:
-        options = ClaudeAgentOptions(tools=[], setting_sources=[], cwd="/tmp", env=self.auth_env(credentials))
+    async def _usage(self, credentials: Credentials, home: Path | None = None) -> list[LimitWindow]:
+        options = ClaudeAgentOptions(tools=[], setting_sources=[], cwd="/tmp", env=self.auth_env(credentials, home=home))
         async with ClaudeSDKClient(options) as client:
             # Claude Code's usage request has no public method in the SDK yet.
             answer = await client._query._send_control_request({"subtype": "get_usage", "skip_behaviors": True}, timeout=20)
@@ -680,6 +836,8 @@ class ClaudeCodeProvider(Provider):
     @staticmethod
     def _sign_in(credentials: Credentials) -> str:
         token = credentials.claude_oauth_token or "" if credentials.claude_auth_mode == "oauth_token" else ""
+        if credentials.claude_auth_mode == "own_login":
+            token = credentials.login_account
         return credentials.claude_auth_mode + ":" + hashlib.sha256(token.encode()).hexdigest()[:16]
 
     async def plan(self, credentials: Credentials) -> tuple[str | None, float | None]:
@@ -696,10 +854,11 @@ class ClaudeCodeProvider(Provider):
         return plan_of(subscription, tier)
 
     async def _read_plan(self, credentials: Credentials) -> tuple[str | None, str | None]:
-        if credentials.claude_auth_mode == "runner_login":
+        if credentials.claude_auth_mode in ("runner_login", "own_login"):
             try:
-                stored = json.loads((Path.home() / ".claude" / ".credentials.json").read_text()).get("claudeAiOauth") or {}
-            except (OSError, ValueError):
+                text = (credentials.login_files or {}).get(SIGN_IN_FILES[0], "") if credentials.claude_auth_mode == "own_login" else (shared_home() / ".credentials.json").read_text()
+                stored = json.loads(text).get("claudeAiOauth") or {}
+            except (OSError, ValueError, AttributeError):
                 return None, None
             return stored.get("subscriptionType"), stored.get("rateLimitTier")
         if not credentials.claude_oauth_token:
@@ -714,14 +873,14 @@ class ClaudeCodeProvider(Provider):
             return None, None
         return organization.get("organization_type"), organization.get("rate_limit_tier")
 
-    async def _limits_of_a_turn(self, credentials: Credentials) -> list[LimitWindow]:
+    async def _limits_of_a_turn(self, credentials: Credentials, home: Path | None = None) -> list[LimitWindow]:
         """The limits as a turn reports them. A subscription that is signed in with a token
         (``claude setup-token``) answers the usage request with nothing: the token is for model
         requests only. Every model request reports the limits, though, so the smallest one there
         is shows them: one word to the small model, a few tokens. Without this, a subscription
         that no agent is running on keeps the numbers of its last turn for days."""
         options = ClaudeAgentOptions(
-            model=PROBE_MODEL, tools=[], system_prompt="Reply with the single word: ok", setting_sources=[], max_turns=1, cwd="/tmp", env=self.auth_env(credentials)
+            model=PROBE_MODEL, tools=[], system_prompt="Reply with the single word: ok", setting_sources=[], max_turns=1, cwd="/tmp", env=self.auth_env(credentials, home=home)
         )
         windows: dict[str, LimitWindow] = {}
 
@@ -739,6 +898,10 @@ class ClaudeCodeProvider(Provider):
         return list(windows.values())
 
     async def complete(self, spec: CompletionSpec) -> CompletionResult:
+        async with self._home(spec.credentials) as home:
+            return await self._complete(spec, home)
+
+    async def _complete(self, spec: CompletionSpec, home: Path | None) -> CompletionResult:
         stderr_tail: collections.deque[str] = collections.deque(maxlen=30)
         options = ClaudeAgentOptions(
             model=spec.model,
@@ -747,7 +910,7 @@ class ClaudeCodeProvider(Provider):
             setting_sources=[],
             max_turns=1,
             cwd="/tmp",
-            env=self.auth_env(spec.credentials, spec.model),
+            env=self.auth_env(spec.credentials, spec.model, home),
             stderr=stderr_tail.append,
             **({"effort": spec.effort} if spec.effort else {}),
         )
@@ -773,3 +936,45 @@ class ClaudeCodeProvider(Provider):
             output_tokens=int(usage.get("output_tokens") or 0),
             cost_usd=float(result.total_cost_usd or 0.0),
         )
+
+    # A person's own browser sign-in (Settings → My subscriptions). The installation's runner_login stays
+    # ``claude`` in the runner's terminal.
+    async def account(self, key: str, own: bool = False) -> ProviderAccount | None:
+        if not own:
+            return None
+        login = self._logins.get(key)
+        if login is None:
+            return ProviderAccount()
+        waiting = login.active
+        return ProviderAccount(signed_in=login.succeeded, login_url=login.url if waiting else None, needs_code=waiting, login_error=login.error)
+
+    async def login(self, key: str, own: bool = False) -> ProviderAccount:
+        if not own:
+            raise NotImplementedError("Claude's sign-in on the runner is made in its terminal: claude")
+        await self._end_login(key)
+        login = self._logins[key] = ClaudeLogin(self.name, key)
+        try:
+            await login.start()
+        except BaseException:
+            self._logins.pop(key, None)
+            await login.cancel()
+            raise
+        return await self.account(key, own=True) or ProviderAccount()
+
+    async def login_code(self, key: str, code: str) -> ProviderAccount:
+        login = self._logins.get(key)
+        if login is None:
+            raise RuntimeError("No sign-in is waiting for a code. Start it again.")
+        await login.code(code)
+        return await self.account(key, own=True) or ProviderAccount()
+
+    async def logout(self, key: str, own: bool = False) -> ProviderAccount:
+        if not own:
+            raise NotImplementedError("Claude's sign-in on the runner is made in its terminal: claude")
+        await self._end_login(key)
+        SIGN_INS.forget(key)
+        return ProviderAccount()
+
+    async def _end_login(self, key: str) -> None:
+        if (login := self._logins.pop(key, None)) is not None:
+            await login.cancel()
