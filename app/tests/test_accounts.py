@@ -634,7 +634,7 @@ def test_antigravity_accounts_signin_credentials_and_cleanup(client, project):
     started = client.post(f"/api/accounts/{google['id']}/signin").json()
     assert started["needs_code"] is True and started["login_url"].startswith("https://accounts.google.com/")
     finished = client.post(f"/api/accounts/{google['id']}/signin/code", json={"code": "4/0A-code"}).json()
-    assert finished["signed_in"] is True and finished["detail"] == "user@example.com"
+    assert finished["signed_in"] is True  # kept by PlainBoard (#84): its files, not the runner's home
     assert getattr(runner(client), "providers_forgotten", 0) >= 1
     agy_limits = limits_of(client, google["id"])
     assert [w["name"] for w in agy_limits["windows"]] == ["antigravity_gemini_five_hour", "antigravity_gemini_seven_day"]
@@ -650,7 +650,7 @@ def test_antigravity_accounts_signin_credentials_and_cleanup(client, project):
     dev = make_dev(client, pid, provider="antigravity")
     assert (dev["provider"], dev["model"], dev["summary_model"]) == ("antigravity", "gemini-4-argon", "gemini-3.8-flash")
     creds = turn(client, pid, dev["id"])
-    assert creds.antigravity_auth_mode == "google" and creds.antigravity_account != ""
+    assert creds.antigravity_auth_mode == "own_login" and creds.antigravity_account != "" and creds.login_files
 
     # API key mode sends gemini_api_key without runner sign-in.
     key_acc = client.post("/api/accounts", json={"provider": "antigravity", "label": "AI Studio", "auth_mode": "api_key", "secret": "AIza-secret"}).json()

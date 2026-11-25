@@ -2039,6 +2039,12 @@ class AntigravityProvider(Provider):
                 pass
         return ""
 
+    async def take_over(self, key: str) -> dict[str, str]:
+        """The installation's Google sign-in from before #84, in the account's GEMINI_HOME, for the app to keep."""
+        if key in self._own_logins:
+            raise signins.Busy("A sign-in is in progress.")
+        return SIGN_INS.take_over(self.name, key, account_home(key) / "antigravity-acp", SIGN_IN_FILES)
+
     async def _end_own_login(self, key: str) -> None:
         if (login := self._own_logins.pop(key, None)) is not None:
             await login.cancel()
