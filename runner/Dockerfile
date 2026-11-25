@@ -56,6 +56,11 @@ RUN if [ "$PLAINBOARD_BROWSER" = "1" ]; then \
         && rm -rf /var/lib/apt/lists/*; \
     fi
 
+# Gemini CLI for the Gemini provider (providers/gemini_cli.py). Pinned; a newer one comes by gemini_cli.py.
+# After the browser so that a new version keeps that layer cached.
+ARG GEMINI_CLI_VERSION=0.71.1
+RUN npm install -g --no-audit --no-fund @google/gemini-cli@${GEMINI_CLI_VERSION} && gemini --version
+
 # Git talks to GitHub through the gh credential helper (uses GH_TOKEN from each run).
 RUN git config --system credential.https://github.com.helper '!gh auth git-credential' \
     && git config --system init.defaultBranch main \

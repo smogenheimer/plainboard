@@ -8,8 +8,10 @@ source outside the database, do as ``commit_docs`` does) and list it in ``INDEXE
 
 from __future__ import annotations
 
+import asyncio
 from abc import ABC, abstractmethod
 from datetime import UTC, datetime
+from pathlib import Path
 from typing import Any
 
 from plainboard_protocol import GitCommit
@@ -17,12 +19,14 @@ from sqlalchemy import Select, String, and_, cast, func, or_, select, tuple_
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import aliased
 
-from ...models import Agent, Assignment, Comment, Decision, Note, Repository, SearchDocument, Task, TicketState, utcnow
+from ...config import get_config
+from ...models import Agent, Assignment, Attachment, Comment, Decision, DocPage, DocSite, Idea, IdeaStatus, Note, Repository, SearchDocument, Task, TicketState, utcnow
 from .documents import Doc
 
 
 class Indexer(ABC):
     kind: str
+    batch: int | None = None  # items a transaction, where fewer than the watcher's BATCH (a file can have many chunks)
 
     @abstractmethod
     def query(self, project_id: int) -> tuple[Select, Any, Any]:
@@ -170,7 +174,135 @@ class Notes(Indexer):
         return select(cast(Note.id, String)).where(Note.project_id == project_id)
 
 
-INDEXERS: tuple[Indexer, ...] = (Tickets(), Reports(), Decisions(), Comments(), Notes())
+IDEA = "idea"
+
+
+def idea_doc(idea: Idea) -> Doc | None:
+    """An open idea (services/ideas.py); a closed one leaves the index. Its topic is left out: rearranging the
+    topics changes no vector."""
+    if idea.status != IdeaStatus.OPEN:
+        return None
+    return Doc(kind=IDEA, source_id=str(idea.id), ref=f"idea i{idea.id}", title=idea.title, body=idea.text, at=idea.created_at, changed=idea.updated_at)
+
+
+class Ideas(Indexer):
+    """The open ideas: found in the search and by services/idea_neighbours.py, which finds their neighbours."""
+
+    kind = IDEA
+
+    def query(self, project_id: int):
+        return select(Idea).where(Idea.project_id == project_id), Idea.updated_at, Idea.id
+
+    def doc(self, row: Any) -> Doc | None:
+        return idea_doc(row.Idea)
+
+    def existing(self, project_id: int) -> Select:
+        return select(cast(Idea.id, String)).where(Idea.project_id == project_id, Idea.status == IdeaStatus.OPEN)
+
+
+DOC = "doc"
+
+
+class DocPages(Indexer):
+    """The pages of the project's doc sites (services/docs.py): found by agents and people, and the neighbours of
+    a landed change that may make one outdated (orchestration/docs_watcher.py)."""
+
+    kind = DOC
+
+    def query(self, project_id: int):
+        query = select(DocPage, DocSite.name.label("site"), DocSite.slug.label("site_slug")).join(DocSite, DocSite.id == DocPage.site_id).where(DocPage.project_id == project_id)
+        return query, DocPage.updated_at, DocPage.id
+
+    def doc(self, row: Any) -> Doc | None:
+        page: DocPage = row.DocPage
+        return Doc(
+            kind=DOC, source_id=str(page.id), ref=f"doc page {page.page_key or page.id}", title=page.title, body=page.body, at=page.created_at,
+            facts=_facts(f"site {row.site} ({row.site_slug})", f"edited by {page.edited_by}" if page.edited_by else None, None if page.until_seq is None else "an earlier version"),
+            links={"doc_page_id": page.page_key or page.id},
+        )  # fmt: skip
+
+    def existing(self, project_id: int) -> Select:
+        return select(cast(DocPage.id, String)).where(DocPage.project_id == project_id)
+
+
+FILE = "file"
+FILE_SUFFIXES = (".md", ".markdown", ".mdx", ".txt", ".text", ".rst", ".adoc", ".csv", ".tsv", ".json", ".jsonl", ".yaml", ".yml", ".toml", ".xml", ".log", ".diff", ".patch")
+FILE_TYPES = ("text/", "application/json", "application/x-ndjson", "application/xml", "application/yaml", "application/x-yaml", "application/toml")
+MARKDOWN = (".md", ".markdown", ".mdx")
+FILE_READ_BYTES = 256 * 1024  # of a longer file its start: about 250 chunks of text, of which FILE_MAX_CHUNKS are kept
+FILE_MAX_CHUNKS = 200  # ~200 000 characters: a research result or a design fits whole, of a dump or log the start
+FILE_BATCH = 20  # files a transaction: at most FILE_BATCH * FILE_MAX_CHUNKS chunks
+
+
+def _texty() -> Any:
+    """Attachments that may be text, by their name or type (the content decides: binary is left out)."""
+    name = func.lower(Attachment.filename)
+    return or_(*[name.like(f"%{suffix}") for suffix in FILE_SUFFIXES], *[func.lower(Attachment.content_type).like(f"{t}%") for t in FILE_TYPES])
+
+
+def read_text(path: Path) -> str | None:
+    """The start of a text file; None: not there, or binary (a NUL byte, or not mostly UTF-8)."""
+    try:
+        with path.open("rb") as fh:
+            data = fh.read(FILE_READ_BYTES)
+    except OSError:
+        return None
+    if b"\x00" in data[:8192]:
+        return None
+    text = data.decode("utf-8", errors="replace")
+    if text.count("\ufffd") > max(8, len(text) // 100):  # an encoding that is not UTF-8, or binary: more noise than words
+        return None
+    return text.replace("\ufffd", "")
+
+
+class Files(Indexer):
+    """Text files attached to tickets and ideas (research results, designs, logs; chat files are not):
+    found with their ticket. Files never change: a file is read once when it comes, and once more when its
+    retention deletes it (``purged_at``: it leaves the index). Read in a thread, a few at a time."""
+
+    kind = FILE
+    batch = FILE_BATCH
+
+    def query(self, project_id: int):
+        query = (
+            select(Attachment, Task.number.label("number"), Task.title.label("ticket_title"), Idea.title.label("idea_title"))
+            .outerjoin(Task, Task.id == Attachment.task_id)
+            .outerjoin(Idea, Idea.id == Attachment.idea_id)
+            .where(Attachment.project_id == project_id, or_(Attachment.task_id.is_not(None), Attachment.idea_id.is_not(None)), _texty())
+        )
+        return query, func.coalesce(Attachment.purged_at, Attachment.created_at), Attachment.id
+
+    def doc(self, row: Any) -> Doc | None:
+        a: Attachment = row.Attachment
+        if a.purged_at is not None:
+            return None
+        where = f"on ticket #{row.number}" if row.number is not None else f"of idea i{a.idea_id}"
+        return Doc(
+            kind=FILE, source_id=str(a.id), ref=a.filename[:120], title=row.ticket_title or row.idea_title or a.filename, body="", at=a.created_at,
+            facts=_facts(where, f"attachment {a.id}"), ticket_number=row.number, paths=[f"{get_config().runner_uploads_dir}/{a.storage_name}"],
+            links={"task_id": a.task_id, "attachment_id": a.id}, max_chunks=FILE_MAX_CHUNKS, sections=a.filename.lower().endswith(MARKDOWN),
+        )  # fmt: skip
+
+    async def changed(self, s: AsyncSession, project_id: int, cursor: str, limit: int) -> list[tuple[str, str, Doc | None]]:
+        items = await super().changed(s, project_id, cursor, limit)
+        uploads = get_config().uploads_dir
+        files = [(i, uploads / Path(doc.paths[0]).name) for i, (_, _, doc) in enumerate(items) if doc is not None and doc.paths]
+        texts = await asyncio.to_thread(lambda: [read_text(path) for _, path in files])
+        for (i, _), text in zip(files, texts, strict=True):
+            after, source_id, doc = items[i]
+            if text is None:
+                items[i] = (after, source_id, None)
+            else:
+                doc.body = text
+        return items
+
+    def existing(self, project_id: int) -> Select:
+        return select(cast(Attachment.id, String)).where(
+            Attachment.project_id == project_id, or_(Attachment.task_id.is_not(None), Attachment.idea_id.is_not(None)), Attachment.purged_at.is_(None), _texty()
+        )
+
+
+INDEXERS: tuple[Indexer, ...] = (Tickets(), Reports(), Decisions(), Comments(), Notes(), Ideas(), DocPages(), Files())
 COMMIT = "commit"
 KINDS = tuple(i.kind for i in INDEXERS) + (COMMIT,)
 

@@ -1,7 +1,7 @@
 import clsx from "clsx";
 import { useLayoutEffect, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
-import { useRuns, useTasks } from "../../api/queries";
+import { useAgents, useRuns, useTasks } from "../../api/queries";
 import type { Run } from "../../api/types";
 import { AgentDot } from "../../components/ui";
 import { useSince } from "../../lib/time";
@@ -14,7 +14,10 @@ export function useRunningRuns(projectId: number): Map<number, Run> {
 }
 
 function useRows() {
-  const { project, agents } = useShell();
+  const { project, agents: team } = useShell();
+  // A doc site's agent is listed while it works only (it is not part of the team).
+  const all = useAgents(project.id).data ?? team;
+  const agents = all.filter((a) => !a.doc_site_id || a.status !== "idle");
   const tasks = useTasks(project.id).data ?? [];
   const running = useRunningRuns(project.id);
   const since = useSince();

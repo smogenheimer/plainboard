@@ -577,7 +577,7 @@ def test_lists_the_turns_it_runs():
 def test_rate_limit_events_become_limit_windows():
     from claude_agent_sdk.types import RateLimitInfo
 
-    from plainboard_runner.providers.claude_code import limit_windows
+    from plainboard_runner.providers.claude_code import limit_covers, limit_windows
 
     raw = {"unifiedWindows": {"five_hour": {"utilization": 0.4, "resetsAt": 100}, "seven_day": {"utilization": 0.1, "resetsAt": 200}}}
     windows = limit_windows(RateLimitInfo(status="allowed", raw=raw))
@@ -588,6 +588,8 @@ def test_rate_limit_events_become_limit_windows():
     assert [(w.name, w.utilization, w.status) for w in hit] == [("seven_day", 1.0, "rejected")]
     assert limit_windows(RateLimitInfo(status="allowed")) == []
     assert limit_windows(RateLimitInfo(status="rejected", rate_limit_type="overage")) == []
+    # A response's headers name every header window of the plan (Ultra has no 5-hour one); a lone type doesn't.
+    assert "five_hour" in limit_covers(RateLimitInfo(status="allowed", raw=raw)) and limit_covers(RateLimitInfo(status="rejected", rate_limit_type="five_hour")) == []
 
 
 def test_usage_answer_becomes_limit_windows():
@@ -643,7 +645,11 @@ async def test_the_plan_of_a_claude_subscription(tmp_path, monkeypatch):
     assert plan_of("claude_max", "default_claude_max_5x") == ("Max 5x", 5.0)
     assert plan_of("pro", None) == ("Pro", 1.0)
     assert plan_of("max", None) == ("Max", None)  # two sizes: the user says which
-    assert plan_of("claude_ultra", None) == ("Ultra", None)
+    # Ultra: 10x Pro a week. Claude Code knows no tier name for it yet, so a tier or plan type that names it counts.
+    assert plan_of("claude_ultra", None) == ("Ultra", 10.0)
+    assert plan_of("max", "default_claude_ultra") == ("Ultra", 10.0)
+    assert plan_of("claude_max", "claude_ultra_10x") == ("Ultra", 10.0)
+    assert plan_of("claude_team", None) == ("Team", None)
     assert plan_of(None, None) == (None, None)
 
     monkeypatch.setattr("pathlib.Path.home", lambda: tmp_path)
@@ -827,6 +833,22 @@ async def test_how_far_the_running_plainboard_is_behind_its_upstream():
         await github.upstream(Credentials(), "acme/limited", "main", "abc1234", transport=transport)
 
 
+async def test_how_many_newer_releases_there_are():
+    from plainboard_runner import github
+
+    refs = ["refs/tags/v1.2.0", "refs/tags/v1.10.0", "refs/tags/v1.3.1", "refs/tags/v1.3.1-rc1", "refs/tags/v0.9.0", "refs/tags/vnext"]
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        assert request.url.path == "/repos/acme/app/git/matching-refs/tags/v"
+        return httpx.Response(200, json=[{"ref": r} for r in refs])
+
+    transport = httpx.MockTransport(answer)
+    state = await github.upstream(Credentials(), "acme/app", "main", "abc1234", version="1.2.0", transport=transport)
+    assert (state.behind, state.latest, state.url) == (2, "1.10.0", "https://github.com/acme/app/compare/v1.2.0...v1.10.0")
+    state = await github.upstream(Credentials(), "acme/app", "main", "abc1234", version="1.10.0", transport=transport)
+    assert (state.behind, state.latest, state.url) == (0, "", "")
+
+
 def test_the_checks_of_a_commit_on_a_branch():
     from plainboard_runner.github import parse_check_runs
 
@@ -884,12 +906,14 @@ async def test_the_limits_of_a_token_subscription_come_from_a_minimal_turn(monke
     FakeUsageClient.usage = {"seven_day": {"utilization": 23, "resets_at": "2026-11-20T03:00:00+00:00"}}
     (window,) = await provider.limits(token)
     assert (window.name, window.utilization) == ("seven_day", 0.23) and FakeUsageClient.asked == []
+    assert (await provider.limits_report(token))[1] == ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"]  # the answer names them all
 
     # It answers with nothing (the token is for model requests only): one word to the small model shows them.
     FakeUsageClient.usage = None
     windows = {w.name: w for w in await provider.limits(token)}
     assert windows["seven_day"].utilization == 0.41 and windows["seven_day"].resets_at == 1795143600 and "seven_day_overage_included" in windows
     assert FakeUsageClient.asked == ["claude-haiku-5-5: ok"]
+    assert "five_hour" in (await provider.limits_report(token))[1]  # the turn's headers had no 5-hour window: it is gone
 
     assert await provider.limits(Credentials(claude_auth_mode="api_key", anthropic_api_key="k")) == []  # an API key has no plan
 

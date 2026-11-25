@@ -21,6 +21,7 @@ import {
   type TextareaHTMLAttributes,
 } from "react";
 import { createPortal } from "react-dom";
+import { useAutoGrow } from "../lib/hooks";
 
 type Variant = "primary" | "secondary" | "ghost" | "danger";
 
@@ -113,11 +114,27 @@ export const Input = forwardRef<HTMLInputElement, InputHTMLAttributes<HTMLInputE
   return <input ref={ref} data-part="field" className={clsx(fieldBase, "h-8 touch:h-11", className)} {...rest} />;
 });
 
+/** Multi-line field. Never resized by hand: it grows with its text from `rows` up to `max-h-[60vh]`
+ * (a `max-h-*` in `className` replaces that), then it scrolls. */
 export const Textarea = forwardRef<HTMLTextAreaElement, TextareaHTMLAttributes<HTMLTextAreaElement>>(function Textarea(
   { className, ...rest },
   ref,
 ) {
-  return <textarea ref={ref} data-part="field" className={clsx(fieldBase, "scroll-thin py-1.5 leading-relaxed", className)} {...rest} />;
+  const own = useRef<HTMLTextAreaElement | null>(null);
+  useAutoGrow(own, rest.value);
+  const setRef = (el: HTMLTextAreaElement | null) => {
+    own.current = el;
+    if (typeof ref === "function") ref(el);
+    else if (ref) ref.current = el;
+  };
+  return (
+    <textarea
+      ref={setRef}
+      data-part="field"
+      className={clsx(fieldBase, "scroll-thin resize-none py-1.5 leading-relaxed", !/(^|\s)max-h-/.test(className ?? "") && "max-h-[60vh]", className)}
+      {...rest}
+    />
+  );
 });
 
 const LIST_GUTTER = 8;
@@ -369,23 +386,24 @@ export function FieldRow({ children }: { children: ReactNode }) {
   return <div className="grid gap-3 sm:grid-cols-2 sm:gap-y-0 sm:*:row-span-3 sm:*:grid sm:*:grid-rows-subgrid">{children}</div>;
 }
 
+/** The look of an on/off switch, shared by every switch (Toggle, and switches inside menu items). Each
+ * design styles it through data-part="toggle" and data-on. */
+export function SwitchTrack({ checked }: { checked: boolean }) {
+  return (
+    <span data-part="toggle" data-on={checked} aria-hidden className={clsx("relative h-5 w-9 shrink-0 rounded-sm ring-1 ring-inset transition-colors", checked ? "bg-fg ring-fg" : "ring-line-2")}>
+      <span className={clsx("absolute top-1 size-3 rounded-[1px] transition-all", checked ? "left-5 bg-bg" : "left-1 bg-fg-3")} />
+    </span>
+  );
+}
+
 export function Toggle({ checked, onChange, label }: { checked: boolean; onChange: (v: boolean) => void; label: ReactNode }) {
   return (
     <label className="flex cursor-pointer items-center gap-2 select-none">
-      <button
-        type="button"
-        role="switch"
-        data-part="toggle"
-        aria-checked={checked}
-        onClick={() => onChange(!checked)}
-        className={clsx(
-          "relative h-5 w-9 shrink-0 rounded-sm ring-1 ring-inset transition-colors",
-          checked ? "bg-fg ring-fg" : "ring-line-2",
-        )}
-      >
-        <span className={clsx("absolute top-1 size-3 rounded-[1px] transition-all", checked ? "left-5 bg-bg" : "left-1 bg-fg-3")} />
+      <button type="button" role="switch" aria-checked={checked} onClick={() => onChange(!checked)} className="flex shrink-0">
+        <SwitchTrack checked={checked} />
       </button>
-      <span>{label}</span>
+      {/* Trim the text box to cap height and baseline so the letters, not the line box, are centred on the switch in every design's font. */}
+      <span className="[text-box:trim-both_cap_alphabetic]">{label}</span>
     </label>
   );
 }

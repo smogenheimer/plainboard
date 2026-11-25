@@ -10,7 +10,7 @@ from pydantic import BaseModel, Field
 from ..services import search
 from .registry import SEARCH, ToolContext, ToolError, tool
 
-Kind = Literal["ticket", "report", "decision", "comment", "note", "commit"]
+Kind = Literal["ticket", "report", "decision", "comment", "note", "commit", "idea", "doc", "file"]
 
 
 class SearchHistoryArgs(BaseModel):
@@ -24,7 +24,7 @@ class SearchHistoryArgs(BaseModel):
 
 @tool(
     "search_history",
-    "Search this project's history by meaning and keywords: tickets, assignment reports, decisions, comments, notes, git commits. "
+    "Search this project's history by meaning and keywords: tickets, assignment reports, decisions, comments, notes, git commits, open ideas, doc pages, text files attached to tickets. "
     "Use it before work that may have history (a similar bug, an earlier decision, where something was changed), not on every turn. "
     "Results are history and may be outdated: each says its age and where it stands now; check the current code or ticket before relying on it.",
     SearchHistoryArgs,

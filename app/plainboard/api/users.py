@@ -2,7 +2,9 @@ from __future__ import annotations
 
 from fastapi import APIRouter, File, Response, UploadFile
 
+from ..models import ProjectRole
 from ..schemas import MemberIn, MemberOut, OwnerChangeOut, MentionsOut, MentionsRead, PersonOut, UserCreate, UserOut, UserUpdate
+from ..services import accounts as account_service
 from ..services import mentions as mention_service
 from ..services import ownership
 from ..services import permissions
@@ -95,12 +97,15 @@ async def change_owner(project_id: int, user_id: int, session: Session, who: Who
 async def set_member(project_id: int, user_id: int, body: MemberIn, session: Session) -> list[MemberOut]:
     await project_service.get(session, project_id)
     await user_service.set_member(session, project_id, user_id, body.role)
+    if body.role == ProjectRole.VIEWER:  # only watching: what they gave the project goes with them
+        await account_service.leave(session, project_id, user_id)
     return await list_members(project_id, session)
 
 
 @router.delete("/projects/{project_id}/members/{user_id}", response_model=list[MemberOut])
 async def remove_member(project_id: int, user_id: int, session: Session) -> list[MemberOut]:
     await user_service.remove_member(session, project_id, user_id)
+    await account_service.leave(session, project_id, user_id)
     return await list_members(project_id, session)
 
 

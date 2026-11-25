@@ -42,7 +42,7 @@ from ..models import (
     TrainStatus,
     utcnow,
 )
-from . import own_notes
+from . import landings, own_notes
 from . import settings as settings_service
 from .timing import duration
 from .util import truncate
@@ -64,6 +64,10 @@ def _age(since: datetime, now: datetime) -> str:
     return duration((now - since).total_seconds())
 
 
+def _name(agents: dict, agent_id: int | None) -> str:
+    return agents[agent_id].name if agent_id in agents else "?"
+
+
 def _listed(items: list[str], limit: int = 5) -> str:
     return ", ".join(items[:limit]) + (f" and {len(items) - limit} more" if len(items) > limit else "")
 
@@ -77,7 +81,7 @@ async def findings(session: AsyncSession, project_id: int, hours: int = 24, now:
     project = await session.get(Project, project_id)
     if project is not None and project.fast_checks:
         found += [finding for repo in repos if (finding := (await slow_checks(session, repo, now))[0])]
-    for check in (_red_base, _failing_checks, _slow_quick_check, _repairs, _waiting_repairs, _stuck, _long_assignments, _queue, _big_tickets):
+    for check in (_red_base, _failing_checks, _slow_quick_check, _repairs, _waiting_repairs, _stuck, _held, _long_assignments, _queue, _big_tickets):
         found += await check(session, project_id, repos, agents, since, now)
     for check in (_tool_errors, _full_notes, _schedules_off, _cost, _waiting_for_user, _job_waiting):
         found += await check(session, project_id, agents, since, now)
@@ -308,6 +312,22 @@ async def _stuck(session, project_id, repos, agents, since, now) -> list[Finding
     ]
 
 
+async def _held(session, project_id, repos, agents, since, now) -> list[Finding]:
+    held = await landings.held_long(session, now, project_id)
+    if not held:
+        return []
+    return [
+        Finding(
+            "held",
+            55,
+            f"{len(held)} branch{'es are' if len(held) != 1 else ' is'} held for a message for over {landings.HOLD_TELL_SECONDS // 3600} h",
+            f"{_listed([f'{b.branch} ({_name(agents, b.agent_id)}, {_age(b.held_at or now, now)})' for b in held])}. "
+            "Their author got a message after handing them over and has neither handed them over again nor confirmed them: they do not land.",
+            "Ask the author (message_agent), let one land as it is (release_branch), or take it off the list (forget_branch).",
+        )
+    ]
+
+
 # --- how work is cut ------------------------------------------------------------------------
 
 
@@ -383,15 +403,21 @@ async def _tool_errors(session, project_id, agents, since, now) -> list[Finding]
     names = {tool.name for tool in all_tools()}
     rows = (
         await session.execute(
-            select(Message.content, Message.meta["result"].as_string())
+            # The whole meta, read in Python: on PostgreSQL any ->/->> fails on a row whose JSON holds a \u0000 (#120).
+            select(Message.content, Message.meta)
             .join(Conversation, Conversation.id == Message.conversation_id)
-            .where(Conversation.agent_id.in_(list(agents)), Message.kind == "tool", Message.created_at >= since, Message.meta["is_error"].as_boolean().is_(True))
+            .where(
+                Conversation.agent_id.in_(list(agents)),
+                Message.kind == "tool",
+                Message.created_at >= since,
+                Message.content.in_(names | {"mcp__plainboard__" + n for n in names}),
+            )
         )
     ).all()
     refused: dict[str, Counter] = {}
-    for name, result in rows:
-        name = name.removeprefix("mcp__plainboard__")
-        if name in names and not str(result or "").startswith("Not handed over: the quick check"):  # that is the quick check doing its work
+    for name, meta in rows:
+        name, result = name.removeprefix("mcp__plainboard__"), (meta or {}).get("result")
+        if (meta or {}).get("is_error") and not str(result or "").startswith("Not handed over: the quick check"):  # that is the quick check doing its work
             refused.setdefault(name, Counter())[truncate(str(result or "").split("\n")[0], 110)] += 1
     often = sorted(((name, reasons) for name, reasons in refused.items() if sum(reasons.values()) >= 5), key=lambda item: -sum(item[1].values()))
     if not often:

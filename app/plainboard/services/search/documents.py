@@ -25,7 +25,7 @@ OVERLAP_CHARS = 150
 MAX_CHUNKS = 50  # ~50 000 characters: only a pasted log or dump is longer; of it the first part (the limit keeps one item from flooding the index)
 MIN_CHARS = 12  # shorter is noise ("ok", "+1")
 
-KIND_NAMES = {"ticket": "Ticket", "report": "Report", "decision": "Decision", "comment": "Comment", "note": "Note", "commit": "Commit"}
+KIND_NAMES = {"ticket": "Ticket", "report": "Report", "decision": "Decision", "comment": "Comment", "note": "Note", "commit": "Commit", "idea": "Idea", "doc": "Doc page", "file": "File"}
 
 
 @dataclass
@@ -44,6 +44,8 @@ class Doc:
     changed: datetime | None = None  # when it last changed at its source; None: when it was made
     paths: list[str] | None = None  # a commit's changed files
     links: dict[str, int | None] = field(default_factory=dict)  # what it comes from (SearchDocument.task_id ...): deleted with it
+    max_chunks: int = MAX_CHUNKS
+    sections: bool = False  # markdown: cut at its headings, each chunk names its section
 
 
 @dataclass
@@ -118,7 +120,7 @@ def _pieces(text: str, size: int) -> list[str]:
     return out
 
 
-def split(text: str, size: int = CHUNK_CHARS, overlap: int = OVERLAP_CHARS) -> list[str]:
+def split(text: str, size: int = CHUNK_CHARS, overlap: int = OVERLAP_CHARS, max_chunks: int = MAX_CHUNKS) -> list[str]:
     """Chunks of at most about ``size`` characters, cut between paragraphs; each after the first
     starts with the last paragraph(s) of the one before, up to ``overlap`` characters."""
     pieces = _pieces(text, size)
@@ -138,7 +140,62 @@ def split(text: str, size: int = CHUNK_CHARS, overlap: int = OVERLAP_CHARS) -> l
         length += len(piece) + 2
     if current:
         chunks.append(current)
-    return ["\n\n".join(c) for c in chunks[:MAX_CHUNKS]]
+    return ["\n\n".join(c) for c in chunks[:max_chunks]]
+
+
+_ATX = re.compile(r"^\s{0,3}(#{1,6})\s+(.*?)\s*#*\s*$")
+_FENCE_LINE = re.compile(r"^\s*(```|~~~)")
+
+
+def sections(text: str) -> list[tuple[str, str]]:
+    """A markdown text by its headings: (the path of headings above it, "A › B", its text). Headings in code
+    blocks are none."""
+    out: list[tuple[str, str]] = []
+    trail: list[str] = []
+    lines: list[str] = []
+    fenced = False
+    for line in (text or "").replace("\r\n", "\n").split("\n"):
+        if _FENCE_LINE.match(line):
+            fenced = not fenced
+        heading = None if fenced else _ATX.match(line)
+        if heading is None:
+            lines.append(line)
+            continue
+        out.append((" › ".join(trail), "\n".join(lines)))
+        level = len(heading.group(1))
+        trail = [*trail[: level - 1], clean(heading.group(2)).replace("\n", " ")[:120]]
+        lines = []
+    out.append((" › ".join(trail), "\n".join(lines)))
+    return [(path, body) for path, body in out if path or body.strip()]
+
+
+def split_sections(text: str, size: int = CHUNK_CHARS, max_chunks: int = MAX_CHUNKS) -> list[str]:
+    """Chunks of a markdown text that follow its headings: short sections share a chunk, a long one is cut
+    (with overlap) and each of its chunks starts with its heading path."""
+    chunks: list[str] = []
+    current = ""
+    for path, raw in sections(text):
+        body = clean(raw)
+        whole = f"{path}\n{body}".strip() if path else body
+        if not whole:
+            continue
+        if current and len(current) + 2 + len(whole) <= size:
+            current = f"{current}\n\n{whole}"
+            continue
+        if current:
+            chunks.append(current)
+            current = ""
+        if len(whole) <= size:
+            current = whole
+            continue
+        room = size - len(path) - 1 if path else size
+        parts = split(body, max(room, size // 2), max_chunks=max_chunks - len(chunks))
+        chunks += [f"{path}\n{p}" if path else p for p in parts]
+        if len(chunks) >= max_chunks:
+            break
+    if current:
+        chunks.append(current)
+    return chunks[:max_chunks]
 
 
 def header(doc: Doc, project: str, part: int = 0, parts: int = 1) -> str:
@@ -159,7 +216,7 @@ def prepare(doc: Doc, project: str) -> list[Chunk]:
     body = clean(doc.body)
     if len(body) < MIN_CHARS and len(clean(doc.title)) < MIN_CHARS:
         return []
-    texts = split(body) or [""]
+    texts = (split_sections(doc.body, max_chunks=doc.max_chunks) if doc.sections else split(body, max_chunks=doc.max_chunks)) or [""]
     chunks = []
     for i, text in enumerate(texts):
         head = header(doc, project, i, len(texts))

@@ -36,6 +36,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ..config import get_config
 from ..models import AssignmentStatus, Base, Project, Schedule, utcnow
 from ..security import decrypt, encrypt
+from . import docs as docs_service
 from . import projects as project_service
 from . import schedules as schedule_service
 from . import version as version_service
@@ -60,10 +61,11 @@ class Table:
 
 
 AGENT = {"created_by_agent_id": "agents"}
-# Not moved: search_documents and search_cursors (services/search), made again from these on the other side.
+# Not moved: doc_watch (where the docs watcher read, starts anew), search_documents and search_cursors (services/search), made again from these on the other side,
+# idea_changes (what can be undone right now: its ids are this side's), and promotions (#129: like landings and trains, the flow of this side).
 TABLES: tuple[Table, ...] = (
-    Table("projects", sealed=("github_token_enc",), reset={"workspace_path": None, "account_id": None, "account_ids": [], "runner_id": None, "owner_id": None}),
-    Table("agents", reset={"account_id": None, "team_pause": False}),
+    Table("projects", sealed=("github_token_enc",), reset={"workspace_path": None, "account_id": None, "account_ids": [], "blocked_account_ids": None, "runner_id": None, "owner_id": None}),
+    Table("agents", reset={"account_id": None, "team_pause": False}, late={"doc_site_id": "doc_sites"}),
     Table("repositories", sealed=("token_enc", "ssh_key_enc"), reset={"tidied_at": None, "tidy_listed": None, "failing_told_at": None, "slow_told_at": None, "slow_told_seconds": None, "checks_baseline_at": None}),
     Table("mcp_servers", sealed=("env_enc", "headers_enc")),
     Table("secrets", sealed=("value_enc",)),
@@ -77,10 +79,26 @@ TABLES: tuple[Table, ...] = (
     Table("schedules", refs={"agent_id": "agents", **AGENT}, reset={"last_run_id": None}),
     Table("tasks", refs=AGENT),
     Table("task_transitions"),
-    Table("attachments", refs={"task_id": "tasks", "uploaded_by_agent_id": "agents"}),
+    # Doc sites (#118): slug and domain are the installation's, so a copy gets free ones (and verifies its domain again).
+    Table("doc_sites", sealed=("cloudflare_token_enc", "deepl_key_enc", "google_key_enc"), reset={"domain_verified_at": None}),
+    Table("attachments", refs={"task_id": "tasks", "uploaded_by_agent_id": "agents", "doc_site_id": "doc_sites"}, late={"idea_id": "ideas"}),
     Table("comments", ("task_id", "tasks"), {"task_id": "tasks", "author_agent_id": "agents"}),
     Table("decisions", refs={"task_id": "tasks", "requested_by_agent_id": "agents"}, lists={"attachment_ids": "attachments"}),
     Table("assignments", refs={"task_id": "tasks", "agent_id": "agents", **AGENT}, reset={"run_id": None, "landing_id": None, "train_id": None}),
+    Table("idea_topics"),
+    Table("ideas", refs={"topic_id": "idea_topics", "task_id": "tasks"}, late={"merged_into_id": "ideas"}),
+    Table("idea_links", refs={"idea_id": "ideas", "other_id": "ideas"}),
+    Table("idea_versions", refs={"idea_id": "ideas"}),
+    Table("doc_releases", refs={"site_id": "doc_sites"}),
+    Table("doc_areas", refs={"site_id": "doc_sites"}, late={"area_key": "doc_areas"}),
+    Table("doc_groups", refs={"site_id": "doc_sites", "area_id": "doc_areas"}, late={"group_key": "doc_groups"}),
+    Table("doc_pages", refs={"site_id": "doc_sites", "area_id": "doc_areas", "group_id": "doc_groups"}, late={"parent_id": "doc_pages", "page_key": "doc_pages"}, reset={"reminded_at": None}),
+    Table("doc_page_versions", refs={"page_id": "doc_pages", "agent_id": "agents"}),
+    Table("doc_translations", refs={"site_id": "doc_sites", "page_id": "doc_pages"}),
+    Table("doc_custom_pages", refs={"site_id": "doc_sites"}),
+    Table("doc_theme_versions", refs={"site_id": "doc_sites", "agent_id": "agents"}),
+    Table("doc_api_keys", refs={"site_id": "doc_sites"}),
+    Table("doc_proposals", refs={"site_id": "doc_sites", "task_id": "tasks", "decision_id": "decisions"}, lists={"pages": "doc_pages"}),
     Table("ticket_states", ("task_id", "tasks"), {"task_id": "tasks", "until_assignment_id": "assignments"}, key="task_id"),
     # A chat goes on from its summary and its latest messages: the provider's own session stays behind.
     Table(
@@ -180,7 +198,7 @@ def _credential(table: str, row: dict[str, Any]) -> str:
     """A credential by the name the user knows it by."""
     if table == "projects":
         return "the project's GitHub token"
-    what = {"repositories": "the access of repository", "mcp_servers": "the environment of MCP server", "secrets": "the secret"}[table]
+    what = {"repositories": "the access of repository", "mcp_servers": "the environment of MCP server", "secrets": "the secret", "doc_sites": "the Cloudflare token or translator keys of doc site"}[table]
     return f"{what} {row.get('name', '')}".strip()
 
 
@@ -280,12 +298,18 @@ async def import_project(session: AsyncSession, source: IO[bytes], *, passphrase
                     values["slug"] = await project_service.unique_slug(session, str(values.get("name") or "project"))
                 elif spec.name == "assignments" and values.get("status") in (AssignmentStatus.QUEUED, AssignmentStatus.RUNNING):
                     values.update(status=AssignmentStatus.CANCELLED, finished_at=now, result=values.get("result") or MOVED)
+                elif spec.name == "attachments" and values.get("purged_at"):
+                    values["storage_name"] = uuid.uuid4().hex  # its file was deleted by the retention: the entry comes along
                 elif spec.name == "attachments":
                     stored = _store(archive, uploads, str(values.get("storage_name") or ""))
                     if stored is None:
                         continue  # its file is not in the archive
                     values["storage_name"] = stored
-                elif spec.name == "public_api_keys" and await session.scalar(select(table.c.id).where(table.c.key_hash == values.get("key_hash"))):
+                elif spec.name == "doc_sites":
+                    values["slug"] = await docs_service.unique_site_slug(session, str(values.get("slug") or values.get("name") or "docs"))
+                    if values.get("domain") and await session.scalar(select(table.c.id).where(table.c.domain == values["domain"])):
+                        values["domain"] = None  # this installation serves that domain already (the project was copied, not moved)
+                elif spec.name in ("public_api_keys", "doc_api_keys") and await session.scalar(select(table.c.id).where(table.c.key_hash == values.get("key_hash"))):
                     continue  # this installation has the key already (the project was copied, not moved)
                 result = await session.execute(insert(table).values(**values))
                 if spec.key == "id":
@@ -302,6 +326,7 @@ async def import_project(session: AsyncSession, source: IO[bytes], *, passphrase
             found = {column: new.get(target, {}).get(row.get(column)) for column, target in spec.late.items()}
             if values := {column: value for column, value in found.items() if value is not None}:
                 await session.execute(update(table).where(table.c[spec.key] == row_id).values(**values))
+        await docs_service.after_import(session, new)
         # A schedule fires at its next time from now, not for every time it missed on the way.
         for schedule in list(await session.scalars(select(Schedule).where(Schedule.id.in_(list(new["schedules"].values()))))):
             schedule.next_run_at = schedule_service.compute_next_run(schedule, after=now)

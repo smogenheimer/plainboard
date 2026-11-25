@@ -7,7 +7,14 @@ that one's refreshed token is the other's too; the last one to end removes it. W
 waits in ``outbox`` until the app has taken it (``GET /signins``, ``POST /signins/ack``), and until then it
 is what the next run of the account starts from: it is newer than what the app sent. A finished sign-in
 waits there as well (``base`` ""). Each entry names the version it was derived from, so the app keeps the
-newest and never goes back to an older one.
+newest and never goes back to an older one. What another runner refreshed reaches the account's folder
+here too while it is in use (``update``): the CLIs read the file again before they refresh, so no two
+runners refresh one token.
+
+The installation's sign-ins from before (#84) are in the runner's home: the app copies them over once
+(``POST /providers/{name}/takeover``), while nothing uses them. From then on a mark (``TAKEN``) keeps every
+use of the home's copy away for good, so it is never refreshed and cannot outdate the app's: OpenAI and
+Anthropic rotate refresh tokens. The home's files themselves stay as they are, a backup.
 """
 
 from __future__ import annotations
@@ -18,13 +25,14 @@ import os
 import re
 import shutil
 import tempfile
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Callable, Iterator
 from dataclasses import dataclass
 from pathlib import Path
 
 from plainboard_protocol import ACCOUNT_KEY_PATTERN, SignInAck, SignInFiles, files_digest
 
 ROOT = Path(tempfile.gettempdir()) / "plainboard-signins"
+TAKEN = Path.home() / ".plainboard" / "signins-taken"  # sign-ins of the home the app took over: one mark each
 NAME = re.compile(r"^\.?[A-Za-z0-9_][A-Za-z0-9._-]{0,99}$")  # a file of the folder itself, e.g. .credentials.json
 
 
@@ -58,6 +66,20 @@ def write(home: Path, files: dict[str, str]) -> None:
             f.write(text)
 
 
+class Busy(RuntimeError):
+    """The home's sign-in is in use right now: it is taken over once nothing uses it."""
+
+
+def _mark(provider: str, key: str) -> Path:
+    if not re.fullmatch(ACCOUNT_KEY_PATTERN, key) or not re.fullmatch(r"[a-z0-9_]+", provider):
+        raise ValueError(f"Invalid sign-in: {provider!r} {key!r}")
+    return TAKEN / f"{provider}-{key}"
+
+
+def taken(provider: str, key: str) -> bool:
+    return _mark(provider, key).exists()
+
+
 @dataclass
 class _Home:
     path: Path
@@ -71,6 +93,29 @@ class SignIns:
         self._homes: dict[str, _Home] = {}
         self._lock = asyncio.Lock()
         self.outbox: dict[str, SignInFiles] = {}
+        self._in_home: dict[tuple[str, str], int] = {}  # uses of a sign-in in the runner's home, until it is taken over
+
+    @contextlib.contextmanager
+    def in_home(self, provider: str, key: str, what: str) -> Iterator[None]:
+        """A use of the home's sign-in ``key``: refused once the app took it over (its copy is the one in use)."""
+        if taken(provider, key):
+            raise RuntimeError(f"{what} is kept by PlainBoard now and comes with the run; this run came without it. Start it again.")
+        self._in_home[(provider, key)] = self._in_home.get((provider, key), 0) + 1
+        try:
+            yield
+        finally:
+            self._in_home[(provider, key)] -= 1
+
+    def take_over(self, provider: str, key: str, home: Path, names: tuple[str, ...]) -> dict[str, str]:
+        """The home's sign-in files for the app (none: not signed in there), copied while nothing uses them.
+        From now on nothing here uses them again (``in_home``); they stay where they are."""
+        mark = _mark(provider, key)
+        if self._in_home.get((provider, key)):
+            raise Busy("The sign-in is in use; it is taken over once that ends.")
+        files = read(home, names)
+        mark.parent.mkdir(parents=True, exist_ok=True)
+        mark.write_text("The app keeps this sign-in now; the files in the home are left as a backup and not used.\n")
+        return files
 
     @contextlib.asynccontextmanager
     async def home(
@@ -115,6 +160,20 @@ class SignIns:
     def signed_in(self, provider: str, account: str, files: dict[str, str]) -> None:
         """A sign-in finished: it replaces whatever the app had."""
         self.outbox[account] = SignInFiles(provider=provider, account=account, files=files, base="", digest=files_digest(files))
+
+    async def update(self, entries: list[SignInFiles]) -> None:
+        """What another runner refreshed: into the account's folder here, while it is in use and still holds
+        the version the refresh came from (``base``). The next run gets it from the app anyway."""
+        async with self._lock:
+            for entry in entries:
+                live = self._homes.get(entry.account)
+                if live is None or not entry.files or files_digest(read(live.path, tuple(entry.files))) != entry.base:
+                    continue  # not in use here, or refreshed here as well: the app keeps the newest
+                try:
+                    write(live.path, entry.files)
+                except (OSError, ValueError):
+                    continue
+                live.files, live.base = dict(entry.files), entry.digest or files_digest(entry.files)
 
     def forget(self, account: str) -> None:
         """Signed out: what waits for the app goes."""

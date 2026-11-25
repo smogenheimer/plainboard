@@ -17,6 +17,7 @@ import json
 import logging
 import os
 import re
+import tempfile
 import time
 from pathlib import Path
 from datetime import UTC, datetime, timedelta
@@ -43,6 +44,7 @@ from plainboard_protocol import (
     AssistantTextEvent,
     ProviderAccount,
     CompactionEvent,
+    DEFAULT_ACCOUNT,
     CompletionResult,
     CompletionSpec,
     Credentials,
@@ -66,7 +68,7 @@ from ..config import TOOL_RESULT_PREVIEW_CHARS
 from ..signins import SIGN_INS
 from ..tool_bridge import ToolBridge
 from ..workspace import tool_env
-from .base import Provider, ProviderError
+from .base import Provider, ProviderError, merge_efforts
 
 log = logging.getLogger(__name__)
 
@@ -117,6 +119,8 @@ MODELS = [
     ModelInfo(id="claude-fable-5-1", label="Claude Fable 5.1", tier="xlarge"),
 ]
 EFFORTS = ["low", "medium", "high", "xhigh", "max"]
+TIER_HINTS = {"fable": "xlarge", "opus": "large", "sonnet": "medium", "haiku": "small"}
+CLI_MODELS_TTL_SECONDS = 3600  # how long Claude Code's own list of models (cli_models) is kept
 # What Claude Code says when a turn is turned away because a plan limit is used up, e.g. "You've hit
 # your 5-hour limit · resets 7:10pm (UTC)", or in older versions "Claude AI usage limit reached|<unix time>".
 LIMIT_HIT = re.compile(r"hit your (?P<kind>[\w -]*?)\s*limit|usage limit reached(?:\|(?P<at>\d+))?", re.IGNORECASE)
@@ -125,16 +129,43 @@ LIMIT_RESET = re.compile(r"resets (?:at )?(?P<hour>\d{1,2})(?::(?P<minute>\d{2})
 
 # Claude's plans by rate limit tier, with their size as a multiple of Pro's usage. A plan Claude Code
 # names without a tier gets its name only (Max comes in two sizes); the user can give its size.
-PLAN_TIERS = {"default_claude_max_5x": ("Max 5x", 5.0), "default_claude_max_20x": ("Max 20x", 20.0)}
-PLAN_TYPES = {"pro": ("Pro", 1.0), "max": ("Max", None)}
+# Ultra (10x Pro a week, no 5-hour window) has no tier name Claude Code knows yet: a tier or plan
+# type that names it counts as Ultra.
+PLAN_TIERS = {"default_claude_max_5x": ("Max 5x", 5.0), "default_claude_max_20x": ("Max 20x", 20.0), "default_claude_ultra": ("Ultra", 10.0)}
+PLAN_TYPES = {"pro": ("Pro", 1.0), "max": ("Max", None), "ultra": ("Ultra", 10.0)}
 PROFILE_URL = "https://api.anthropic.com/api/oauth/profile"
 PLAN_KEEP_SECONDS = 6 * 3600  # a plan rarely changes; asking for it costs a request, no tokens
+
+
+def guess_tier(model_id: str) -> str:
+    return next((tier for hint, tier in TIER_HINTS.items() if hint in model_id), "medium")
+
+
+def cli_models(listed: list[Any] | None) -> tuple[list[ModelInfo], list[str]]:
+    """The models Claude Code offers (``models`` of its initialize answer) beyond MODELS, and their effort levels."""
+    known = {m.id for m in MODELS}
+    out: dict[str, ModelInfo] = {}
+    levels: list[list[str]] = []
+    entries = [m for m in listed or [] if isinstance(m, dict)]
+    for m in sorted(entries, key=lambda m: m.get("value") == "default"):  # "default" is another one's alias: its label last
+        model_id = str(m.get("resolvedModel") or m.get("value") or "")
+        if not model_id.startswith("claude-"):
+            continue
+        levels.append([str(e) for e in m.get("supportedEffortLevels") or []])
+        if model_id in known or model_id in out:
+            continue
+        name = str(m.get("description") or "").split(" · ")[0].strip() or str(m.get("displayName") or "")
+        label = name if name.lower().startswith("claude") else f"Claude {name}" if name else model_id
+        out[model_id] = ModelInfo(id=model_id, label=label, tier=guess_tier(model_id))  # type: ignore[arg-type]
+    return list(out.values()), merge_efforts([], *levels)
 
 
 def plan_of(subscription: str | None, tier: str | None) -> tuple[str | None, float | None]:
     """Name and size of a plan from what Claude Code knows about the account."""
     if tier in PLAN_TIERS:
         return PLAN_TIERS[tier]
+    if "ultra" in (tier or "").lower():
+        return PLAN_TIERS["default_claude_ultra"]
     kind = (subscription or "").lower().removeprefix("claude_")
     if not kind:
         return None, None
@@ -151,6 +182,20 @@ LOGIN_START_SECONDS = 30
 LOGIN_CODE_SECONDS = 30
 LOGIN_TIMEOUT_SECONDS = 15 * 60
 LOGIN_URL = re.compile(r"https://\S+")
+HOME_SIGN_IN = "claude_code"  # the mark of the home's sign-in once the app took it over (signins.TAKEN)
+REFRESH_AHEAD_SECONDS = 3 * 3600  # a kept sign-in whose token ends sooner is refreshed ahead (refresh_sign_in)
+
+
+def refresh_due(files: dict[str, str], now: float | None = None) -> bool:
+    """A Claude sign-in whose access token ends within ``REFRESH_AHEAD_SECONDS``."""
+    try:
+        oauth = json.loads(files.get(SIGN_IN_FILES[0]) or "{}").get("claudeAiOauth") or {}
+    except (ValueError, AttributeError):
+        return False
+    expires = oauth.get("expiresAt")
+    if not oauth.get("refreshToken") or not isinstance(expires, (int, float)):
+        return False
+    return expires / 1000 - (time.time() if now is None else now) < REFRESH_AHEAD_SECONDS
 
 
 def private_config(home: Path) -> None:
@@ -326,7 +371,8 @@ def build_mcp_server(bridge: ToolBridge):
         def make_handler(name: str):
             async def handler(args: dict[str, Any]) -> dict[str, Any]:
                 result = await bridge.call(name, args)
-                return {"content": [{"type": "text", "text": result.text}], "is_error": result.is_error}
+                images = [{"type": "image", "data": i.data, "mimeType": i.media_type} for i in result.images]
+                return {"content": [{"type": "text", "text": result.text}, *images], "is_error": result.is_error}
 
             return handler
 
@@ -421,6 +467,19 @@ def session_file(cwd: str | Path, session_id: str) -> Path:
     return Path.home() / ".claude" / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", str(cwd)) / f"{session_id}.jsonl"
 
 
+# The windows Claude Code reads from the headers of every model response (unifiedWindows): a response
+# lists each of them the plan has, so one it leaves out is gone (Ultra has no 5-hour window). Windows
+# for certain models come only with requests that touch them.
+HEADER_WINDOWS = ["five_hour", "seven_day", "seven_day_overage_included", "overage"]
+# The windows of Claude Code's usage answer, each of them null where the plan has none.
+USAGE_WINDOWS = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"]
+
+
+def limit_covers(info: RateLimitInfo) -> list[str]:
+    """The windows a rate limit event speaks for in full (LimitsEvent.covers)."""
+    return list(HEADER_WINDOWS) if info.raw.get("unifiedWindows") else []
+
+
 def limit_windows(info: RateLimitInfo) -> list[LimitWindow]:
     """The plan's limit windows. Only the window that changed may be known, usually the one getting tight."""
     windows = {
@@ -438,7 +497,7 @@ def limit_windows(info: RateLimitInfo) -> list[LimitWindow]:
 def usage_windows(rate_limits: dict[str, Any] | None) -> list[LimitWindow]:
     """Limit windows from Claude Code's usage answer, which has percentages and ISO dates."""
     windows = []
-    for name in ("five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"):
+    for name in USAGE_WINDOWS:
         window = (rate_limits or {}).get(name) or {}
         if window.get("utilization") is not None:
             resets = window.get("resets_at")
@@ -592,7 +651,7 @@ class EventMapper:
         elif isinstance(message, RateLimitEvent):
             if windows := limit_windows(message.rate_limit_info):
                 self.rejected = self.rejected or any(w.status == "rejected" for w in windows)
-                events.append(LimitsEvent(windows=windows))
+                events.append(LimitsEvent(windows=windows, covers=limit_covers(message.rate_limit_info)))
         elif isinstance(message, SystemMessage):
             if message.subtype == "init" and message.data.get("session_id"):
                 events.append(SessionEvent(session_id=message.data["session_id"]))
@@ -696,9 +755,33 @@ class ClaudeCodeProvider(Provider):
     def __init__(self) -> None:
         self._plans: dict[str, tuple[float, str | None, str | None]] = {}  # sign-in -> (when, subscription, tier)
         self._logins: dict[str, ClaudeLogin] = {}  # people's own sign-ins, by account key
+        self._listed: tuple[float, list[ModelInfo], list[str]] = (float("-inf"), [], [])  # Claude Code's own list (cli_models); never read yet
+        self._listing: asyncio.Task[None] | None = None
 
     def info(self) -> ProviderInfo:
-        return ProviderInfo(name=self.name, label="Claude Agent", models=MODELS, efforts=EFFORTS)
+        _when, models, efforts = self._listed
+        return ProviderInfo(name=self.name, label="Claude Agent", models=[*MODELS, *models], efforts=merge_efforts(EFFORTS, efforts))
+
+    async def catalog(self) -> ProviderInfo:
+        """With the models of Claude Code's own list, asked again in the background once it is an hour old."""
+        if time.monotonic() - self._listed[0] > CLI_MODELS_TTL_SECONDS and not (self._listing and not self._listing.done()):
+            self._listing = asyncio.create_task(self._list())
+        return self.info()
+
+    async def _list(self) -> None:
+        try:
+            self._listed = (time.monotonic(), *await self._cli_models())
+        except Exception as exc:
+            log.info("Claude Code's list of models could not be read: %s", str(exc)[:200])
+            self._listed = (time.monotonic() - CLI_MODELS_TTL_SECONDS + 300, self._listed[1], self._listed[2])  # again in 5 minutes
+
+    async def _cli_models(self) -> tuple[list[ModelInfo], list[str]]:
+        """Claude Code's list, from a start without a sign-in in an empty home: no account is touched, no token used."""
+        with tempfile.TemporaryDirectory(prefix="plainboard-claude-models-") as home:
+            env = {"HOME": home, "CLAUDE_CONFIG_DIR": str(Path(home) / ".claude"), "ANTHROPIC_API_KEY": "", "CLAUDE_CODE_OAUTH_TOKEN": "", "ANTHROPIC_AUTH_TOKEN": ""}
+            async with ClaudeSDKClient(ClaudeAgentOptions(tools=[], setting_sources=[], cwd=home, env=env)) as client:
+                info = await client.get_server_info() or {}
+        return cli_models(info.get("models"))
 
     def auth_env(self, creds: Credentials, model: str = "", home: Path | None = None) -> dict[str, str]:
         """What tells Claude Code where the model is and how to sign in. ``model``: what the request
@@ -709,6 +792,10 @@ class ClaudeCodeProvider(Provider):
     @contextlib.asynccontextmanager
     async def _home(self, creds: Credentials) -> AsyncIterator[Path | None]:
         """The private folder of a person's own sign-in while the block runs; None for every other sign-in."""
+        if creds.claude_auth_mode == "runner_login":  # the home's own, all runner_login accounts share it
+            with SIGN_INS.in_home(HOME_SIGN_IN, DEFAULT_ACCOUNT, "This Claude sign-in"):
+                yield None
+            return
         if creds.claude_auth_mode != "own_login":
             yield None
             return
@@ -759,7 +846,7 @@ class ClaudeCodeProvider(Provider):
                 **common,
             )
         return ClaudeAgentOptions(
-            tools=READ_TOOLSET_BUILTINS if spec.toolset == "read" else BOARD_TOOLSET_BUILTINS,
+            tools=[] if spec.toolset == "none" else READ_TOOLSET_BUILTINS if spec.toolset == "read" else BOARD_TOOLSET_BUILTINS,
             system_prompt=spec.system_prompt,
             setting_sources=[],
             **common,
@@ -813,15 +900,22 @@ class ClaudeCodeProvider(Provider):
             yield paused or ResultEvent(is_error=True, error="Claude Code ended without a result", context_tokens=mapper.context_tokens)
 
     async def limits(self, credentials: Credentials) -> list[LimitWindow]:
+        return (await self.limits_report(credentials))[0]
+
+    async def limits_report(self, credentials: Credentials) -> tuple[list[LimitWindow], list[str]]:
         if credentials.claude_auth_mode == "api_key" or (credentials.claude_auth_mode == "own_login" and not credentials.login_files):
-            return []
+            return [], []
+        if credentials.claude_auth_mode == "runner_login" and signins.taken(HOME_SIGN_IN, DEFAULT_ACCOUNT):
+            return [], []
         async with self._home(credentials) as home:
             try:
                 windows = await self._usage(credentials, home)
             except Exception as exc:
                 log.info("Claude's usage could not be read, asking with a minimal turn: %s", str(exc)[:200])
                 windows = []
-            return windows or await self._limits_of_a_turn(credentials, home)
+            if windows:  # the usage answer names every window of the plan
+                return windows, list(USAGE_WINDOWS)
+            return await self._limits_of_a_turn(credentials, home)
 
     async def _usage(self, credentials: Credentials, home: Path | None = None) -> list[LimitWindow]:
         options = ClaudeAgentOptions(tools=[], setting_sources=[], cwd="/tmp", env=self.auth_env(credentials, home=home))
@@ -873,7 +967,7 @@ class ClaudeCodeProvider(Provider):
             return None, None
         return organization.get("organization_type"), organization.get("rate_limit_tier")
 
-    async def _limits_of_a_turn(self, credentials: Credentials, home: Path | None = None) -> list[LimitWindow]:
+    async def _limits_of_a_turn(self, credentials: Credentials, home: Path | None = None) -> tuple[list[LimitWindow], list[str]]:
         """The limits as a turn reports them. A subscription that is signed in with a token
         (``claude setup-token``) answers the usage request with nothing: the token is for model
         requests only. Every model request reports the limits, though, so the smallest one there
@@ -883,6 +977,7 @@ class ClaudeCodeProvider(Provider):
             model=PROBE_MODEL, tools=[], system_prompt="Reply with the single word: ok", setting_sources=[], max_turns=1, cwd="/tmp", env=self.auth_env(credentials, home=home)
         )
         windows: dict[str, LimitWindow] = {}
+        covers: set[str] = set()
 
         async def ask() -> None:
             async with ClaudeSDKClient(options) as client:
@@ -890,12 +985,13 @@ class ClaudeCodeProvider(Provider):
                 async for message in client.receive_response():
                     if isinstance(message, RateLimitEvent):
                         windows.update({w.name: w for w in limit_windows(message.rate_limit_info)})
+                        covers.update(limit_covers(message.rate_limit_info))
 
         try:
             await asyncio.wait_for(ask(), timeout=60)
         except Exception as exc:  # a subscription that is used up refuses the request, after reporting that
             log.info("Minimal turn for Claude's limits ended early: %s", str(exc)[:200])
-        return list(windows.values())
+        return list(windows.values()), sorted(covers)
 
     async def complete(self, spec: CompletionSpec) -> CompletionResult:
         async with self._home(spec.credentials) as home:
@@ -974,6 +1070,24 @@ class ClaudeCodeProvider(Provider):
         await self._end_login(key)
         SIGN_INS.forget(key)
         return ProviderAccount()
+
+    async def take_over(self, key: str) -> dict[str, str]:
+        """The home's sign-in (``claude`` in the runner's terminal): one for all runner_login accounts."""
+        return SIGN_INS.take_over(HOME_SIGN_IN, DEFAULT_ACCOUNT, shared_home(), SIGN_IN_FILES)
+
+    async def refresh_sign_in(self, credentials: Credentials) -> None:
+        """Claude Code refreshes a token when it ends, in every runner that has the same file at that moment;
+        here it is made to do so earlier, on one runner: the token is marked as ended, then the usage is read."""
+        if credentials.claude_auth_mode != "own_login" or not credentials.login_files:
+            return
+        async with self._home(credentials) as home:
+            files = signins.read(home, SIGN_IN_FILES)
+            if not home or not refresh_due(files):
+                return
+            stored = json.loads(files[SIGN_IN_FILES[0]])
+            stored["claudeAiOauth"]["expiresAt"] = 0
+            signins.write(home, {SIGN_IN_FILES[0]: json.dumps(stored)})
+            await self._usage(credentials, home)
 
     async def _end_login(self, key: str) -> None:
         if (login := self._logins.pop(key, None)) is not None:

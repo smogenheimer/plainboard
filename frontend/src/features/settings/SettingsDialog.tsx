@@ -5,12 +5,13 @@ import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../api/client";
 import { qk, useAccounts, useMe, useMeta, useSettings } from "../../api/queries";
-import type { CheckResult } from "../../api/types";
+import type { CheckResult, RetentionPreview } from "../../api/types";
 import { ApiKeyEditor } from "../../components/ApiKeyEditor";
 import { SaveRow, SavedAtOnce, SettingsLayout, type SettingsSection } from "../../components/SettingsLayout";
 import { Button, ErrorText, Field, FieldRow, IconButton, Input, PageHead, Select, Textarea, Toggle } from "../../components/ui";
 import { useStored } from "../../lib/hooks";
 import { equivalentModel } from "../../lib/models";
+import { updateHow } from "../../lib/version";
 import { DatabaseEditor } from "./DatabaseEditor";
 import { DefaultModels } from "./DefaultModels";
 import { GithubTokenField } from "./GithubTokenField";
@@ -19,9 +20,11 @@ import { AccountsEditor } from "./AccountsEditor";
 import { EndpointAccounts } from "./EndpointAccounts";
 import { McpAccessEditor } from "./McpAccessEditor";
 import { PauseEditor } from "./PauseEditor";
+import { RetentionConfirm } from "../projects/RetentionConfirm";
 import { RunnersEditor } from "./RunnersEditor";
 import { SearchEditor } from "./SearchEditor";
 import { SecretsEditor } from "./SecretsEditor";
+import { TokenUsage } from "./TokenUsage";
 import { UsageEditor } from "./UsageEditor";
 import { UsersEditor } from "./UsersEditor";
 import luchsApproved from "../../assets/luchs-approved.webp";
@@ -56,6 +59,10 @@ export function SettingsDialog({ open, onClose, section }: { open: boolean; onCl
   }, [open, section, setCurrent]);
   const [values, setValues] = useState<Values>({});
   const [githubToken, setGithubToken] = useState<string | null>(null); // null: untouched, "": clear it
+  const [retention, setRetention] = useState<RetentionPreview | null>(null);
+  const [retentionBusy, setRetentionBusy] = useState(false);
+  const [retentionError, setRetentionError] = useState<unknown>(null);
+  const [ownError, setOwnError] = useState<unknown>(null);
 
   useEffect(() => {
     if (open && settings.data) {
@@ -71,7 +78,8 @@ export function SettingsDialog({ open, onClose, section }: { open: boolean; onCl
   }, [open, onClose]);
 
   if (!open || !me) return null;
-  const others = (accounts.data ?? []).some((a) => a.owner_id != null);
+  const peoples = (accounts.data ?? []).filter((a) => a.owner_id != null).length;
+  const others = peoples > 0;
   const ownEndpoints = (accounts.data ?? []).some((a) => a.owner_id != null && meta.data?.endpoints?.some((p) => p.name === a.provider));
   const stored = settings.data?.values ?? {};
   const set = (patch: Values) => setValues((v) => ({ ...v, ...patch }));
@@ -96,6 +104,28 @@ export function SettingsDialog({ open, onClose, section }: { open: boolean; onCl
   const MODELS = ["default_provider", "default_manager_model", "default_worker_model", "default_summary_model", "default_manager_effort", "default_worker_effort", "default_summary_effort", "default_context_limit", "default_keep_recent"];
   const PACE = ["max_parallel_runs", "manager_parallel_limit"];
   const GENERAL = ["timezone", "member_chat", "update_check"];
+  const RETENTION = ["attachment_retention_days", "attachment_retention_min_mb"];
+  // The default's preview covers every project that follows it; saved only after that.
+  const saveRetention = async () => {
+    const days = Number(values.attachment_retention_days ?? 0);
+    if (days > 0) {
+      setRetention(await api.get<RetentionPreview>(`/settings/attachment-retention?days=${days}&min_mb=${Number(values.attachment_retention_min_mb ?? 0)}`));
+      return;
+    }
+    await save(RETENTION);
+  };
+  const confirmRetention = async () => {
+    setRetentionBusy(true);
+    setRetentionError(null);
+    try {
+      await save(RETENTION);
+      setRetention(null);
+    } catch (err) {
+      setRetentionError(err);
+    } finally {
+      setRetentionBusy(false);
+    }
+  };
   const CLEANUP = ["storage_notify_percent", "storage_emergency_percent", "cleanup", "cleanup_memory_free_percent", "tool_details_days"];
 
   const account: SettingsSection = { id: "account", label: t("account.title"), description: t("account.hint"), content: <AccountEditor /> };
@@ -114,6 +144,33 @@ export function SettingsDialog({ open, onClose, section }: { open: boolean; onCl
       />
     ),
   };
+  // #138: whether people other than admins add subscriptions of their own, and whether those they have are used.
+  const ownAllowed = stored.own_accounts ?? true;
+  const ownOff = !ownAllowed && (stored.own_accounts_off ?? false);
+  const setOwn = async (patch: Values) => {
+    setOwnError(null);
+    try {
+      await save([], patch);
+      await Promise.all([qc.invalidateQueries({ queryKey: qk.accounts }), qc.invalidateQueries({ queryKey: qk.limits })]);
+    } catch (err) {
+      setOwnError(err);
+    }
+  };
+  const ownSwitch = (
+    <div className="space-y-3">
+      <div className="space-y-1">
+        <Toggle checked={ownAllowed} onChange={(on) => setOwn({ own_accounts: on })} label={t("settingsPage.own.allow")} />
+        <p className="text-fg-3">{t("settingsPage.own.allowHint")}</p>
+      </div>
+      {!ownAllowed && (
+        <div className="space-y-1">
+          <Toggle checked={ownOff} onChange={(on) => setOwn({ own_accounts_off: on })} label={t("settingsPage.own.switchOff", { count: peoples })} />
+          <p className="text-fg-3">{t("settingsPage.own.switchOffHint")}</p>
+        </div>
+      )}
+      <ErrorText error={ownError} />
+    </div>
+  );
   const ownAccounts = (
     <>
       <div className="space-y-2">
@@ -130,6 +187,12 @@ export function SettingsDialog({ open, onClose, section }: { open: boolean; onCl
         <div className="space-y-2">
           <h3 className="font-semibold">{t("settings.antigravity")}</h3>
           <AccountsEditor provider="antigravity" own />
+        </div>
+      )}
+      {providers.some((p) => p.name === "gemini_cli") && (
+        <div className="space-y-2">
+          <h3 className="font-semibold">{t("settings.gemini")}</h3>
+          <AccountsEditor provider="gemini_cli" own />
         </div>
       )}
       {!!meta.data?.endpoints?.length && (!me.is_admin || ownEndpoints) && (
@@ -151,11 +214,13 @@ export function SettingsDialog({ open, onClose, section }: { open: boolean; onCl
           content: (
             <div className="space-y-6">
               <p className="text-fg-3">{t("settingsPage.own.hint")}</p>
+              {!ownAllowed && <p className="rounded-lg border border-line bg-sunk px-3 py-2 text-fg-2">{t(ownOff ? "settingsPage.own.offAll" : "settingsPage.own.off")}</p>}
               {ownAccounts}
               <SavedAtOnce />
             </div>
           ),
         },
+        { id: "tokens", label: t("tokens.title"), description: t("tokens.description"), content: <TokenUsage /> },
       ];
   const admin: SettingsSection[] = !me.is_admin || !settings.data
     ? []
@@ -186,6 +251,13 @@ export function SettingsDialog({ open, onClose, section }: { open: boolean; onCl
                   <AccountsEditor provider="antigravity" />
                 </div>
               )}
+              {providers.some((p) => p.name === "gemini_cli") && (
+                <div className="space-y-2">
+                  <h3 className="font-semibold">{t("settings.gemini")}</h3>
+                  <p className="text-fg-3">{t("settings.geminiHint")}</p>
+                  <AccountsEditor provider="gemini_cli" />
+                </div>
+              )}
               {!!meta.data?.endpoints?.length && (
                 <div className="space-y-2">
                   <h3 className="font-semibold">{t("endpoints.title")}</h3>
@@ -193,15 +265,14 @@ export function SettingsDialog({ open, onClose, section }: { open: boolean; onCl
                   <EndpointAccounts />
                 </div>
               )}
-              {others && (
-                <div className="space-y-4 border-t border-line pt-4">
-                  <div className="space-y-1">
-                    <h3 className="font-semibold">{t("settingsPage.own.peoples")}</h3>
-                    <p className="text-fg-3">{t("settingsPage.own.peoplesHint")}</p>
-                  </div>
-                  {ownAccounts}
+              <div className="space-y-4 border-t border-line pt-4">
+                <div className="space-y-1">
+                  <h3 className="font-semibold">{t("settingsPage.own.peoples")}</h3>
+                  <p className="text-fg-3">{t("settingsPage.own.peoplesHint")}</p>
                 </div>
-              )}
+                {ownSwitch}
+                {others && ownAccounts}
+              </div>
               <SavedAtOnce />
             </div>
           ),
@@ -318,8 +389,8 @@ export function SettingsDialog({ open, onClose, section }: { open: boolean; onCl
                 <Toggle checked={values.update_check ?? true} onChange={(v) => set({ update_check: v })} label={t("settings.updateCheck")} />
                 <p className="text-fg-3">
                   {t("settings.updateCheckHint")}
-                  {meta.data?.version && ` ${t("settings.versionRunning", { commit: meta.data.version.commit })}`}
-                  {meta.data?.version?.behind ? ` ${t("update.how", { count: meta.data.version.behind })}` : meta.data?.version?.behind === 0 ? ` ${t("settings.versionCurrent")}` : ""}
+                  {meta.data?.version && ` ${t("settings.versionRunning", { commit: meta.data.version.name })}`}
+                  {meta.data?.version?.behind ? ` ${updateHow(t, meta.data.version)}` : meta.data?.version?.behind === 0 ? ` ${t("settings.versionCurrent")}` : ""}
                 </p>
               </div>
               <SaveRow dirty={dirty(...GENERAL)} onSave={() => save(GENERAL)} />
@@ -340,8 +411,9 @@ export function SettingsDialog({ open, onClose, section }: { open: boolean; onCl
           label: t("usage.title"),
           description: t("usage.description"),
           content: (
-            <div className="space-y-6">
-              <UsageEditor />
+            <UsageEditor
+              cleanupSettings={
+            <div className="space-y-8">
               <section className="space-y-4">
                 <h3 className="caps rule-b pb-1.5">{t("cleanup.title")}</h3>
                 <FieldRow>
@@ -366,7 +438,42 @@ export function SettingsDialog({ open, onClose, section }: { open: boolean; onCl
                 </FieldRow>
                 <SaveRow dirty={dirty(...CLEANUP)} onSave={() => save(CLEANUP)} />
               </section>
+              <section className="space-y-3">
+                <h3 className="caps rule-b pb-1.5">{t("cleanup.retention")}</h3>
+                <Toggle
+                  checked={Number(values.attachment_retention_days ?? 0) > 0}
+                  onChange={(v) => set({ attachment_retention_days: v ? Number(stored.attachment_retention_days) || 90 : 0 })}
+                  label={<span className="font-semibold">{t("projects.retentionDefault")}</span>}
+                />
+                <p className="text-fg-3">{t("projects.retentionDefaultHint")}</p>
+                {Number(values.attachment_retention_days ?? 0) > 0 && (
+                  <FieldRow>
+                    <Field label={t("projects.retentionDays")}>
+                      <Input
+                        type="number"
+                        min={1}
+                        max={3650}
+                        value={values.attachment_retention_days}
+                        onChange={(e) => set({ attachment_retention_days: Math.max(1, Math.min(3650, Math.round(Number(e.target.value) || 0))) })}
+                      />
+                    </Field>
+                    <Field label={t("projects.retentionMinMb")}>
+                      <Input
+                        type="number"
+                        min={0}
+                        max={100000}
+                        value={values.attachment_retention_min_mb ?? 0}
+                        onChange={(e) => set({ attachment_retention_min_mb: Math.max(0, Math.min(100000, Math.round(Number(e.target.value) || 0))) })}
+                      />
+                    </Field>
+                  </FieldRow>
+                )}
+                <SaveRow dirty={dirty(...RETENTION)} onSave={saveRetention} />
+                <RetentionConfirm preview={retention} busy={retentionBusy} error={retentionError} onCancel={() => setRetention(null)} onConfirm={confirmRetention} />
+              </section>
             </div>
+              }
+            />
           ),
         },
         {

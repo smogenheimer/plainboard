@@ -148,6 +148,7 @@ class RepositoryCreate(BaseModel):
     check_command: str = Field(default="", max_length=2000)  # decides whether finished branches may land
     quick_check_command: str = Field(default="", max_length=2000)  # run on a branch when it is handed over
     land_first: bool = False  # merge finished branches at once, check the base branch afterwards
+    release_branch: str = Field(default="", max_length=200, pattern=r"^[^\s~^:?*\[\\]*$")  # promoted to on request (#129); empty: none
     tidy_branches: bool = True  # remove branches whose content is all on the base branch (orchestration/tidy.py)
     check_target_seconds: int = Field(default=0, ge=0, le=7 * 86400)  # how long a check run should take; 0: no target
     agent_ids: list[int] | None = None  # explicit access for agents restricted to selected repos
@@ -165,6 +166,7 @@ class RepositoryUpdate(BaseModel):
     check_command: str | None = Field(default=None, max_length=2000)
     quick_check_command: str | None = Field(default=None, max_length=2000)
     land_first: bool | None = None
+    release_branch: str | None = Field(default=None, max_length=200, pattern=r"^[^\s~^:?*\[\\]*$")  # "": no promotion step
     tidy_branches: bool | None = None
     check_target_seconds: int | None = Field(default=None, ge=0, le=7 * 86400)  # 0: no target
     checks_baseline_seconds: int | None = Field(default=None, ge=0, le=7 * 86400)  # the verdict of a speed-up: what a check run takes now
@@ -374,6 +376,32 @@ class SearchStatusOut(BaseModel):
     models: list[SearchModelOption] = Field(default_factory=list)
 
 
+class SearchHitOut(BaseModel):
+    kind: str  # ticket, report, decision, comment, note, commit, idea, doc, file
+    ref: str
+    title: str
+    snippet: str  # the part of its text around the words searched for
+    at: UTCDateTime
+    changed_at: UTCDateTime
+    ticket_number: int | None = None
+    task_id: int | None = None  # the ticket it belongs to, to open it
+    note_id: int | None = None
+    idea_id: int | None = None
+    doc_page_id: int | None = None  # a doc page (#118): open it in its site
+    attachment_id: int | None = None  # a file (#157): its ticket (task_id) or idea opens it
+    filename: str | None = None
+    repo: str | None = None
+    sha: str | None = None  # a commit's whole hash
+    url: str | None = None  # a commit's page, where its repository has one
+
+
+class ProjectSearchOut(BaseModel):
+    # ok: by meaning and words; preparing: the model is not ready, by words only; off: the project's or the
+    # installation's switch is off; unavailable: no PostgreSQL with pgvector here
+    state: Literal["ok", "preparing", "off", "unavailable"]
+    hits: list[SearchHitOut] = Field(default_factory=list)
+
+
 class SearchModelIn(BaseModel):
     model: str = Field(min_length=1, max_length=100)
 
@@ -433,6 +461,31 @@ class AccountOut(ORM):
     share: str = "private"
     shared_with: list[int] | None = None  # to its managers only
     can_manage: bool = False  # the viewer may change, test, share and delete it
+    home_login: bool = False  # the installation's sign-in is still in the built-in runner's home (accounts.take_over)
+    project_ids: list[int] | None = None  # the projects its owner gave it to (#93); to its managers only
+
+
+class ProjectAccountOut(BaseModel):
+    """A person's own subscription in a project's list of what members gave it (#93). Never a secret."""
+
+    id: int
+    provider: str
+    label: str
+    enabled: bool
+    owner_id: int | None
+    owner_name: str = ""
+    mine: bool = False  # the viewer's own: they give it or take it back
+    given: bool = False  # its owner gave it to this project
+    blocked: bool = False  # the project's owner switched it off for the project
+    used: bool = False  # the project's runs may use it now (also one shared with its owner)
+
+
+class ProjectAccountGiveIn(BaseModel):
+    given: bool
+
+
+class ProjectAccountBlockIn(BaseModel):
+    blocked: bool
 
 
 class RepositoryOut(ORM):
@@ -445,6 +498,7 @@ class RepositoryOut(ORM):
     check_command: str = ""
     quick_check_command: str = ""
     land_first: bool = False
+    release_branch: str = ""
     tidy_branches: bool = True
     check_target_seconds: int = 0
     checks_baseline_seconds: int | None = None
@@ -488,13 +542,19 @@ class ProjectUpdate(BaseModel):
     continue_with_backlog: bool | None = None
     fast_checks: bool | None = None
     semantic_search: bool | None = None
+    limit_pause: bool | None = None
     parallel_agents: int | None = Field(default=None, ge=0, le=20)  # null: the number from the settings again
     account_id: int | None = None  # null: the subscription with the most room again
     auto_archive_days: int | None = Field(default=None, ge=0, le=3650)
     review_days: int | None = Field(default=None, ge=0, le=365)
+    attachment_retention_days: int | None = Field(default=None, ge=0, le=3650)  # files of done tickets; 0: never deleted; null: the PlainBoard default
+    attachment_retention_min_mb: int | None = Field(default=None, ge=0, le=100000)  # only files from this size; 0: all; null: the default
     ask_provider: str | None = Field(default=None, max_length=50)  # questions: "" the default again
     ask_model: str | None = Field(default=None, max_length=100)
     ask_effort: str | None = Field(default=None, max_length=20)
+    idea_provider: str | None = Field(default=None, max_length=50)  # sorting ideas: "" the same as questions again
+    idea_model: str | None = Field(default=None, max_length=100)
+    idea_effort: str | None = Field(default=None, max_length=20)
 
 
 class ProjectAccountsIn(BaseModel):
@@ -510,6 +570,9 @@ class ProjectOut(ORM):
     customer_languages: list[str] = Field(default_factory=lambda: ["en"])  # the first is the default
     paused_at: UTCDateTime | None = None  # paused for good by a person, since then
     paused_by: str = ""
+    limit_paused_at: UTCDateTime | None = None  # paused by PlainBoard: its subscriptions are nearly used up
+    limit_resumes_at: UTCDateTime | None = None  # expected to go on then; None: unknown
+    limit_pause: bool = True  # off: it never pauses before its limits
     workspace_path: str | None
     has_github_token: bool = False
     auto_wake_manager: bool
@@ -523,9 +586,14 @@ class ProjectOut(ORM):
     role: ProjectRole | None = None  # the asking user's role; not part of events, which go to everyone
     auto_archive_days: int
     review_days: int = 3
+    attachment_retention_days: int | None = None  # None: follows the PlainBoard default (settings)
+    attachment_retention_min_mb: int | None = None
     ask_provider: str = ""
     ask_model: str = ""
     ask_effort: str = ""
+    idea_provider: str = ""
+    idea_model: str = ""
+    idea_effort: str = ""
     label_colors: dict[str, str] = Field(default_factory=dict)
     created_at: UTCDateTime
 
@@ -605,6 +673,7 @@ class AgentOut(ORM):
     slug: str
     role: str
     is_manager: bool
+    doc_site_id: int | None = None  # the doc agent of this doc site: hidden from team and board, set up in the site's settings
     description: str
     instructions: str
     provider: str
@@ -710,7 +779,7 @@ class TaskOut(ORM):
     manager_active: bool = False
     open_decisions: int = 0
     # Work is finished and only waits to land (no open assignment): its branch waits for a train, is checked, or is repaired.
-    landing: Literal["waiting", "checking", "repairing"] | None = None
+    landing: Literal["waiting", "checking", "repairing", "held"] | None = None
 
 
 class StatsDay(BaseModel):
@@ -777,6 +846,26 @@ class StatsOut(BaseModel):
     current: StatsPeriod = Field(default_factory=StatsPeriod)
     previous: StatsPeriod = Field(default_factory=StatsPeriod)  # the same number of days right before
     versions: list[StatsVersion] = Field(default_factory=list)  # PlainBoard's own updates in the period
+
+
+class TokenProject(BaseModel):
+    id: int
+    name: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    cache_read_tokens: int = 0
+    cache_creation_tokens: int = 0
+    cost_usd: float = 0.0
+    runs: int = 0
+    tokens: list[int] = Field(default_factory=list)  # input + output per day, as TokenUsageOut.days
+    costs: list[float] = Field(default_factory=list)  # per day
+
+
+class TokenUsageOut(BaseModel):
+    """Tokens and cost of the projects the user sees, per day (UTC) and in total, most expensive first."""
+
+    days: list[str]
+    projects: list[TokenProject]
 
 
 class PublicTask(BaseModel):
@@ -852,11 +941,29 @@ class CommentOut(ORM):
 class AttachmentOut(ORM):
     id: int
     task_id: int | None
+    idea_id: int | None = None
+    doc_site_id: int | None = None
     filename: str
     content_type: str
     size: int
     uploaded_by_agent_id: int | None
     created_at: UTCDateTime
+    purged_at: UTCDateTime | None = None  # its file was deleted by the project's retention; the entry stays
+    purged_after_days: int | None = None
+
+
+class RetentionCount(BaseModel):
+    count: int
+    bytes: int
+
+
+class RetentionPreviewOut(BaseModel):
+    """What a retention setting would delete: at once, and within the next ``soon_days``."""
+
+    now: RetentionCount
+    soon: RetentionCount
+    soon_days: int
+    projects: int | None = None  # the PlainBoard default: how many projects follow it
 
 
 class AssignmentOut(ORM):
@@ -1328,6 +1435,7 @@ class FlowRepo(BaseModel):
     typical_check_seconds: int | None  # the median of the last check runs that landed; None until there is one
     check_target_seconds: int
     red: bool  # the base branch fails its checks
+    release: str = ""  # the release branch it is promoted to on request (#129); empty: none
 
 
 class FlowJob(BaseModel):
@@ -1366,6 +1474,8 @@ class FlowBranch(BaseModel):
     since: UTCDateTime  # when it entered this state
     merged_at: UTCDateTime | None
     conflict_files: list[str] = Field(default_factory=list)
+    held: Literal["message", "manager"] | None = None  # it does not land until its author hands it over again / the manager releases it
+    held_reason: str = ""
 
 
 class FlowTrain(BaseModel):
@@ -1383,12 +1493,66 @@ class FlowTrain(BaseModel):
     branches: list[str] = Field(default_factory=list)
 
 
+class PromotionTicket(BaseModel):
+    task_id: int | None
+    task_number: int | None
+    title: str  # the ticket's, else the branch's
+    branch: str
+
+
+class PromotionCommit(BaseModel):
+    sha: str
+    author: str
+    date: str
+    message: str  # its subject line
+
+
+class PromotionOut(BaseModel):
+    id: int
+    repository_id: int
+    base: str
+    release: str
+    sha: str
+    tag: str
+    status: Literal["checking", "promoted", "pull_request", "failed"]
+    how: str
+    url: str
+    detail: str
+    commits: int
+    tickets: int
+    by: str
+    started_at: UTCDateTime
+    finished_at: UTCDateTime | None
+
+
+class PromotionPreview(BaseModel):
+    """What a promotion of the base branch to the release branch would bring now (#129)."""
+
+    repository_id: int
+    base: str
+    release: str
+    sha: str
+    release_sha: str | None
+    fast_forward: bool  # else a merge commit (the release branch has commits of its own)
+    total: int  # commits the release branch lacks
+    commits: list[PromotionCommit]
+    tickets: list[PromotionTicket]  # branches that landed on the base branch since the last promotion
+    checked: bool  # this exact commit passed its checks already: no check run needed
+    running: PromotionOut | None = None  # a promotion that is on its way
+
+
+class PromoteIn(BaseModel):
+    tag: str = Field(default="", max_length=100, pattern=r"^[^\s~^:?*\[\\]*$")
+    sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{7,64}$")  # the commit the preview showed; None: the head now
+
+
 class FlowLive(BaseModel):
     now: UTCDateTime
     repositories: list[FlowRepo]
     work: list[FlowWork]
     branches: list[FlowBranch]  # on their way (waiting, checking, repairing, stuck) and the last ones that landed
     trains: list[FlowTrain]  # being checked now (or blocked)
+    promotions: list[PromotionOut] = Field(default_factory=list)  # per repository: the running one and the last one
 
 
 class FlowRepair(BaseModel):
@@ -1413,7 +1577,7 @@ class FlowHistory(BaseModel):
 
 
 class FlowStep(BaseModel):
-    key: Literal["handed", "failed", "repair", "checking", "landed", "stuck"]
+    key: Literal["handed", "failed", "repair", "checking", "landed", "stuck", "released"]
     state: Literal["done", "now", "todo"]
     at: UTCDateTime | None = None
     detail: str = ""
@@ -1424,3 +1588,554 @@ class FlowTicketBranch(BaseModel):
     repository: str
     train: FlowTrain | None
     steps: list[FlowStep]
+
+
+# --- ideas (services/ideas.py, orchestration/ideas.py) -----------------------------------------
+
+IDEA_TEXT_MAX = 10000
+
+
+class IdeaCreate(BaseModel):
+    text: str = Field(min_length=1, max_length=IDEA_TEXT_MAX)
+    title: str = Field(default="", max_length=200)
+    topic_id: int | None = None  # placed by a person: the model leaves its topic alone
+    x: float | None = None
+    y: float | None = None
+
+
+class IdeaInput(BaseModel):
+    """What a person typed into the field of the board of ideas: the model reads what they mean."""
+
+    text: str = Field(min_length=1, max_length=IDEA_TEXT_MAX)
+
+
+class IdeaUpdate(BaseModel):
+    text: str | None = Field(default=None, min_length=1, max_length=IDEA_TEXT_MAX)
+    title: str | None = Field(default=None, max_length=200)
+    topic_id: int | None = None  # sent as null: out of its topic (unsorted)
+    x: float | None = None
+    y: float | None = None
+    votes: int | None = Field(default=None, ge=0, le=1000000)
+
+
+class IdeaOption(BaseModel):
+    label: str
+    description: str = ""
+    resolve: str = ""  # an option of a conflict question, done without the model: keep:<kept>:<left out> | both:<a>:<b>
+
+
+class IdeaOut(ORM):
+    id: int
+    project_id: int
+    title: str
+    text: str
+    author: str
+    status: str  # open | taken | dismissed | merged
+    topic_id: int | None
+    topic_manual: bool
+    task_id: int | None
+    task_number: int | None = None
+    merged_into_id: int | None
+    hint: str
+    sort_state: str  # pending | sorted | failed
+    x: float | None
+    y: float | None
+    votes: int
+    similar: list[int] = Field(default_factory=list)  # open ideas kept apart from it on purpose (not merged although close)
+    duplicate_of: int | None = None  # to be merged into this one
+    conflicts: list[int] = Field(default_factory=list)  # open ideas it contradicts, until the person decides
+    question: str  # the model's question to the person; "" none
+    question_options: list[IdeaOption]  # the first is recommended; a free answer is possible too
+    question_status: str  # "" | open | answered | withdrawn
+    question_answer: str
+    question_at: UTCDateTime | None
+    closed_at: UTCDateTime | None
+    closed_reason: str
+    attachments: list[AttachmentOut] = Field(default_factory=list)
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
+
+
+class IdeaVersionOut(ORM):
+    id: int
+    idea_id: int
+    title: str
+    text: str
+    source: str  # who replaced it: user | ai | undo
+    created_at: UTCDateTime
+
+
+class IdeaAnswer(BaseModel):
+    option_index: int | None = Field(default=None, ge=0)
+    text: str = Field(default="", max_length=IDEA_TEXT_MAX)
+
+
+class IdeaTopicIn(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=100)
+    color: int | None = Field(default=None, ge=0, le=9)
+    x: float | None = None
+    y: float | None = None
+
+
+class IdeaTopicOut(ORM):
+    id: int
+    project_id: int
+    name: str
+    color: int
+    hint: str
+    manual: bool
+    x: float | None
+    y: float | None
+
+
+class IdeaChangeOut(ORM):
+    """One step on the board of ideas, to show ("added to 'Booking'") and undo (POST .../changes/{id}/undo)."""
+
+    id: int
+    project_id: int
+    kind: str  # new | several | amend | merge | split | resolve | question | edit | reorder
+    source: str  # input | answer | user | auto | button
+    author: str
+    summary: dict[str, Any]
+    created_at: UTCDateTime
+    undone_at: UTCDateTime | None
+    ideas: list[IdeaOut] = Field(default_factory=list)  # the ideas it touched, as they are now (with an answer only)
+
+
+class IdeasOut(BaseModel):
+    topics: list[IdeaTopicOut]
+    ideas: list[IdeaOut]
+    sorting: bool = False  # the model is sorting ideas right now
+
+
+class IdeaTicketIn(BaseModel):
+    """One idea straight into a ticket; what is not sent comes from the idea."""
+
+    status: Literal["backlog", "todo"] = "backlog"
+    title: str | None = Field(default=None, min_length=1, max_length=300)
+    description: str | None = None
+    priority: Priority = "medium"
+    labels: list[str] = Field(default_factory=list)
+
+
+class IdeaTicketOut(BaseModel):
+    ticket: TaskOut
+    idea: IdeaOut
+
+
+# --- doc sites (#118, services/docs.py) -----------------------------------------------------------------
+
+DocSlug = Annotated[str, Field(max_length=80, pattern=r"^[a-z0-9]+(-[a-z0-9]+)*$")]
+
+
+Color = Annotated[str, Field(max_length=9, pattern=r"^(#[0-9a-fA-F]{3}|#[0-9a-fA-F]{6}|#[0-9a-fA-F]{8})?$")]
+
+
+class DocThemeColors(BaseModel):
+    """One mode (light or dark) of a site's theme; "" keeps the site's own colour."""
+
+    accent: Color = ""  # links, the marked page, the logo mark
+    page: Color = ""  # the background
+    surface: Color = ""  # cards, code, menus
+    text: Color = ""  # (lighter shades for secondary text and lines follow from it)
+
+
+class DocThemeLink(BaseModel):
+    label: str = Field(min_length=1, max_length=40)
+    url: str = Field(min_length=1, max_length=500)  # http(s), mailto: or an address on this host (/...)
+
+
+class DocTheme(BaseModel):
+    """A doc site's own look (#121, services/docs_theme.py). Every field at its default: the site as every site looks."""
+
+    logo_light: int | None = None  # a file of the site (an image)
+    logo_dark: int | None = None  # in dark mode; none: logo_light
+    favicon: int | None = None
+    show_name: bool = True  # the site's name beside the logo
+    light: DocThemeColors = Field(default_factory=DocThemeColors)
+    dark: DocThemeColors = Field(default_factory=DocThemeColors)
+    font_family: str = Field(default="", max_length=200)  # a CSS font-family list; "": the site's own (Inter)
+    font_url: str = Field(default="", max_length=500)  # https: a web font's stylesheet (e.g. Google Fonts)
+    radius: int | None = Field(default=None, ge=0, le=28)  # px of a card's corner, the rest in proportion; None: 14
+    links: list[DocThemeLink] = Field(default_factory=list, max_length=6)  # in the header (back to the website)
+    css: str = Field(default="", max_length=20000)  # applied on the public site only, after everything else
+
+
+class DocThemePreviewOut(BaseModel):
+    css: str
+
+
+DocPageSlug = Annotated[str, Field(min_length=1, max_length=120, pattern=r"^[a-z0-9]+(-[a-z0-9]+)*$")]
+
+
+class DocCustomText(BaseModel):
+    title: str = Field(default="", max_length=200)
+    body: str = Field(default="", max_length=200000)
+
+
+class DocCustomPageCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    slug: DocPageSlug | None = None  # None: from the title
+    body: str = Field(default="", max_length=200000)
+    texts: dict[str, DocCustomText] = Field(default_factory=dict)  # the site's further languages
+
+
+class DocCustomPageUpdate(BaseModel):
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    slug: DocPageSlug | None = None
+    body: str | None = Field(default=None, max_length=200000)
+    texts: dict[str, DocCustomText] | None = None  # replaces all of them
+    position: int | None = Field(default=None, ge=0)
+
+
+class DocCustomPageOut(BaseModel):
+    id: int
+    site_id: int
+    position: int
+    title: str
+    slug: str
+    body: str
+    texts: dict[str, DocCustomText]
+    path: str  # under the site: p/<slug>
+    edited_by: str
+    updated_at: UTCDateTime
+
+
+class DocSiteCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)
+    slug: DocSlug | None = None  # None: from the name
+    description: str = Field(default="", max_length=300)
+    spec: str = Field(default="", max_length=20000)
+    published: bool = False
+    public: bool = False  # published and public: everyone; published and private: people with a role in the project
+    language: str = Field(default="en", max_length=20)
+    languages: list[str] = Field(default_factory=list, max_length=30)
+    agent_provider: str | None = Field(default=None, max_length=50)  # its doc agent; None: the installation's defaults
+    agent_model: str | None = Field(default=None, max_length=100)
+    agent_effort: str | None = Field(default=None, max_length=20)
+    versioned: bool = False  # versions (#126); off: always the current state
+
+
+Translator = Literal["", "llm", "deepl", "google"]
+
+
+class DocSiteUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=200)
+    slug: DocSlug | None = None
+    description: str | None = Field(default=None, max_length=300)
+    spec: str | None = Field(default=None, max_length=20000)
+    versioned: bool | None = None  # versions (#126): off again, they stay but are not served
+    restructure_check: bool | None = None  # its doc agent proposes larger restructurings now and then (#156)
+    published: bool | None = None
+    public: bool | None = None
+    languages: list[str] | None = Field(default=None, max_length=30)  # further languages, translated
+    translator: Translator | None = None
+    translate_provider: str | None = Field(default=None, max_length=50)  # llm: "" = the project's default provider
+    translate_model: str | None = Field(default=None, max_length=100)  # llm: "" = the provider's small model
+    agent_provider: str | None = Field(default=None, max_length=50)  # its doc agent
+    agent_model: str | None = Field(default=None, max_length=100)
+    agent_effort: str | None = Field(default=None, max_length=20)  # "": the installation's default
+    # Its assistant for visitors (#119): provider "" = Claude (the only one so far), model "" = its small one.
+    assistant_enabled: bool | None = None
+    assistant_provider: str | None = Field(default=None, max_length=50)
+    assistant_model: str | None = Field(default=None, max_length=100)
+    assistant_effort: str | None = Field(default=None, max_length=20)
+    assistant_code: bool | None = None  # may read the code and the board's public texts: see assistant_warning
+    assistant_daily_messages: int | None = Field(default=None, ge=1, le=100000)
+    assistant_daily_cost: float | None = Field(default=None, ge=0, le=100000)  # USD per day; 0: no cap
+    assistant_max_tokens: int | None = Field(default=None, ge=128, le=8192)
+    theme: DocTheme | None = None  # its look (#121); DocTheme() as it is: none
+
+
+class DocKeysIn(BaseModel):
+    """Write-only; "" removes a key, None keeps it."""
+
+    deepl: str | None = Field(default=None, max_length=200)
+    google: str | None = Field(default=None, max_length=200)
+
+
+class DocTranslationItem(BaseModel):
+    lang: str
+    title: str
+    state: Literal["current", "outdated", "missing", "failed"]
+    translated_by: str = ""
+    translated_at: UTCDateTime | None = None
+    error: str = ""
+
+
+class DocTranslationOut(DocTranslationItem):
+    body: str
+
+
+class DocTranslationIn(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    body: str = Field(max_length=200000)
+
+
+class DocDomainIn(BaseModel):
+    domain: str = Field(max_length=253)  # "" removes it
+
+
+class DocDomainOut(BaseModel):
+    """What the user sets up for the site's own domain (the UI words it): a CNAME, or a public hostname of a
+    Cloudflare tunnel, from ``domain`` to ``target``; PlainBoard then reads ``verify_url`` and expects ``token``."""
+
+    domain: str
+    target: str  # the host this PlainBoard is reached at (where the request came to)
+    verify_url: str
+    token: str
+    verified_at: UTCDateTime | None = None
+    cloudflare_token_set: bool = False
+
+
+class DocAgentOut(BaseModel):
+    """The hidden agent of a doc site (#118): configured in the site's settings."""
+
+    id: int
+    slug: str
+    name: str
+    provider: str
+    model: str
+    effort: str | None = None
+    enabled: bool = True
+
+
+class DocReleaseOut(BaseModel):
+    """A version of a doc site (#126, services/docs_releases.py)."""
+
+    id: int
+    site_id: int
+    name: str  # e.g. 1.0; the working one "next" until renamed
+    slug: str  # its address: /docs/<site>/<slug>/
+    working: bool  # the version written now (one per site)
+    seq: int  # the order of cutting (the working one: the next cut's)
+    notes: str = ""
+    released_on: UTCDateTime | None = None
+    deprecated: bool = False
+    hidden: bool = False  # not served (the working one: not public)
+    is_default: bool = False  # chosen as the visitors' default
+    default: bool = False  # what visitors get at /docs/<site>/ now (chosen, else the latest released one)
+    url: str
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
+
+
+class DocReleaseCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=80)
+    slug: str | None = Field(default=None, max_length=40, pattern=r"^[a-z0-9][a-z0-9._-]*$")  # default: from the name
+    notes: str = Field(default="", max_length=20000)
+    released_on: datetime | None = None  # default: now
+
+
+class DocReleaseUpdate(BaseModel):
+    name: str | None = Field(default=None, min_length=1, max_length=80)
+    slug: str | None = Field(default=None, max_length=40, pattern=r"^[a-z0-9][a-z0-9._-]*$")
+    notes: str | None = Field(default=None, max_length=20000)
+    released_on: datetime | None = None
+    deprecated: bool | None = None
+    hidden: bool | None = None
+    default: bool | None = None  # true: the visitors' default; false: back to the latest released one
+
+
+class DocSiteOut(ORM):
+    id: int
+    project_id: int
+    name: str
+    slug: str
+    description: str
+    spec: str
+    published: bool
+    public: bool = False
+    language: str = "en"
+    languages: list[str] = []
+    translator: str = ""
+    translate_provider: str = ""
+    translate_model: str = ""
+    deepl_key_set: bool = False
+    google_key_set: bool = False
+    domain: str | None = None
+    domain_verified_at: UTCDateTime | None = None
+    cloudflare_token_set: bool = False
+    assistant_enabled: bool = False
+    assistant_provider: str = ""
+    assistant_model: str = ""
+    assistant_effort: str = ""
+    assistant_code: bool = False
+    assistant_daily_messages: int = 300
+    assistant_daily_cost: float = 0.0
+    assistant_max_tokens: int = 1024
+    assistant_warning: str = ""  # what reading the code and the board risks: shown beside assistant_code
+    theme: DocTheme = Field(default_factory=DocTheme)
+    agent: DocAgentOut | None = None  # its doc agent, the only agent that writes it
+    versioned: bool = False  # uses versions (#126): off, it always shows the current state and visitors see no versions
+    restructure_check: bool = True  # its doc agent proposes larger restructurings now and then (#156)
+    releases: list[DocReleaseOut] = []  # its versions (#126): the working one first, then the released ones, newest first
+    url: str  # its address under this PlainBoard: /docs/<slug>/
+    pages: int = 0
+    stale_pages: int = 0  # flagged as possibly outdated
+    created_at: UTCDateTime
+    updated_at: UTCDateTime
+
+
+class DocPageItem(ORM):
+    """A page in the site's tree (without its text)."""
+
+    id: int  # the page in every version of its site (#126)
+    site_id: int
+    release_id: int | None = None  # the version it was read or changed in; None: the working version
+    parent_id: int | None
+    position: int
+    title: str
+    slug: str
+    path: str  # under the site: parent-slug/slug (the home page is the first page at the top, also at "")
+    depth: int = 0
+    children: int = 0  # pages directly below it
+    paths: list[str]
+    edited_by: str
+    edited_at: UTCDateTime
+    drift: int
+    flagged_at: UTCDateTime | None = None
+    flag_reason: str = ""
+    updated_at: UTCDateTime
+    area_id: int | None = None  # its area and group in the navigation (#159): pages at the top only
+    group_id: int | None = None
+
+
+class DocCrumb(BaseModel):
+    id: int
+    title: str
+    path: str
+
+
+class DocPageOut(DocPageItem):
+    body: str
+    versions: int = 0
+    ancestors: list[DocCrumb] = []  # from the top down: what to open in the tree
+    translations: list[DocTranslationItem] = []
+
+
+class DocPagesOut(BaseModel):
+    items: list[DocPageItem]
+    total: int  # children of that parent
+    offset: int
+
+
+class DocPageCreate(BaseModel):
+    title: str = Field(min_length=1, max_length=200)
+    body: str = Field(default="", max_length=200000)
+    parent_id: int | None = None
+    position: int | None = Field(default=None, ge=0)  # None: last
+    slug: DocSlug | None = None
+    paths: list[Annotated[str, Field(min_length=1, max_length=300)]] = Field(default_factory=list, max_length=50)
+    reason: str = Field(default="", max_length=300)
+    area_id: int | None = None  # its area and group in the navigation (#159): pages at the top only
+    group_id: int | None = None
+
+
+class DocPageUpdate(BaseModel):
+    """Only what is given changes. ``parent_id`` with ``move``: another place in the tree (None: the top)."""
+
+    title: str | None = Field(default=None, min_length=1, max_length=200)
+    body: str | None = Field(default=None, max_length=200000)
+    move: bool = False
+    parent_id: int | None = None
+    position: int | None = Field(default=None, ge=0)
+    slug: DocSlug | None = None
+    paths: list[Annotated[str, Field(min_length=1, max_length=300)]] | None = Field(default=None, max_length=50)
+    reason: str = Field(default="", max_length=300)
+    area_id: int | None = None  # given: its area and group change (None: none); pages at the top only
+    group_id: int | None = None
+
+
+class DocAreaIn(BaseModel):
+    """An area of a doc site's navigation (#159). Changing it: only what is given changes."""
+
+    title: str | None = Field(default=None, min_length=1, max_length=100)
+    description: str | None = Field(default=None, max_length=200)
+    icon: str | None = Field(default=None, max_length=40)
+    texts: dict[str, dict[str, str]] | None = None  # lang -> {title, description}
+    position: int | None = Field(default=None, ge=0)
+
+
+class DocGroupIn(BaseModel):
+    """A group of a doc site's navigation (#159). Changing it: only what is given changes (area_id None: no area)."""
+
+    title: str | None = Field(default=None, min_length=1, max_length=100)
+    area_id: int | None = None
+    texts: dict[str, dict[str, str]] | None = None  # lang -> {title}
+    position: int | None = Field(default=None, ge=0)
+
+
+class DocAreaOut(BaseModel):
+    id: int  # its key: the same in every version
+    title: str
+    description: str
+    icon: str
+    position: int
+    texts: dict[str, dict[str, str]] = {}
+
+
+class DocGroupOut(BaseModel):
+    id: int
+    area_id: int | None
+    title: str
+    position: int
+    texts: dict[str, dict[str, str]] = {}
+
+
+class DocOutlineOut(BaseModel):
+    areas: list[DocAreaOut]
+    groups: list[DocGroupOut]
+
+
+class DocVersionOut(ORM):
+    id: int
+    page_id: int
+    title: str
+    body: str | None = None  # in the list: None
+    author: str
+    agent_id: int | None
+    reason: str
+    created_at: UTCDateTime
+
+
+class DocCloudflareIn(BaseModel):
+    token: str | None = Field(default=None, max_length=200)  # stored encrypted for this site; None: the one stored
+    target: str | None = Field(default=None, max_length=253)  # None: the host this request came to
+    proxied: bool = True
+
+
+class DocDnsOut(BaseModel):
+    zone: str
+    record: str
+    target: str
+    created: bool  # False: an existing record was changed
+
+
+class DocVerifyOut(BaseModel):
+    verified: bool
+    detail: str = ""
+    verified_at: UTCDateTime | None = None
+
+
+class DocApiKeyCreate(BaseModel):
+    name: str = Field(min_length=1, max_length=200)  # where it is used
+    expires_at: datetime | None = None  # none: until revoked
+
+
+class DocApiKeyOut(BaseModel):
+    """A doc site's read-only API key (#131): never the key itself, only its last characters."""
+
+    model_config = ConfigDict(from_attributes=True)
+    id: int
+    site_id: int
+    name: str
+    hint: str
+    created_by: str
+    created_at: UTCDateTime
+    expires_at: UTCDateTime | None = None
+    last_used_at: UTCDateTime | None = None
+
+
+class DocApiKeyCreated(DocApiKeyOut):
+    key: str  # shown this once

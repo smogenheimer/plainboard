@@ -29,10 +29,18 @@ function usePauseSwitch(project: Project) {
 
 const since = (iso: string) => new Date(iso).toLocaleString([], { dateStyle: "medium", timeStyle: "short" });
 
+/** PlainBoard's own pause before the subscriptions run out, with when it goes on. Empty: not paused so. */
+function useLimitPause(project: Project): string {
+  const { t } = useTranslation();
+  if (!project.limit_paused_at) return "";
+  return project.limit_resumes_at ? t("projects.limitPaused", { when: since(project.limit_resumes_at) }) : t("projects.limitPausedUnknown");
+}
+
 /** The switch in the project's settings, with what it means. */
 export function ProjectPauseSwitch({ project }: { project: Project }) {
   const { t } = useTranslation();
   const turn = usePauseSwitch(project);
+  const limited = useLimitPause(project);
   return (
     <div className="space-y-1">
       <Toggle checked={!!project.paused_at} onChange={(on) => turn.mutate(on)} label={t("projects.pause")} />
@@ -40,6 +48,7 @@ export function ProjectPauseSwitch({ project }: { project: Project }) {
         {project.paused_at && `${t("projects.pausedSince", { by: project.paused_by || t("pause.someone"), when: since(project.paused_at) })} `}
         {t("projects.pauseHint")}
       </p>
+      {limited && <p className="text-fg-2">{limited}</p>}
       <ErrorText error={turn.error} />
     </div>
   );
@@ -49,6 +58,15 @@ export function ProjectPauseSwitch({ project }: { project: Project }) {
 export function ProjectPauseBanner({ project, isOwner }: { project: Project; isOwner: boolean }) {
   const { t } = useTranslation();
   const turn = usePauseSwitch(project);
+  const limited = useLimitPause(project);
+  if (!project.paused_at && limited) {
+    return (
+      <div role="status" className="flex shrink-0 items-center gap-3 border-b border-line bg-you-bg px-4 py-1.5 text-you-fg">
+        <PauseCircle className="size-4 shrink-0" />
+        <span className="min-w-0 flex-1">{limited}</span>
+      </div>
+    );
+  }
   if (!project.paused_at) return null;
   return (
     <div role="status" className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-line bg-you-bg px-4 py-1.5 text-you-fg">

@@ -4,7 +4,7 @@ from __future__ import annotations
 
 import json
 
-from fastapi import APIRouter, File, Form, UploadFile
+from fastapi import APIRouter, File, Form, Query, UploadFile
 
 from ..schemas import (
     McpServerCreate,
@@ -13,6 +13,7 @@ from ..schemas import (
     NoteCreate,
     NoteOut,
     NoteUpdate,
+    ProjectSearchOut,
     ScheduleCreate,
     ScheduleOut,
     ScheduleUpdate,
@@ -25,11 +26,27 @@ from ..services import notes as note_service
 from ..services import ownership
 from ..services import projects as project_service
 from ..services import schedules as schedule_service
+from ..services import search as search_service
 from ..services import skills as skill_service
 from ..services.errors import ServiceError
 from .deps import Runs, Session, Who
 
 router = APIRouter(prefix="/api/projects/{project_id}", tags=["knowledge"])
+
+
+@router.get("/search", response_model=ProjectSearchOut)
+async def search_project(
+    project_id: int,
+    session: Session,
+    q: str = Query(min_length=1, max_length=300),
+    limit: int = Query(8, ge=1, le=50),
+    kinds: list[str] | None = Query(None),
+    close: bool = False,
+) -> ProjectSearchOut:
+    """The project's history by meaning and words, for the command palette and the board's filter (``kinds=ticket``,
+    ``close``: by meaning only what stands out); whoever may read the project."""
+    project = await project_service.get(session, project_id)
+    return ProjectSearchOut(**await search_service.for_user(session, project, q, limit, kinds=kinds, only_close=close))
 
 
 @router.get("/notes", response_model=list[NoteOut])

@@ -50,7 +50,7 @@ TOOLS = frozenset(
     {
         "get_board_summary", "list_tasks", "get_task", "get_comments", "list_assignments", "list_runs", "list_jobs", "read_chat",
         "list_agents", "get_agent", "member_notes", "list_notes", "get_note", "list_todos", "get_todo", "list_schedules",
-        "get_project", "list_repositories", "list_skills", "list_models", "search_history", "flow_check", "time_report",
+        "get_project", "list_repositories", "list_skills", "list_models", "search_history", "flow_check", "time_report", "list_ideas", "get_idea",
     }
 )  # fmt: skip
 MAX_TURNS = 40  # a question that needs more is not a short one
@@ -152,8 +152,9 @@ class Questions:
         if sum(t.busy for t in self._threads.values() if t.user_id == thread.user_id) >= MAX_RUNNING:
             raise ServiceError(f"At most {MAX_RUNNING} questions at the same time.", 429)
 
-        account = await account_service.pick(s, thread.provider, manager, None, model=thread.model, fresh=thread.session_id is None)
-        if account is None and (why := await account_service.shut_out(s, thread.provider, manager)):
+        where = self.runs.runners.where(project.id)
+        account = await account_service.pick(s, thread.provider, manager, None, model=thread.model, fresh=thread.session_id is None, where=where)
+        if account is None and (why := await account_service.shut_out(s, thread.provider, manager) or await account_service.not_signed_in(s, thread.provider, manager, where)):
             raise ServiceError(why)
         values = await settings_service.get_all(s)
         credentials = await permissions.credentials(s, project, values, account_service.fields(account))
@@ -227,7 +228,7 @@ class Questions:
                     thread.session_id = event.session_id
                 elif event.type == "limits" and ctx.account_key:
                     async with self.runs._sm() as s:
-                        await limits_service.record(s, ctx.account_key, event.windows, complete=event.complete)
+                        await limits_service.record(s, ctx.account_key, event.windows, complete=event.complete, covers=event.covers)
                 elif event.type == "result":
                     result = event
                 elif event.type == "error":

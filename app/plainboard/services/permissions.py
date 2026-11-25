@@ -12,6 +12,11 @@ that hands credentials or secrets to a project's runs, jobs and git work takes t
 
 The project's own limit to some subscriptions (``Project.account_ids``, set by an admin) comes on top.
 Subscriptions people added themselves (``Account.owner_id``) are their own and whom they share them with.
+Besides, whoever works in a project (a member, not a viewer) can give it their own subscriptions
+(``Account.project_ids``, #93): its runs use them, whatever they are shared with, as long as that person
+works in it and the project's owner has not switched them off (``Project.blocked_account_ids``).
+An admin can stop people from adding their own (setting ``own_accounts``) and switch those they have off
+for the whole installation (``own_accounts_off``, ``switched_off``): nothing runs on them until it is on again.
 """
 
 from __future__ import annotations
@@ -19,10 +24,10 @@ from __future__ import annotations
 from typing import Any
 
 from plainboard_protocol import Credentials
-from sqlalchemy import func, select
+from sqlalchemy import func, or_, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..models import Account, Project, Runner, Secret, User
+from ..models import Account, Project, ProjectMember, ProjectRole, Runner, Secret, User
 from ..security import decrypt
 from . import secrets as secret_service
 from . import settings as settings_service
@@ -61,17 +66,47 @@ def may_manage(user: User | None, account: Account) -> bool:
     return user is not None and (user.is_admin or (account.owner_id is not None and account.owner_id == user.id))
 
 
+async def own_allowed(session: AsyncSession) -> bool:
+    """May people other than admins add subscriptions of their own (#138)?"""
+    return bool(await settings_service.get(session, "own_accounts"))
+
+
+async def switched_off(session: AsyncSession) -> set[int]:
+    """People's own subscriptions, if an admin switched them off with adding new ones: none of them is used."""
+    values = await settings_service.get_all(session)
+    if values["own_accounts"] or not values["own_accounts_off"]:
+        return set()
+    return set(await session.scalars(select(Account.id).where(Account.owner_id.is_not(None))))
+
+
 async def usable(session: AsyncSession, user: User | None) -> set[int]:
-    return {a.id for a in await session.scalars(select(Account)) if may_use(user, a)}
+    off = await switched_off(session)
+    return {a.id for a in await session.scalars(select(Account)) if may_use(user, a) and a.id not in off}
+
+
+async def given(session: AsyncSession, project: Project) -> list[Account]:
+    """The subscriptions people gave the project themselves (``Account.project_ids``), switched off or not."""
+    return [a for a in await session.scalars(select(Account).where(Account.owner_id.is_not(None))) if project.id in (a.project_ids or [])]
+
+
+async def contributed(session: AsyncSession, project: Project) -> set[int]:
+    """Of those, the ones the project uses: their owner works in it (an enabled member, not a viewer, or
+    an admin), and its owner has not switched them off."""
+    workers = select(ProjectMember.user_id).where(ProjectMember.project_id == project.id, ProjectMember.role != ProjectRole.VIEWER)
+    people = set(await session.scalars(select(User.id).where(User.enabled, or_(User.is_admin, User.id.in_(workers)))))
+    blocked = set(project.blocked_account_ids or [])
+    return {a.id for a in await given(session, project) if a.owner_id in people and a.id not in blocked}
 
 
 async def account_ids(session: AsyncSession, project: Project | None) -> set[int] | None:
     """The only accounts the project's agents may run on: what its owner may use, and of those the
-    ones an admin limited the project to. None: no project, any."""
+    ones an admin limited the project to; and what its members gave it (``contributed``). None: no project, any."""
     if project is None:
         return None
     allowed = await usable(session, await session.get(User, project.owner_id) if project.owner_id else None)
-    return allowed & set(project.account_ids) if project.account_ids else allowed
+    if project.account_ids:
+        allowed &= set(project.account_ids)
+    return (allowed | await contributed(session, project)) - set(project.blocked_account_ids or []) - await switched_off(session)
 
 
 async def check_account(session: AsyncSession, project: Project | None, account_id: int | None, user: User | None = None) -> None:

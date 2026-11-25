@@ -6,6 +6,7 @@ what goes on a train and what happens after its checks; nothing here needs an ag
 from __future__ import annotations
 
 import asyncio
+import fnmatch
 import time
 from pathlib import Path
 
@@ -277,7 +278,7 @@ async def commit_log(spec: GitLogSpec) -> GitLogResult:
         span = head
         if spec.since and await git.ok("merge-base", "--is-ancestor", spec.since, head):
             span = f"{spec.since}..{head}"
-        out = await git("log", "--no-merges", f"-n{spec.limit}", f"--skip={skip}", "--format=%x1e%H%x1f%an%x1f%cI%x1f%B%x1f", "--numstat", span, timeout=300)
+        out = await git("log", "--no-merges", f"-n{spec.limit}", f"--skip={skip}", "--format=%x1e%H%x1f%an%x1f%cI%x1f%B%x1f", "--numstat", "-M", span, timeout=300)
         for record in (r for r in out.split("\x1e") if r.strip()):  # the output comes stripped, and \x1e counts as a space
             sha, author, date, message, stats = (record.split("\x1f", 4) + [""] * 5)[:5]
             commit = GitCommit(sha=sha.strip(), author=author, date=date, message=message.strip())
@@ -289,10 +290,40 @@ async def commit_log(spec: GitLogSpec) -> GitLogResult:
                 commit.file_count += 1
                 commit.insertions += int(added) if added.isdigit() else 0
                 commit.deletions += int(deleted) if deleted.isdigit() else 0
-                if len(commit.files) < LOG_FILES:
-                    commit.files.append(path)
+                moved = renamed(path)
+                if moved:
+                    commit.renames[moved[0]] = moved[1]
+                for name in moved or (path,):
+                    if len(commit.files) < LOG_FILES:
+                        commit.files.append(name)
             result.commits.append(commit)
         return result
+
+
+def renamed(path: str) -> tuple[str, str] | None:
+    """A rename as ``--numstat`` names it ("old => new", "dir/{old => new}/file"): (old, new); else None."""
+    if " => " not in path:
+        return None
+    if (start := path.find("{")) >= 0 and (end := path.find("}", start)) > start and " => " in path[start:end]:
+        old, new = path[start + 1 : end].split(" => ", 1)
+        both = (path[:start] + old + path[end + 1 :], path[:start] + new + path[end + 1 :])
+        return both[0].replace("//", "/").strip("/"), both[1].replace("//", "/").strip("/")
+    old, new = path.split(" => ", 1)
+    return old, new
+
+
+def matches(path: str, patterns: list[str]) -> bool:
+    """A path under a prefix or matching a glob (the app's ``docs_watcher.matches``)."""
+    for pattern in patterns:
+        pattern = pattern.strip().lstrip("./")
+        if not pattern:
+            continue
+        if any(ch in pattern for ch in "*?["):
+            if fnmatch.fnmatch(path, pattern) or fnmatch.fnmatch(path, pattern.rstrip("/") + "/*"):
+                return True
+        elif path == pattern or path.startswith(pattern.rstrip("/") + "/"):
+            return True
+    return False
 
 
 async def present(spec: GitPresentSpec) -> GitPresentResult:
@@ -318,6 +349,13 @@ async def present(spec: GitPresentSpec) -> GitPresentResult:
     if spec.paths:
         there = set((await git("ls-tree", "-r", "--name-only", tip, "--", *spec.paths)).splitlines())
         result.missing = [p for p in spec.paths if p not in there]
+    if spec.patterns:
+        files = (await git("ls-tree", "-r", "--name-only", tip)).splitlines()
+        there = set(files) | {f[:i] for f in files for i in range(len(f)) if f[i] == "/"}  # the files and their folders
+        result.unmatched = [
+            p for p in spec.patterns
+            if (p.strip().lstrip("./").rstrip("/") not in there if not any(ch in p for ch in "*?[") else not any(matches(f, [p]) for f in files))
+        ]  # fmt: skip
     return result
 
 

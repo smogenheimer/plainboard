@@ -40,6 +40,7 @@ MAX_BACKOFF = 60.0
 REFUSED_BACKOFF = 300.0
 REPLACED_BACKOFF = 600.0
 INSTANCE = uuid.uuid4().hex  # new with every start: PlainBoard tells a restart from a reconnect by it
+FEATURES = ["signins"]  # what PlainBoard may send here: "signins": kept sign-ins (Credentials.login_files, signins.py)
 
 
 def enabled() -> bool:
@@ -84,7 +85,7 @@ class Session:
         return self._own_port if port is None else int(port)
 
     async def run(self) -> None:
-        await self._json({"t": "hello", "version": commit(), "protocol": PROTOCOL, "instance": INSTANCE, "update": selfupdate.status()})
+        await self._json({"t": "hello", "version": commit(), "protocol": PROTOCOL, "instance": INSTANCE, "update": selfupdate.status(), "features": FEATURES})
         pinger = asyncio.create_task(self._ping())
         reader = asyncio.create_task(self._read())
         try:

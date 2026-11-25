@@ -244,10 +244,86 @@ def test_codex_accounts_have_their_own_sign_in(client, project):
     assert turn(client, pid, dev["id"]).codex_account == "default"
     assert client.patch(f"/api/agents/{dev['id']}", json={"account_id": claude["id"]}).status_code == 400
     client.patch(f"/api/agents/{dev['id']}", json={"account_id": other["id"]})
+    assert turn(client, pid, dev["id"]).codex_account == "default"  # not signed in yet: never chosen (#84)
+    client.post(f"/api/accounts/{other['id']}/signin")  # a new one is signed in in a private folder and kept here
+    client.post(f"/api/accounts/{other['id']}/signin/code", json={"code": "good#code"})
     creds = turn(client, pid, dev["id"])
-    assert creds.codex_account not in ("default", "") and creds.codex_auth_mode == "chatgpt"
+    assert creds.codex_account not in ("default", "") and creds.codex_auth_mode == "own_login" and creds.login_account == creds.codex_account and creds.login_files
     moved = client.patch(f"/api/agents/{dev['id']}", json={"provider": "claude_code"}).json()
     assert moved["account_id"] is None  # the pin belonged to Codex
+
+
+def test_gemini_accounts_sign_in_with_google_or_a_key(client, project):
+    """Gemini CLI (#160): a Google sign-in made in the browser is kept here and goes with each run; an API key too."""
+    pid = project["id"]
+    google = client.post("/api/accounts", json={"provider": "gemini_cli", "auth_mode": "google"}).json()
+    assert google["label"] == "Gemini"
+    dev = make_dev(client, pid, provider="gemini_cli")
+    client.post(f"/api/accounts/{google['id']}/signin")
+    client.post(f"/api/accounts/{google['id']}/signin/code", json={"code": "good#code"})
+    creds = turn(client, pid, dev["id"])
+    assert creds.gemini_auth_mode == "own_login" and creds.login_account not in ("default", "") and creds.login_files and creds.gemini_api_key is None
+    key = client.post("/api/accounts", json={"provider": "gemini_cli", "auth_mode": "api_key", "secret": "gem-key"}).json()
+    client.patch(f"/api/agents/{dev['id']}", json={"account_id": key["id"]})
+    creds = turn(client, pid, dev["id"])
+    assert creds.gemini_auth_mode == "api_key" and creds.gemini_api_key == "gem-key" and not creds.login_files
+
+
+def test_codex_subscriptions_list_the_models_they_may_use(client, project):
+    """Each Codex subscription says with its read of the limits which models it may use (#92): what any of them
+    may use can be chosen, and a turn goes to a subscription that has the agent's model."""
+    from plainboard_protocol import ModelInfo
+
+    pid = project["id"]
+    team = client.post("/api/accounts", json={"provider": "codex", "label": "Team", "auth_mode": "chatgpt"}).json()
+    client.post(f"/api/accounts/{team['id']}/signin")
+    client.post(f"/api/accounts/{team['id']}/signin/code", json={"code": "good#code"})
+    sol, daybreak = ModelInfo(id="gpt-6.1-sol", label="Sol"), ModelInfo(id="gpt-daybreak-blue-latest", label="Daybreak Blue")
+    runs, fake = client.app_ref.state.runs, runner(client)
+    fake.limit_models = {"chatgpt": [sol], "own_login": [sol, daybreak]}
+    wait_for(lambda: not (runs._limits_task and not runs._limits_task.done()))
+    client.portal.call(runs._refresh_limits)
+    found = accounts(client)
+    assert (found["Codex"]["models"], found["Team"]["models"]) == (["gpt-6.1-sol"], ["gpt-6.1-sol", "gpt-daybreak-blue-latest"])
+    codex = next(p for p in client.get("/api/meta").json()["providers"] if p["name"] == "codex")
+    assert [m["id"] for m in codex["models"]] == ["gpt-6.1-sol", "gpt-6.1-terra", "gpt-6-luna", "gpt-daybreak-blue-latest"]
+
+    # Pinned to the subscription that does not have the model: the one that has it runs the turn.
+    dev = make_dev(client, pid, provider="codex")
+    client.patch(f"/api/agents/{dev['id']}", json={"account_id": found["Codex"]["id"], "model": "gpt-daybreak-blue-latest"})
+    assert turn(client, pid, dev["id"]).codex_auth_mode == "own_login"
+    client.patch(f"/api/agents/{dev['id']}", json={"model": "gpt-6.1-sol"})
+    assert turn(client, pid, dev["id"]).codex_account == "default"
+    # A model no list names (typed by hand) is not held back: it may run anywhere.
+    client.patch(f"/api/agents/{dev['id']}", json={"model": "gpt-9-new"})
+    assert turn(client, pid, dev["id"]).codex_account == "default"
+    # In use, its list is still asked for every hour: a new model shows up without anything else.
+    import time
+
+    from plainboard.db import sessionmaker
+    from plainboard.models import Account
+    from plainboard.services import limits as limits_service
+    from sqlalchemy import select
+
+    async def in_use(checked_ago: float) -> None:
+        async with sessionmaker()() as s:
+            key = await s.scalar(select(Account.key).where(Account.label == "Team"))
+            await limits_service.record(s, key, [LimitWindow(name="codex_seven_day", utilization=0.1)])
+            await limits_service.record_plan(s, key, None, None)
+            row, plans = await limits_service._plans(s)
+            plans[key]["checked_at"] = int(time.time() - checked_ago)
+            row.value = json.dumps(plans)
+            await s.commit()
+
+    fake.limit_models["own_login"] = [sol, daybreak, ModelInfo(id="gpt-7-sol", label="GPT-7-Sol")]
+    client.portal.call(in_use, 600)
+    client.portal.call(runs._refresh_limits)
+    assert "gpt-7-sol" not in accounts(client)["Team"]["models"]
+    client.portal.call(in_use, 3700)
+    client.portal.call(runs._refresh_limits)
+    assert accounts(client)["Team"]["models"][-1] == "gpt-7-sol"
+    # Another kind of sign-in may offer other models: its list is asked anew.
+    assert client.patch(f"/api/accounts/{team['id']}", json={"auth_mode": "api_key", "secret": "sk-o"}).json()["models"] == []
 
 
 def test_only_a_subscription_without_a_fresh_report_is_asked(client, project):
@@ -352,7 +428,7 @@ def test_a_model_server_of_one_s_own_is_an_account_with_its_address_and_models(c
     that offers the agent's model."""
     pid = project["id"]
     meta = client.get("/api/meta").json()
-    assert [p["name"] for p in meta["providers"]] == ["claude_code", "codex", "antigravity"]
+    assert [p["name"] for p in meta["providers"]] == ["claude_code", "codex", "antigravity", "gemini_cli"]
     assert [p["name"] for p in meta["endpoints"]] == ["ollama", "gemini"] and meta["endpoints"][0]["endpoint"]["key"] is False
     assert client.post("/api/accounts", json={"provider": "nowhere", "auth_mode": "api_key"}).status_code == 400
     assert client.post("/api/accounts", json={"provider": "ollama", "auth_mode": "chatgpt"}).status_code == 400
@@ -360,7 +436,7 @@ def test_a_model_server_of_one_s_own_is_an_account_with_its_address_and_models(c
     home = client.post("/api/accounts", json={"provider": "ollama", "auth_mode": "api_key"}).json()
     assert (home["label"], home["endpoint_url"], home["models"], home["context_tokens"]) == ("Ollama", "", [], 0)
     # No model named yet: nothing an agent could run on.
-    assert [p["name"] for p in client.get("/api/meta").json()["providers"]] == ["claude_code", "codex", "antigravity"]
+    assert [p["name"] for p in client.get("/api/meta").json()["providers"]] == ["claude_code", "codex", "antigravity", "gemini_cli"]
     assert client.post(f"/api/accounts/{home['id']}/models").json() == {"models": ["a-model", "b-model"]}
     assert runner(client).models_asked[0] == "ollama"
 
@@ -393,8 +469,7 @@ def test_a_model_server_of_one_s_own_is_an_account_with_its_address_and_models(c
     wait_for(lambda: idle(client, pid))
     messages = client.get(f"/api/agents/{manager['id']}/conversation").json()["messages"]
     listed = next(m["meta"]["result"] for m in messages if m["kind"] == "tool" and m["content"] == "list_models")
-    assert "ollama: coder (medium), small-one (medium), large-one (medium)" in listed
-    assert not any(line.startswith("gemini") for line in listed.splitlines())
+    assert "ollama: coder (medium), small-one (medium), large-one (medium)" in listed and "\ngemini:" not in listed
 
 
 def test_a_project_can_be_limited_to_some_subscriptions(client, project):
@@ -589,3 +664,45 @@ def test_antigravity_accounts_signin_credentials_and_cleanup(client, project):
 
     # Broken thinking signature error clears provider_session_id via _session_lost.
     assert _session_lost("Antigravity session can no longer be resumed (invalid thinking signature).")
+
+
+def test_a_window_the_provider_no_longer_reports_is_gone_at_once(client):
+    """Production, 2026-11-24 (#149): a subscription moved from Max to Ultra, which has no 5-hour
+    window. Every report after that named only the weekly window, and the 5-hour window of the old
+    plan (99 %) stayed for hours: the subscription counted as nearly used up."""
+    import time
+
+    from plainboard.db import sessionmaker
+    from plainboard.models import Account
+    from plainboard.services import limits as limits_service
+    from sqlalchemy import select
+
+    first = accounts(client)["Claude"]
+    later = int(time.time()) + 3600
+
+    def names() -> dict[str, float]:
+        return {w["name"]: w["utilization"] for w in limits_of(client, first["id"])["windows"]}
+
+    async def report(windows: list[tuple[str, float]], covers: list[str] | None = None, plan: tuple | None = None) -> None:
+        async with sessionmaker()() as s:
+            key = await s.scalar(select(Account.key).where(Account.label == "Claude"))
+            if plan:
+                await limits_service.record_plan(s, key, *plan)
+            if windows:
+                await limits_service.record(s, key, [LimitWindow(name=n, utilization=u, resets_at=later) for n, u in windows], covers=covers)
+
+    client.portal.call(report, [("five_hour", 0.99), ("seven_day", 0.5), ("seven_day_opus", 0.3)], None, ("Max", 5.0))
+    # A report of the changed window only keeps the others.
+    client.portal.call(report, [("seven_day", 0.6)])
+    assert names() == {"five_hour": 0.99, "seven_day": 0.6, "seven_day_opus": 0.3}
+    # A report that speaks for the header windows drops the 5-hour one it leaves out, not the Opus one.
+    client.portal.call(report, [("seven_day", 0.6)], ["five_hour", "seven_day", "seven_day_overage_included", "overage"])
+    assert names() == {"seven_day": 0.6, "seven_day_opus": 0.3}
+    # A window it still reports stays.
+    client.portal.call(report, [("five_hour", 0.2), ("seven_day", 0.6)], ["five_hour", "seven_day"])
+    assert names() == {"five_hour": 0.2, "seven_day": 0.6, "seven_day_opus": 0.3}
+    # The same plan again changes nothing; a new plan forgets the old plan's limits.
+    client.portal.call(report, [], None, ("Max", None))
+    assert names() == {"five_hour": 0.2, "seven_day": 0.6, "seven_day_opus": 0.3}
+    client.portal.call(report, [], None, ("Ultra", 10.0))
+    assert names() == {} and limits_of(client, first["id"])["plan"] == "Ultra"

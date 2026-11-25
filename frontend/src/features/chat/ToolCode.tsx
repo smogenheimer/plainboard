@@ -19,11 +19,11 @@ interface Code {
   length: number;
 }
 
-type Row = { k: "+" | "-" | " " | "gap"; o?: number; n?: number; c: string };
+export type Row = { k: "+" | "-" | " " | "gap"; o?: number; n?: number; c: string };
 
 /** Line diff of one edit: the lines both share stay, the rest is removed and added. Beyond a few
  * hundred lines it only trims what they share at both ends. */
-function diffLines(oldText: string, newText: string): Row[] {
+export function diffLines(oldText: string, newText: string): Row[] {
   const a = oldText ? oldText.split("\n") : [];
   const b = newText ? newText.split("\n") : [];
   let head = 0;

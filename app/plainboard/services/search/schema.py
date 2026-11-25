@@ -37,7 +37,21 @@ def ensure(conn: Connection) -> bool:
             log.warning("Could not create the extension vector, semantic search is not available: %s", exc)
             return False
     Base.metadata.create_all(conn, tables=vector_tables(), checkfirst=True)
+    link_doc_pages(conn)
     return True
+
+
+DOC_PAGE_FK = "fk_search_documents_doc_page_id"
+
+
+def link_doc_pages(conn: Connection) -> None:
+    """A doc page's chunks go with it: the foreign key, once both tables are there (idempotent)."""
+    if not conn.execute(text("SELECT to_regclass('doc_pages') IS NOT NULL AND to_regclass('search_documents') IS NOT NULL")).scalar():
+        return
+    conn.execute(text("ALTER TABLE search_documents ADD COLUMN IF NOT EXISTS doc_page_id INTEGER"))
+    conn.execute(text("CREATE INDEX IF NOT EXISTS ix_search_documents_doc_page_id ON search_documents (doc_page_id)"))
+    if not conn.execute(text("SELECT 1 FROM pg_constraint WHERE conname = :name"), {"name": DOC_PAGE_FK}).first():
+        conn.execute(text(f"ALTER TABLE search_documents ADD CONSTRAINT {DOC_PAGE_FK} FOREIGN KEY (doc_page_id) REFERENCES doc_pages(id) ON DELETE CASCADE"))
 
 
 _known: dict[str, tuple[bool, float]] = {}

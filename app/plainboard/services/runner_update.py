@@ -5,7 +5,8 @@ with a sha256, through the runner's own connection; nothing is fetched from anyw
 Only the code changes. A version that needs another image (its Dockerfile or launcher changed) or
 other Python packages (a dependency in runner/ or protocol/pyproject.toml whose range the installed
 package does not meet, e.g. a newer claude-agent-sdk with its CLI) is refused by the runner: then the
-managers of its projects hear once that ``docker compose pull && docker compose up -d`` is needed. So a
+managers of its projects hear once that ``docker compose pull && docker compose up -d`` is needed, with the
+image tag that matches the app (runners.manual: latest for a release, edge for :edge or a build from source). So a
 change that needs a newer package must raise its lower bound in the pyproject."""
 
 from __future__ import annotations
@@ -23,7 +24,6 @@ from . import runners as runner_service
 # anyway (setting runner_update_drain_seconds): cut turns go on in the same session, cut check runs again.
 DRAIN_SECONDS = 5 * 60
 RETRY_SECONDS = 6 * 3600  # after a failed or refused update: no new try for the same version before this
-MANUAL = "docker compose pull && docker compose up -d"
 
 # What to do with a runner now (``step``).
 IDLE = "idle"  # nothing: up to date, version not known, or a try failed not long ago
@@ -107,14 +107,14 @@ def bundle(commit: str, root: Path | None = None) -> Bundle | None:
 def manual_note(name: str, version: str, own: str, reason: str) -> str:
     return (
         f'The runner "{name}" runs version {runner_service.short(version)}, PlainBoard {runner_service.short(own)}, and it cannot update itself to it: {reason}. '
-        f"Tell the user once: on the runner's machine, in its folder, run `{MANUAL}`. Until then it works on with its version."
+        f"Tell the user once, on the runner's machine: {runner_service.manual()}. Until then it works on with its version."
     )
 
 
 def failed_note(name: str, own: str, reason: str) -> str:
     return (
         f'The runner "{name}" could not update itself to PlainBoard\'s version {runner_service.short(own)} ({reason}) and runs on with its old version; '
-        f"it tries again in {RETRY_SECONDS // 3600} hours. Tell the user once: if it keeps failing, run `{MANUAL}` on the runner's machine, in its folder."
+        f"it tries again in {RETRY_SECONDS // 3600} hours. Tell the user once: if it keeps failing, on the runner's machine: {runner_service.manual()}."
     )
 
 

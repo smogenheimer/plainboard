@@ -26,6 +26,7 @@ import tempfile
 import time
 import uuid
 from collections.abc import AsyncIterator, Callable
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any
 
@@ -53,20 +54,22 @@ from plainboard_protocol import (
     UsageEvent,
 )
 
-from .. import notices, signins
+from .. import codex_cli, notices, signins
 from ..config import TOOL_RESULT_PREVIEW_CHARS
 from ..mcp_stdio import BRIDGE_FILE_ENV, write_bridge_file
 from ..signins import SIGN_INS
 from ..tool_bridge import ToolBridge
 from ..workspace import tool_env
-from .base import Provider
+from .base import Provider, merge_efforts
 
 log = logging.getLogger(__name__)
 
-CODEX_BIN = os.environ.get("PLAINBOARD_CODEX_BIN", "codex")
+CODEX_BIN = codex_cli.own_bin() or codex_cli.IMAGE_BIN  # the image's; newer ones come by codex_cli
 SUBSCRIPTION_HOME = Path(os.environ.get("CODEX_HOME") or Path.home() / ".codex")
 API_KEY_HOME = Path.home() / ".plainboard" / "codex-api-key"
 ACCOUNTS_HOME = Path.home() / ".plainboard" / "codex-accounts"  # further accounts, one home each
+CATALOG_HOME = Path.home() / ".plainboard" / "codex-catalog"  # the model list once the default home's sign-in is the app's
+REFRESH_AFTER_DAYS = 4  # a kept sign-in is refreshed ahead (refresh_sign_in) well before Codex would itself
 SIGN_IN_FILES = ("auth.json",)  # what a person's own ChatGPT sign-in is (signins.py), with cli_auth_credentials_store "file"
 BRIDGE_DIR = Path(tempfile.gettempdir()) / "plainboard-bridge"
 MCP_SERVER_NAME = "plainboard"
@@ -77,6 +80,7 @@ NOTICE_GRACE_SECONDS = 60
 NOTICE_CHECK_SECONDS = 2
 LOGIN_TIMEOUT_SECONDS = 15 * 60
 MODELS_TTL_SECONDS = 3600
+MODEL_PAGES = 10
 
 MODELS = [
     ModelInfo(id="gpt-6.1-sol", label="GPT-6.1 Sol", tier="large"),
@@ -92,6 +96,41 @@ LIMIT_NAMES = {300: "codex_five_hour", 10080: "codex_seven_day"}
 
 class CodexError(RuntimeError):
     pass
+
+
+def model_infos(listed: list[dict[str, Any]]) -> list[ModelInfo]:
+    """The models of a ``model/list`` answer an agent can be given. Hidden ones are left out (Codex's own helpers such as
+    its auto review), except models for a special field (Daybreak, ``modelSpecialty`` "cyber"), unless the account's
+    access programs, where the answer names them, leave them out."""
+    known = {m.id: m for m in MODELS}
+    out: dict[str, ModelInfo] = {}
+    for m in listed:
+        if not isinstance(m, dict) or not m.get("id"):
+            continue
+        if m.get("hidden"):
+            programs = (m.get("availableAccessPrograms") or {}).get("cyber") if isinstance(m.get("availableAccessPrograms"), dict) else None
+            if not m.get("modelSpecialty") or (programs is not None and not any(str(p).startswith("daybreak") for p in programs)):
+                continue
+        out.setdefault(m["id"], known.get(m["id"]) or ModelInfo(id=m["id"], label=m.get("displayName") or m["id"], tier=guess_tier(m["id"])))
+    return list(out.values())
+
+
+async def list_models(server: AppServer) -> tuple[list[ModelInfo], list[str]]:
+    """Every page of ``model/list``, hidden models included (model_infos picks), and the effort levels they have."""
+    listed: list[dict[str, Any]] = []
+    cursor = None
+    for _ in range(MODEL_PAGES):
+        params: dict[str, Any] = {"includeHidden": True}
+        if cursor:
+            params["cursor"] = cursor
+        answer = await server.request("model/list", params, timeout=20) or {}
+        listed += answer.get("data") or []
+        if not (cursor := answer.get("nextCursor")):
+            break
+    models = model_infos(listed)
+    ids = {m.id for m in models}
+    levels = [[e.get("reasoningEffort") for e in m.get("supportedReasoningEfforts") or [] if isinstance(e, dict)] for m in listed if isinstance(m, dict) and m.get("id") in ids]
+    return models, merge_efforts([], *levels)
 
 
 def toml_value(value: Any) -> str:
@@ -127,6 +166,21 @@ def share_sessions(home: Path) -> None:
     target = SUBSCRIPTION_HOME / "sessions"
     target.mkdir(parents=True, exist_ok=True)
     link.symlink_to(target, target_is_directory=True)
+
+
+def refresh_due(files: dict[str, str], now: datetime | None = None) -> bool:
+    """A ChatGPT sign-in last refreshed ``REFRESH_AFTER_DAYS`` ago or more (or not known when)."""
+    try:
+        stored = json.loads(files.get("auth.json") or "{}")
+    except ValueError:
+        return False
+    if not isinstance(stored, dict) or not stored.get("tokens") or stored.get("auth_mode") not in (None, "chatgpt"):
+        return False
+    try:
+        last = datetime.fromisoformat(str(stored.get("last_refresh") or "").replace("Z", "+00:00"))
+    except ValueError:
+        return True  # not known when: refreshed once, then it is
+    return (now or datetime.now(timezone.utc)) - last >= timedelta(days=REFRESH_AFTER_DAYS)
 
 
 def guess_tier(model_id: str) -> str:
@@ -168,7 +222,7 @@ def run_config(spec: RunSpec, bridge_file: Path) -> dict[str, Any]:
         # Codex drops variables named like *KEY*/*TOKEN* from commands by default; agents need GH_TOKEN and the user's secrets.
         "shell_environment_policy": {"inherit": "all", "ignore_default_excludes": True},
     }
-    if spec.toolset in ("board", "read"):  # smaller prompt: no web search, no project instructions
+    if spec.toolset in ("board", "read", "none"):  # smaller prompt: no web search, no project instructions
         config["web_search"] = "disabled"
         config["project_doc_max_bytes"] = 0
     return config
@@ -186,7 +240,10 @@ COMPLETION_CONFIG: dict[str, Any] = {"mcp_servers": {}, "web_search": "disabled"
 class AppServer:
     """One ``codex app-server`` process. Notifications and the server's requests arrive in :meth:`next`."""
 
-    def __init__(self, home: Path, env: dict[str, str] | None = None, config: dict[str, Any] | None = None, cwd: Path | None = None) -> None:
+    def __init__(
+        self, home: Path, env: dict[str, str] | None = None, config: dict[str, Any] | None = None, cwd: Path | None = None, binary: str | None = None
+    ) -> None:
+        self.binary = binary or codex_cli.binary()
         self.home = home
         self.env = env or {}
         self.config = config or {}
@@ -201,7 +258,7 @@ class AppServer:
     async def __aenter__(self) -> AppServer:
         self.home.mkdir(parents=True, exist_ok=True)
         share_sessions(self.home)
-        args = [CODEX_BIN, "app-server"]
+        args = [self.binary, "app-server"]
         for key, value in {**BASE_CONFIG, **self.config}.items():
             args += ["-c", f"{key}={toml_value(value)}"]
         try:
@@ -579,21 +636,30 @@ class CodexProvider(Provider):
 
     def __init__(self) -> None:
         self._models: tuple[float, list[ModelInfo]] | None = None
+        self._offered: dict[str, list[ModelInfo]] = {}  # each account's own list from its last read of the limits
+        self._seen: dict[str, ModelInfo] = {}  # every model an account's list named, for the catalog's labels
+        self._efforts: list[str] = []  # the levels the lists name, unknown ones (ultra) too
         self._logins: dict[str, DeviceLogin] = {}
         self._own_logins: dict[str, DeviceLogin] = {}  # people's own sign-ins in progress, each in a private home
         self._api_key_lock = asyncio.Lock()
 
     def info(self) -> ProviderInfo:
-        models = self._models[1] if self._models else MODELS
-        return ProviderInfo(name=self.name, label="Codex", models=models, efforts=EFFORTS)
+        models = list(self._models[1] if self._models else MODELS)
+        ids = {m.id for m in models}
+        models += [m for m in self._seen.values() if m.id not in ids]  # what accounts' own lists added (offered)
+        return ProviderInfo(name=self.name, label="Codex", models=models, efforts=merge_efforts(EFFORTS, self._efforts))
 
     async def catalog(self) -> ProviderInfo:
         if not self._models or time.monotonic() - self._models[0] > MODELS_TTL_SECONDS:
             try:
-                async with AppServer(SUBSCRIPTION_HOME) as server:
-                    listed = (await server.request("model/list", {}, timeout=20)).get("data") or []
-                known = {m.id: m for m in MODELS}
-                models = [known.get(m["id"]) or ModelInfo(id=m["id"], label=m.get("displayName") or m["id"], tier=guess_tier(m["id"])) for m in listed if not m.get("hidden")]
+                if signins.taken(self.name, DEFAULT_ACCOUNT):  # never the home's copy of a sign-in the app keeps
+                    async with AppServer(CATALOG_HOME) as server:
+                        models, efforts = await list_models(server)
+                else:
+                    with SIGN_INS.in_home(self.name, DEFAULT_ACCOUNT, "This ChatGPT sign-in"):
+                        async with AppServer(SUBSCRIPTION_HOME) as server:
+                            models, efforts = await list_models(server)
+                self._efforts = merge_efforts(self._efforts, efforts)
                 self._models = (time.monotonic(), models or MODELS)
             except Exception as exc:
                 log.warning("Could not list Codex models: %s", exc)
@@ -614,7 +680,11 @@ class CodexProvider(Provider):
             async with SIGN_INS.home(self.name, creds.login_account, creds.login_files, SIGN_IN_FILES) as home:
                 yield home
             return
-        yield await self._shared_home(creds)
+        if creds.codex_auth_mode == "api_key":
+            yield await self._shared_home(creds)
+            return
+        with SIGN_INS.in_home(self.name, creds.codex_account, "This ChatGPT sign-in"):
+            yield await self._shared_home(creds)
 
     async def _shared_home(self, creds: Credentials) -> Path:
         """The Codex home in the runner's home. An API key is signed in to its own home."""
@@ -648,7 +718,7 @@ class CodexProvider(Provider):
                     "cwd": str(bridge.workspace),
                     "model": spec.model,
                     # The runner container is the sandbox; a question (toolset "read") only reads.
-                    "sandbox": "read-only" if spec.toolset == "read" else "danger-full-access",
+                    "sandbox": "read-only" if spec.toolset in ("read", "none") else "danger-full-access",
                     "approvalPolicy": "never",
                     "developerInstructions": spec.system_prompt,
                 }
@@ -718,13 +788,24 @@ class CodexProvider(Provider):
         mode = credentials.codex_auth_mode
         if mode == "api_key" or (mode == "own_login" and not credentials.login_files):
             return []
-        if mode != "own_login" and not (account_home(credentials.codex_account) / "auth.json").is_file():
+        if mode != "own_login" and (signins.taken(self.name, credentials.codex_account) or not (account_home(credentials.codex_account) / "auth.json").is_file()):
             return []
         async with self._home(credentials) as home, AppServer(home) as server:
             if not (await server.request("account/read", {"refreshToken": False})).get("account"):
                 return []
             answer = await server.request("account/rateLimits/read", None, timeout=30)
+            try:  # what this subscription may use, asked with its sign-in in the same server (offered)
+                listed, efforts = await list_models(server)
+            except (CodexError, TimeoutError) as exc:
+                log.info("Could not list the models of Codex account %s: %s", credentials.codex_account, str(exc)[:200])
+            else:
+                self._offered[credentials.codex_account] = listed
+                self._seen.update({m.id: m for m in listed})
+                self._efforts = merge_efforts(self._efforts, efforts)
         return limit_windows((answer or {}).get("rateLimits"))
+
+    async def offered(self, credentials: Credentials) -> list[ModelInfo] | None:
+        return self._offered.pop(credentials.codex_account, None)
 
     async def account(self, key: str, own: bool = False) -> ProviderAccount:
         if own:
@@ -734,7 +815,7 @@ class CodexProvider(Provider):
             return ProviderAccount(signed_in=login.succeeded, login_url=login.url, login_code=login.code, login_error=login.error)
         login = self._device_login(key)
         state = ProviderAccount(login_url=login.url, login_code=login.code, login_error=login.error)
-        if login.active:
+        if login.active or signins.taken(self.name, key):  # the app keeps that one: the home's copy is not used
             return state
         async with AppServer(login.home) as server:
             account = (await server.request("account/read", {"refreshToken": False})).get("account") or {}
@@ -784,6 +865,24 @@ class CodexProvider(Provider):
             return ProviderAccount()
         login = self._device_login(key)
         await login.cancel()
+        if signins.taken(self.name, key):  # signing the backup out would end the app's copy too: the same tokens
+            return ProviderAccount()
         async with AppServer(login.home) as server:
             await server.request("account/logout", None)
         return ProviderAccount()
+
+    async def take_over(self, key: str) -> dict[str, str]:
+        if self._device_login(key).active:
+            raise signins.Busy("A sign-in is in progress.")
+        return SIGN_INS.take_over(self.name, key, account_home(key), SIGN_IN_FILES)
+
+    async def refresh_sign_in(self, credentials: Credentials) -> None:
+        """Codex refreshes a sign-in that is some days old on its own, in every runner that has the same file at
+        once; here it happens before that, on one runner, and the others get the new file from the app."""
+        if credentials.codex_auth_mode != "own_login" or not credentials.login_files:
+            return
+        async with self._home(credentials) as home:
+            if not refresh_due(signins.read(home, SIGN_IN_FILES)):
+                return
+            async with AppServer(home) as server:
+                await server.request("account/read", {"refreshToken": True}, timeout=60)

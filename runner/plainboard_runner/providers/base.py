@@ -4,13 +4,23 @@ from abc import ABC, abstractmethod
 from collections.abc import AsyncIterator
 from pathlib import Path
 
-from plainboard_protocol import CheckResult, CompletionResult, CompletionSpec, Credentials, LimitWindow, ProviderAccount, ProviderInfo, RunEvent, RunSpec
+from plainboard_protocol import CheckResult, CompletionResult, CompletionSpec, Credentials, LimitWindow, ModelInfo, ProviderAccount, ProviderInfo, RunEvent, RunSpec
 
 from ..tool_bridge import ToolBridge
 
 
 class ProviderError(RuntimeError):
     """A failed turn whose text already names the error that caused it."""
+
+
+def merge_efforts(known: list[str], *more: list[str]) -> list[str]:
+    """``known`` with the levels the other lists add, each after the level it follows there (``ultra`` after ``max``)."""
+    out = list(known)
+    for levels in more:
+        for i, level in enumerate(levels):
+            if level and level not in out:
+                out.insert(out.index(levels[i - 1]) + 1 if i and levels[i - 1] in out else len(out), level)
+    return out
 
 
 class Provider(ABC):
@@ -52,6 +62,15 @@ class Provider(ABC):
         """The account's plan limits, without using the model. Empty if it has none or they are unknown."""
         return []
 
+    async def limits_report(self, credentials: Credentials) -> tuple[list[LimitWindow], list[str]]:
+        """Like :meth:`limits`, with the windows the read speaks for in full (LimitsEvent.covers)."""
+        return await self.limits(credentials), []
+
+    async def offered(self, credentials: Credentials) -> list[ModelInfo] | None:
+        """The models the account in ``credentials`` may use, as its last read of the limits found them (only once).
+        None: not known, or the provider lists the same models for every account."""
+        return None
+
     async def plan(self, credentials: Credentials) -> tuple[str | None, float | None]:
         """The account's plan: its name and its size as a multiple of the provider's smallest plan. None: not known."""
         return None, None
@@ -70,6 +89,15 @@ class Provider(ABC):
     async def login_code(self, key: str, code: str) -> ProviderAccount:
         """The code the provider's page showed after signing in, for an own sign-in in progress."""
         raise NotImplementedError(f"{self.name} takes no sign-in code")
+
+    async def take_over(self, key: str) -> dict[str, str]:
+        """The installation's sign-in of account ``key`` in the runner's home, for the app to keep (signins.py);
+        none if it is not signed in there. Raises ``signins.Busy`` while it is in use."""
+        raise NotImplementedError(f"{self.name} has no sign-in")
+
+    async def refresh_sign_in(self, credentials: Credentials) -> None:
+        """Refresh a kept sign-in (``login_files``) ahead of time where it is due soon, so the runners that use it
+        get it fresh and none of them has to refresh it itself (two refreshes of one token: the second fails)."""
 
     async def check(self, spec: CompletionSpec) -> CheckResult:
         try:

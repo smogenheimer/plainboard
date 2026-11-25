@@ -4,10 +4,11 @@ import { Plus, Trash2 } from "lucide-react";
 import { useEffect, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, errorMessage } from "../../api/client";
-import { checks, qk, useAccounts, useMe, useMeta } from "../../api/queries";
+import { checks, qk, useAccounts, useMe, useMeta, useSettings } from "../../api/queries";
 import type { Account, CheckResult, ProviderInfo } from "../../api/types";
 import { Button, ErrorText, Field, IconButton, Input, Select, Textarea, Toggle } from "../../components/ui";
-import { Sharing } from "./AccountsEditor";
+import { Sharing, Step } from "./AccountsEditor";
+import { doneCount, useAccountStatus } from "./AccountStatus";
 import { CheckBadge } from "./SettingsDialog";
 
 const lines = (text: string) => [...new Set(text.split("\n").map((l) => l.trim()).filter(Boolean))];
@@ -24,7 +25,8 @@ export function EndpointAccounts({ own = false }: { own?: boolean }) {
   const [error, setError] = useState<unknown>(null);
   const [choice, setChoice] = useState("");
   const endpoints = meta.data?.endpoints ?? [];
-  const adds = !own || !me?.is_admin;
+  const allowed = useSettings().data?.values.own_accounts ?? true;
+  const adds = !own || (!me?.is_admin && allowed);
   const mine = (accounts.data ?? []).filter((a) => (own ? a.owner_id != null && a.can_manage : a.owner_id == null) && endpoints.some((p) => p.name === a.provider));
   const chosen = endpoints.find((p) => p.name === choice) ?? endpoints[0];
 
@@ -126,27 +128,33 @@ function EndpointCard({ account, provider, onChange }: { account: Account; provi
   };
   const shown = (offered ?? []).filter((id) => id.toLowerCase().includes(filter.trim().toLowerCase()));
 
-  return (
-    <div className={clsx("space-y-3 rounded-sm p-3 ring-1 ring-line", !account.enabled && "opacity-60")}>
-      <div className="flex items-center gap-2">
-        <Input
-          aria-label={t("accounts.label")}
-          className="min-w-0 flex-1 font-medium"
-          value={label}
-          onChange={(e) => setLabel(e.target.value)}
-          onBlur={() => label.trim() && label !== account.label && patch({ label })}
-        />
-        <Toggle checked={account.enabled} onChange={(enabled) => patch({ enabled })} label={<span>{t("accounts.enabled")}</span>} />
-        <IconButton label={t("accounts.delete")} onClick={remove}>
-          <Trash2 className="size-3.5" />
-        </IconButton>
-      </div>
-      <p className="text-fg-3">
-        {provider.label}
-        {endpoint.hint && ` · ${endpoint.hint}`}
-      </p>
-      {account.owner_id != null && account.owner_id !== me?.id && <p className="text-fg-3">{t("accounts.ownedBy", { name: account.owner_name })}</p>}
-      {account.owner_id != null && <Sharing account={account} patch={patch} />}
+  const status = useAccountStatus(account);
+
+  const head = (
+    <div className="flex items-center gap-2">
+      <Input
+        aria-label={t("accounts.label")}
+        className="min-w-0 flex-1 font-medium"
+        value={label}
+        onChange={(e) => setLabel(e.target.value)}
+        onBlur={() => label.trim() && label !== account.label && patch({ label })}
+      />
+      <Toggle checked={account.enabled} onChange={(enabled) => patch({ enabled })} label={<span>{t("accounts.enabled")}</span>} />
+      <IconButton label={t("accounts.delete")} onClick={remove}>
+        <Trash2 className="size-3.5" />
+      </IconButton>
+    </div>
+  );
+  const kind = (
+    <p className="text-fg-3">
+      {provider.label}
+      {endpoint.hint && ` · ${endpoint.hint}`}
+    </p>
+  );
+  const ownedBy = account.owner_id != null && account.owner_id !== me?.id && <p className="text-fg-3">{t("accounts.ownedBy", { name: account.owner_name })}</p>;
+  const sharing = account.owner_id != null && <Sharing account={account} patch={patch} />;
+  const connection = (
+    <div className="space-y-3" data-part="endpoint-connection">
       <Field label={t("endpoints.address")} hint={endpoint.url ? t("endpoints.addressHint", { url: endpoint.url }) : t("endpoints.addressNeeded")}>
         <Input value={url} placeholder={endpoint.url || "https://"} onChange={(e) => setUrl(e.target.value)} onBlur={() => url.trim() !== account.endpoint_url && patch({ endpoint_url: url.trim() })} />
       </Field>
@@ -213,6 +221,28 @@ function EndpointCard({ account, provider, onChange }: { account: Account; provi
           </ul>
         </div>
       )}
+    </div>
+  );
+  return (
+    <div className={clsx("space-y-3 rounded-sm p-3 ring-1 ring-line", !account.enabled && "opacity-60")}>
+      {head}
+      {kind}
+      {ownedBy}
+      <p className="text-fg-3">{t("accountStatus.progress", doneCount(status))}</p>
+      <ol data-part="account-steps">
+        <Step n={1} item={status[0]} title={t("accountStatus.step.connect")}>
+          {connection}
+        </Step>
+        <Step n={2} item={status[1]} title={t("accountStatus.step.share")}>
+          {sharing || <p className="text-fg-3">{t("accountStatus.share.installationHint")}</p>}
+        </Step>
+        <Step n={3} item={status[2]} title={t("accountStatus.step.projects")}>
+          <p className="text-fg-3">{t(account.owner_id == null ? "accountStatus.projects.installationHint" : "accountStatus.projects.ownHint")}</p>
+        </Step>
+        <Step n={4} item={status[3]} title={status[3].label ?? t("accountStatus.step.limits")} last>
+          <p className="text-fg-3">{t("accountStatus.use.hint")}</p>
+        </Step>
+      </ol>
     </div>
   );
 }

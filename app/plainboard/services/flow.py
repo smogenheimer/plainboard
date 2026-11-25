@@ -23,6 +23,8 @@ from ..models import (
     JobStatus,
     Landing,
     LandingStatus,
+    Promotion,
+    PromotionStatus,
     Repository,
     Run,
     RunStatus,
@@ -33,6 +35,7 @@ from ..models import (
 )
 from ..schemas import FlowBranch, FlowHistory, FlowHistoryItem, FlowJob, FlowLive, FlowRepair, FlowRepo, FlowStep, FlowTicketBranch, FlowTrain, FlowWork
 from . import landings as landing_service
+from . import promotions as promotion_service
 
 TYPICAL_OF = 5  # the median of this many of the latest check runs that landed
 RECENTLY_LANDED = 5  # per repository
@@ -56,6 +59,8 @@ def _branch(landing: Landing, numbers: dict[int, int]) -> FlowBranch:
         task_id=landing.task_id, task_number=numbers.get(landing.task_id or 0), status=PHASE[landing.status],  # type: ignore[arg-type]
         train_id=landing.train_id, failures=landing.failures, since=landing.updated_at, merged_at=landing.merged_at,
         conflict_files=list(landing.conflict_files or []),
+        held=landing.hold if landing.hold in ("message", "manager") and landing.status in (LandingStatus.WAITING, LandingStatus.TRAIN, LandingStatus.BACK) else None,
+        held_reason=landing.hold_reason or "",
     )  # fmt: skip
 
 
@@ -141,12 +146,13 @@ async def live(session: AsyncSession, project_id: int) -> FlowLive:
         now=utcnow(),
         repositories=[
             FlowRepo(id=r.id, name=r.name, base=r.default_branch or "", land_first=r.land_first, typical_check_seconds=typical.get(r.id),
-                     check_target_seconds=r.check_target_seconds, red=r.id in red)
+                     check_target_seconds=r.check_target_seconds, red=r.id in red, release=r.release_branch or "")
             for r in repos
         ],  # fmt: skip
         work=list(work.values()),
         branches=[_branch(landing, numbers) for landing in landings],
         trains=[_train(t, members.get(t.id, [])) for t in trains],
+        promotions=[promotion_service.out(p) for p in await promotion_service.latest(session, project_id)] if any(r.release_branch for r in repos) else [],
     )
 
 
@@ -210,32 +216,44 @@ async def of_ticket(session: AsyncSession, task_id: int) -> list[FlowTicketBranc
     if not landings:
         return []
     numbers = await _numbers(session, {task_id})
-    trains = {t.id: t for t in await session.scalars(select(Train).where(Train.id.in_([x.train_id for x in landings if x.train_id])))}
+    # A branch a repair branch carries (landings.carry) goes that one's way: its checks and landing are the carrier's.
+    carriers = {c.id: c for c in await session.scalars(select(Landing).where(Landing.id.in_([x.carried_by for x in landings if x.carried_by and x.status == LandingStatus.CLOSED])))}
+    trains = {t.id: t for t in await session.scalars(select(Train).where(Train.id.in_([x.train_id for x in (*landings, *carriers.values()) if x.train_id])))}
     repos = {r.id: r.name for r in await session.scalars(select(Repository).where(Repository.id.in_({x.repository_id for x in landings})))}
     events: dict[int, list[FlowEvent]] = {}
     for e in await session.scalars(select(FlowEvent).where(FlowEvent.landing_id.in_([x.id for x in landings]), FlowEvent.kind.in_(("landing.back", "landing.stuck"))).order_by(FlowEvent.id)):
         events.setdefault(e.landing_id or 0, []).append(e)
+    released = await promotion_service.of_landings(session, [i for x in landings for i in (x.id, x.carried_by) if i])
     out = []
     for landing in landings:
-        train = trains.get(landing.train_id or 0)
+        carrier = carriers.get(landing.carried_by or 0) if landing.status == LandingStatus.CLOSED else None
+        way = carrier or landing
+        train = trains.get(way.train_id or 0)
         steps = [FlowStep(key="handed", state="done", at=landing.created_at)]
         back = [e for e in events.get(landing.id, []) if e.kind == "landing.back"]
         for i, e in enumerate(back):
             steps.append(FlowStep(key="failed", state="done", at=e.at, detail=str(e.data.get("why", ""))[:200]))
             steps.append(FlowStep(key="repair", state="now" if landing.status == LandingStatus.BACK and i == len(back) - 1 else "done"))
-        status = landing.status
+        status = way.status
         if status == LandingStatus.STUCK:
             steps.append(FlowStep(key="stuck", state="now", at=next((e.at for e in reversed(events.get(landing.id, [])) if e.kind == "landing.stuck"), None)))
         elif train is not None and train.direct and status == LandingStatus.MERGED:
-            steps.append(FlowStep(key="landed", state="done", at=landing.merged_at))
+            steps.append(FlowStep(key="landed", state="done", at=way.merged_at))
             steps.append(FlowStep(key="checking", state="done" if train.status != TrainStatus.CHECKING else "now", at=train.created_at))
         elif status == LandingStatus.MERGED:
             steps.append(FlowStep(key="checking", state="done", at=train.finished_at if train else None))
-            steps.append(FlowStep(key="landed", state="done", at=landing.merged_at))
+            steps.append(FlowStep(key="landed", state="done", at=way.merged_at))
         else:
             steps.append(FlowStep(key="checking", state="now" if status == LandingStatus.TRAIN else "todo", at=train.created_at if train and status == LandingStatus.TRAIN else None))
             steps.append(FlowStep(key="landed", state="todo"))
-        out.append(FlowTicketBranch(branch=_branch(landing, numbers), repository=repos.get(landing.repository_id, ""), train=_train(train, [landing.branch]) if train else None, steps=steps))
+        if status == LandingStatus.MERGED and (promotion := released.get(way.id)):
+            done = promotion.status == PromotionStatus.PROMOTED
+            steps.append(FlowStep(key="released", state="done" if done else "now", at=promotion.finished_at, detail=promotion.release + (f" ({promotion.tag})" if promotion.tag else "") + ("" if done else f": {promotion.url}")))
+        branch = _branch(landing, numbers)
+        if carrier is not None:
+            shown = _branch(carrier, numbers)
+            branch = branch.model_copy(update={"title": carrier.title, "status": shown.status, "train_id": carrier.train_id, "merged_at": carrier.merged_at, "held": shown.held, "held_reason": shown.held_reason})
+        out.append(FlowTicketBranch(branch=branch, repository=repos.get(landing.repository_id, ""), train=_train(train, [way.branch]) if train else None, steps=steps))
     return out
 
 
@@ -245,7 +263,7 @@ async def of_ticket(session: AsyncSession, task_id: int) -> list[FlowTicketBranc
 @event.listens_for(Session, "before_flush")
 def _note_changes(session: Session, _ctx, _instances) -> None:  # noqa: ANN001
     for obj in (*session.new, *session.dirty, *session.deleted):
-        if isinstance(obj, (Landing, Train, Job)) or (isinstance(obj, FlowEvent) and obj in session.new and obj.kind in ("branches.tidied", "landing.stuck")):
+        if isinstance(obj, (Landing, Train, Job, Promotion)) or (isinstance(obj, FlowEvent) and obj in session.new and obj.kind in ("branches.tidied", "landing.stuck")):
             session.info.setdefault("flow_projects", set()).add(obj.project_id)
 
 

@@ -200,39 +200,46 @@ async function copyText(text: string) {
 const hastText = (node: { value?: string; children?: unknown[] }): string =>
   node.value ?? (node.children as { value?: string; children?: unknown[] }[] | undefined)?.map(hastText).join("") ?? "";
 
-/** A fenced code block with a copy button in its top-right corner (on hover where there is one, else always). */
-export function CodeBlock({ text, children, alwaysCopy }: { text: string; children: ReactNode; alwaysCopy?: boolean }) {
+/** A small copy button: a copy icon that turns into a check for a moment once the text is copied. */
+export function CopyButton({ text, className }: { text: string; className?: string }) {
   const { t } = useTranslation();
   const [copied, setCopied] = useState(false);
   const timer = useRef<number>(undefined);
   useEffect(() => () => window.clearTimeout(timer.current), []);
   const label = t(copied ? "common.copied" : "common.copy");
   return (
+    <button
+      type="button"
+      title={label}
+      aria-label={label}
+      onClick={async () => {
+        await copyText(text);
+        setCopied(true);
+        window.clearTimeout(timer.current);
+        timer.current = window.setTimeout(() => setCopied(false), 1500);
+      }}
+      className={clsx("inline-flex size-7 shrink-0 items-center justify-center rounded-sm text-fg-3 hover:bg-line hover:text-fg focus-visible:opacity-100", className)}
+    >
+      {copied ? <Check className="size-4 text-ok" /> : <Copy className="size-4" />}
+      <span role="status" className="sr-only">
+        {copied ? label : ""}
+      </span>
+    </button>
+  );
+}
+
+/** A fenced code block with a copy button in its top-right corner (on hover where there is one, else always). */
+export function CodeBlock({ text, children, alwaysCopy }: { text: string; children: ReactNode; alwaysCopy?: boolean }) {
+  return (
     <div className="group/code relative my-2">
       {/* Right padding keeps the button off the text. */}
       <pre style={{ margin: 0, paddingRight: "2.5rem" }} className="scroll-thin">
         {children}
       </pre>
-      <button
-        type="button"
-        title={label}
-        aria-label={label}
-        onClick={async () => {
-          await copyText(text);
-          setCopied(true);
-          window.clearTimeout(timer.current);
-          timer.current = window.setTimeout(() => setCopied(false), 1500);
-        }}
-        className={clsx(
-          "absolute top-1.5 right-1.5 inline-flex size-7 items-center justify-center rounded-sm text-fg-3 hover:bg-line hover:text-fg focus-visible:opacity-100",
-          !alwaysCopy && "[@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/code:opacity-100",
-        )}
-      >
-        {copied ? <Check className="size-4 text-ok" /> : <Copy className="size-4" />}
-        <span role="status" className="sr-only">
-          {copied ? label : ""}
-        </span>
-      </button>
+      <CopyButton
+        text={text}
+        className={clsx("absolute top-1.5 right-1.5 bg-sunk", !alwaysCopy && "[@media(hover:hover)]:opacity-0 [@media(hover:hover)]:group-hover/code:opacity-100")}
+      />
     </div>
   );
 }

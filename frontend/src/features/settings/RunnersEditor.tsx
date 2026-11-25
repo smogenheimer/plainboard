@@ -4,6 +4,7 @@ import { Check, ChevronRight, KeyRound, Pencil, Plus, Server, Trash2 } from "luc
 import { useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../api/client";
+import { useMeta } from "../../api/queries";
 import type { RunnerCreated, RunnerInfo } from "../../api/types";
 import { Button, ErrorText, IconButton, Input, Spinner } from "../../components/ui";
 import { CodeBlock } from "../../components/Markdown";
@@ -48,6 +49,7 @@ export function RunnersEditor() {
   const { t } = useTranslation();
   const qc = useQueryClient();
   const [created, setCreated] = useState<RunnerCreated | null>(null);
+  const runnerTag = useMeta().data?.runner_tag ?? "latest";
   const runners = useQuery({
     queryKey: KEY,
     queryFn: () => api.get<RunnerInfo[]>("/runners"),
@@ -136,7 +138,7 @@ export function RunnersEditor() {
                       ` · ${t("runners.restartsIn", { minutes: Math.max(1, Math.ceil((new Date(r.restart_by).getTime() - Date.now()) / 60000)) })}`}
                   </div>
                 ) : (
-                  !r.version_ok && <div className="text-you-fg">{t("runners.versionMismatch")}</div>
+                  !r.version_ok && <div className="text-you-fg">{t("runners.versionMismatch", { tag: runnerTag })}</div>
                 )}
                 <div className="text-fg-3 [overflow-wrap:anywhere]">{r.projects.length ? t("runners.projects", { names: r.projects.join(", ") }) : t("runners.noProjects")}</div>
               </div>
@@ -233,7 +235,7 @@ export function RunnersEditor() {
               {connected && (
                 <div className="space-y-2">
                   <p className="text-fg-2">{t("runners.stepChooseHint")}</p>
-                  <p className="text-fg-3">{t("runners.updateHint")}</p>
+                  <p className="text-fg-3">{t("runners.updateHint", { tag: runnerTag })}</p>
                   <Code text={UPDATE} />
                   <Button size="md" onClick={() => setCreated(null)}>
                     {t("runners.addAnother")}

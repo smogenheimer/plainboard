@@ -5,7 +5,7 @@ changed since its cursor (the first time: everything, in batches, which is the b
 those chunks up to date (unchanged text keeps its vector) and then embeds what waits, newest first,
 for at most ``EMBED_SECONDS`` a look, in small transactions. The model runs in its own thread at lowered
 priority (``services/search/embedding.py``): requests and agent turns go on meanwhile. While there is
-more it goes on after a short pause, else it waits for the next look. Commits come from the runner
+more it goes on after a short pause, else it waits for the next look. Text files attached to tickets are read a few at a time in a thread (``indexers.Files``). Commits come from the runner
 (``/git/log``), per repository from its last indexed commit, at most every ``COMMITS_EVERY``, and its older
 history page by page down to the root (``OLDER_EVERY``). Every
 ``SWEEP_EVERY`` what was deleted at its source leaves the index (deleting it already did, through the
@@ -118,12 +118,13 @@ class SearchIndexer:
         while pending and time.monotonic() - started < INDEX_SECONDS:
             for indexer in list(pending):
                 cursor = await self._cursor(s, project.id, indexer.kind)
-                items = await indexer.changed(s, project.id, cursor.value, BATCH)
+                batch = indexer.batch or BATCH
+                items = await indexer.changed(s, project.id, cursor.value, batch)
                 if items:
                     changed += await store.put(s, project.id, project.name, indexer.kind, [(source_id, doc) for _, source_id, doc in items])
                     cursor.value = items[-1][0]
                 await s.commit()
-                if len(items) < BATCH:
+                if len(items) < batch:
                     pending.remove(indexer)
         return changed, bool(pending)
 

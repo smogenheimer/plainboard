@@ -181,7 +181,7 @@ def tool(description: str, read: bool = True):  # noqa: ANN201
 @tool("Your projects: id, slug, name, your role.")
 async def list_projects() -> str:
     rows = await api("GET", "/api/projects")
-    return "\n".join(f"{p['id']} {p['slug']} | {p['name']} | {p.get('role') or 'admin'}" + (" (paused)" if p.get("paused_at") else "") for p in rows) or "No projects."
+    return "\n".join(f"{p['id']} {p['slug']} | {p['name']} | {p.get('role') or 'admin'}" + (" (paused)" if p.get("paused_at") or p.get("limit_paused_at") else "") for p in rows) or "No projects."
 
 
 @tool("Ticket counts per status plus all open tickets.")
@@ -479,11 +479,11 @@ async def list_schedules(project: ProjectRef) -> str:
     ) or "No schedules."
 
 
-@tool("Search the project's history by meaning and keywords: tickets, reports, decisions, comments, notes, commits.")
+@tool("Search the project's history by meaning and keywords: tickets, reports, decisions, comments, notes, commits, files of tickets.")
 async def search_history(
     project: ProjectRef,
     query: Annotated[str, Field(min_length=2, max_length=500)],
-    kinds: list[Literal["ticket", "report", "decision", "comment", "note", "commit"]] | None = None,
+    kinds: list[Literal["ticket", "report", "decision", "comment", "note", "commit", "file"]] | None = None,
     limit: Annotated[int, Field(ge=1, le=20)] = 8,
 ) -> str:
     async with sessionmaker()() as session:
@@ -514,6 +514,8 @@ async def get_attachment(attachment_id: int) -> str:
         attachment = await board_service.get_attachment(session, attachment_id)
         _project_of_call.set(attachment.project_id)
     head = f"{attachment.filename} ({attachment.content_type or 'unknown type'}, {attachment.size} bytes)"
+    if attachment.purged_at is not None:
+        return f"{head}: {board_service.purged_text(attachment)}"
     path = board_service.storage_path(attachment)
     textual = (attachment.content_type or mimetypes.guess_type(attachment.filename)[0] or "").startswith(("text/", "application/json")) or attachment.filename.endswith((".md", ".txt", ".log", ".csv", ".json", ".yaml", ".yml"))
     if textual and attachment.size <= TEXT_INLINE and path.exists():

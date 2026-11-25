@@ -142,7 +142,7 @@ async def list_models(ctx: ToolContext, _args) -> str:
 
 @tool("list_agents", "List the team: slug, role, model, status and area.")
 async def list_agents(ctx: ToolContext, _args) -> str:
-    agents = await agent_service.list_for_project(ctx.session, ctx.project.id)
+    agents = await agent_service.list_for_project(ctx.session, ctx.project.id, doc_agents=False)
     outs = await agent_service.to_out(ctx.session, agents)
     repos = await repo_service.list_for_project(ctx.session, ctx.project.id)
     names = {a.id: ", ".join(r.name for r in repo_service.accessible(a, repos)) for a in agents}
@@ -164,7 +164,7 @@ async def get_agent(ctx: ToolContext, args: AgentRef) -> str:
 async def create_agent(ctx: ToolContext, args: CreateAgentArgs) -> str:
     agent = await agent_service.create(ctx.session, ctx.project.id, AgentCreate(**args.model_dump(exclude={"repositories"})), catalog=await _catalog(ctx, args.provider))
     access = await apply_repo_access(ctx, agent, args.repositories) if args.repositories is not None else "all repositories"
-    members = len([a for a in await agent_service.list_for_project(ctx.session, ctx.project.id) if not a.is_manager])
+    members = len([a for a in await agent_service.list_for_project(ctx.session, ctx.project.id, doc_agents=False) if not a.is_manager])
     crowded = " Each member starts without context and adds handovers: keep the team to those whose area nobody else covers." if members > 4 else ""
     return f"Created agent {agent.slug} ({agent.model}; {access}). The team now has {members} members.{crowded}"
 

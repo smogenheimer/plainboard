@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import BinaryIO
 
 from sqlalchemy import event, func, inspect, or_, select, update
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, aliased
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from ..config import get_config
@@ -25,6 +25,7 @@ from ..models import (
     Comment,
     Decision,
     DecisionStatus,
+    Idea,
     Job,
     JobStatus,
     Landing,
@@ -219,20 +220,31 @@ async def unmarked_in_review(session: AsyncSession, project_id: int) -> list[Tas
     return [t for t in tasks if t.id not in asked]
 
 
-async def accept_reviews(session: AsyncSession) -> int:
-    """Moves tickets to done that lay in review unchanged for the project's review_days. Tickets that
-    wait for the user (user action, open question) or are being worked on stay."""
-    accepted = 0
-    for project in (await session.scalars(select(Project).where(Project.review_days > 0))).all():
-        cutoff = utcnow() - timedelta(days=project.review_days)
+async def stale_reviews(session: AsyncSession) -> list[tuple[Project, Agent, list[Task]]]:
+    """Tickets that lay in review unchanged for their project's review_days, per project with its manager,
+    who decides what happens to them. Each comes once per stale period: again only after another
+    review_days. Tickets that wait for the user (user action, open question) or are being worked on stay
+    out, as do projects without a manager and paused ones."""
+    stale = []
+    for project in (await session.scalars(select(Project).where(Project.review_days > 0, Project.paused_at.is_(None)))).all():
+        manager = await session.scalar(select(Agent).where(Agent.project_id == project.id, Agent.is_manager.is_(True)))
+        if manager is None:
+            continue
+        now = utcnow()
+        cutoff = now - timedelta(days=project.review_days)
         working = set(await session.scalars(select(Run.task_id).where(Run.project_id == project.id, Run.status.in_(ACTIVE_RUN_STATUSES))))
-        for task in await unmarked_in_review(session, project.id):
-            if task.updated_at >= cutoff or task.id in working:
-                continue
-            await _apply_update(session, task, {"status": TaskStatus.DONE})
-            await add_comment(session, task, f"Moved to done automatically: {project.review_days} days in review without a change.", author_kind="system")
-            accepted += 1
-    return accepted
+        tasks = [
+            t
+            for t in await unmarked_in_review(session, project.id)
+            if t.updated_at < cutoff and t.id not in working and (t.review_handed_at is None or t.review_handed_at < cutoff)
+        ]
+        if not tasks:
+            continue
+        # Handing it over is no change to the ticket: updated_at stays.
+        await session.execute(update(Task).where(Task.id.in_([t.id for t in tasks])).values(review_handed_at=now, updated_at=Task.updated_at))
+        await session.commit()
+        stale.append((project, manager, tasks))
+    return stale
 
 
 async def finish_user_action(session: AsyncSession, task: Task, note: str = "", author_name: str | None = None) -> str:
@@ -306,6 +318,7 @@ async def untouched(session: AsyncSession, project_id: int, statuses: tuple[str,
         # An assignment stays open while it waits for its jobs, a branch is in flight until it has landed.
         *await session.scalars(select(Assignment.task_id).where(Assignment.project_id == project_id, Assignment.status.in_(OPEN_ASSIGNMENT_STATUSES))),
         *await session.scalars(select(Landing.task_id).where(Landing.project_id == project_id, Landing.status.in_(LANDING_IN_FLIGHT))),
+        *(task_id for task_id, _, _ in await carried(session, project_id=project_id)),
     }
     return [t for t in tasks if t.id not in busy]
 
@@ -346,7 +359,7 @@ async def capacity(
     open_assignment = set(await session.scalars(select(Assignment.agent_id).where(Assignment.status == AssignmentStatus.RUNNING)))
     # A member that waits for its own job takes no slot, and its next assignment waits for that job, not for a slot.
     queued = {agent_id for agent_id, status, _project in rows if status == RunStatus.QUEUED and (agent_id in running or agent_id not in open_assignment)}
-    team = list(await session.scalars(select(Agent).where(Agent.project_id == project_id, Agent.enabled, ~Agent.is_manager).order_by(Agent.id)))
+    team = list(await session.scalars(select(Agent).where(Agent.project_id == project_id, Agent.enabled, ~Agent.is_manager, Agent.doc_site_id.is_(None)).order_by(Agent.id)))
     active = {agent_id for agent_id, _status, project in rows if project == project_id}
     columns = (TaskStatus.TODO, TaskStatus.IN_PROGRESS, *((TaskStatus.BACKLOG,) if backlog else ()))
     open_tickets = select(Task.id).where(Task.project_id == project_id, Task.archived_at.is_(None), Task.status.in_(columns))
@@ -414,7 +427,18 @@ async def in_flight(session: AsyncSession, project_id: int, now: datetime | None
             state = f"being checked with {train.size - 1} other branch{'es' if train.size != 2 else ''} ({age(train.created_at)})" if train.size > 1 else f"being checked ({age(train.created_at)})"
         else:
             state = "goes on the next train"
-        lines.append(f'- Branch {truncate(landing.branch, 60)}{ticket}, {names.get(landing.agent_id or 0, "?")}: {state}; PlainBoard lands it')
+        author = names.get(landing.agent_id or 0, "?")
+        why = f" ({truncate(landing.hold_reason, 80)})" if landing.hold_reason else ""
+        if landing.hold == "manager":
+            lands = f"held by you{why}: it does not land until release_branch"
+        elif landing.hold == "message":
+            lands = f"held{why}, {age(landing.held_at or now)}: it lands once {author} hands it over again or confirms it"
+        elif landing.hold == "next":
+            lands = "handed over again: it lands with the next train, not this one"
+        else:
+            lands = "PlainBoard lands it"
+        name = truncate(landing.title, 160) if (landing.title or "").startswith(f"{landing.branch} carrying ") else truncate(landing.branch, 60)
+        lines.append(f'- Branch {name}{ticket}, {author}: {state}; {lands}')
     return lines[:IN_FLIGHT_LINES], max(len(lines) - IN_FLIGHT_LINES, 0)
 
 
@@ -486,20 +510,41 @@ async def list_tasks(
 
 
 LANDING_PHASE = {LandingStatus.WAITING: "waiting", LandingStatus.TRAIN: "checking", LandingStatus.BACK: "repairing"}
-LANDING_ORDER = ["waiting", "checking", "repairing"]  # the one shown when a ticket has several branches: the furthest from done
+LANDING_ORDER = ["waiting", "checking", "repairing", "held"]  # the one shown when a ticket has several branches: the furthest from done
+
+
+async def carried(session: AsyncSession, task_ids: list[int] | None = None, project_id: int | None = None) -> list[tuple[int, str, str]]:
+    """Tickets whose branch a repair branch carries (landings.carry) while that one is on its way:
+    (ticket id, the carrier's status, its hold). The ticket's branch is closed, the carrier has no ticket."""
+    carrier = aliased(Landing)
+    q = (
+        select(Landing.task_id, carrier.status, carrier.hold)
+        .join(carrier, carrier.id == Landing.carried_by)
+        .where(Landing.status == LandingStatus.CLOSED, Landing.task_id.is_not(None), carrier.status.in_(LANDING_IN_FLIGHT))
+    )
+    if task_ids is not None:
+        q = q.where(Landing.task_id.in_(task_ids))
+    if project_id is not None:
+        q = q.where(Landing.project_id == project_id)
+    return [(task_id, status, hold) for task_id, status, hold in (await session.execute(q)).all()]
 
 
 @event.listens_for(Session, "before_flush")
 def _note_landing_changes(session: Session, _ctx, _instances) -> None:  # noqa: ANN001
     """A branch that starts or ends landing changes what its ticket's card shows: remember the ticket until the commit."""
     for obj in (*session.new, *session.dirty):
-        if isinstance(obj, Landing) and obj.task_id and (obj in session.new or inspect(obj).attrs.status.history.has_changes()):
+        if not isinstance(obj, Landing) or not (obj in session.new or inspect(obj).attrs.status.history.has_changes() or inspect(obj).attrs.hold.history.has_changes()):
+            continue
+        if obj.task_id:
             session.info.setdefault("landing_tasks", set()).add(obj.task_id)
+        if obj.id:  # the tickets of the branches it carries show its way
+            session.info.setdefault("landing_carriers", set()).add(obj.id)
 
 
 @event.listens_for(Session, "after_rollback")
 def _forget_landing_changes(session: Session) -> None:
     session.info.pop("landing_tasks", None)
+    session.info.pop("landing_carriers", None)
 
 
 _publishing: set[asyncio.Task] = set()
@@ -508,17 +553,21 @@ _publishing: set[asyncio.Task] = set()
 @event.listens_for(Session, "after_commit")
 def _publish_landing_changes(session: Session) -> None:
     ids = session.info.pop("landing_tasks", None)
-    if ids:
-        job = asyncio.get_running_loop().create_task(_publish_tasks(sorted(ids)))
+    carriers = session.info.pop("landing_carriers", None)
+    if ids or carriers:
+        job = asyncio.get_running_loop().create_task(_publish_tasks(sorted(ids or ()), sorted(carriers or ())))
         _publishing.add(job)
         job.add_done_callback(_publishing.discard)
 
 
-async def _publish_tasks(ids: list[int]) -> None:
+async def _publish_tasks(ids: list[int], carriers: list[int] = ()) -> None:  # type: ignore[assignment]
     from ..db import sessionmaker
 
     try:
         async with sessionmaker()() as session:
+            if carriers:
+                q = select(Landing.task_id).where(Landing.carried_by.in_(carriers), Landing.task_id.is_not(None))
+                ids = sorted({*ids, *await session.scalars(q)})
             for task_id in ids:
                 await publish_task_id(session, task_id)
     except Exception:  # noqa: BLE001 - a missed card refresh must not break the landing
@@ -551,10 +600,10 @@ async def task_outs(session: AsyncSession, tasks: list[Task]) -> list[TaskOut]:
         ).all()
     )
     landing: dict[int, str] = {}
-    for task_id, status in (
-        await session.execute(select(Landing.task_id, Landing.status).where(Landing.task_id.in_(ids), Landing.status.in_(LANDING_IN_FLIGHT)))
-    ).all():
-        landing[task_id] = max(landing.get(task_id, "waiting"), LANDING_PHASE[status], key=LANDING_ORDER.index)
+    own = (await session.execute(select(Landing.task_id, Landing.status, Landing.hold).where(Landing.task_id.in_(ids), Landing.status.in_(LANDING_IN_FLIGHT)))).all()
+    for task_id, status, hold in (*own, *await carried(session, ids)):  # a branch a repair branch carries shows that one's way
+        phase = "held" if hold in ("message", "manager") else LANDING_PHASE[status]
+        landing[task_id] = max(landing.get(task_id, "waiting"), phase, key=LANDING_ORDER.index)
     out = []
     for task in tasks:
         item = TaskOut.model_validate(task)
@@ -655,6 +704,13 @@ def runner_path(attachment: Attachment) -> str:
     return f"{get_config().runner_uploads_dir}/{attachment.storage_name}"
 
 
+def purged_text(attachment: Attachment) -> str:
+    """An attachment whose file the project's retention deleted (services/retention.py)."""
+    from ..orchestration.prompts import _purged
+
+    return _purged(attachment).capitalize()
+
+
 def _remove_file(attachment: Attachment) -> None:
     storage_path(attachment).unlink(missing_ok=True)
 
@@ -718,6 +774,8 @@ async def store_attachment(
     data: bytes | BinaryIO,
     *,
     task_id: int | None = None,
+    idea_id: int | None = None,
+    doc_site_id: int | None = None,
     agent_id: int | None = None,
 ) -> Attachment:
     """``data``: the content, or a file to read it from (an upload: never read whole into memory)."""
@@ -726,6 +784,8 @@ async def store_attachment(
     attachment = Attachment(
         project_id=project_id,
         task_id=task_id,
+        idea_id=idea_id,
+        doc_site_id=doc_site_id,
         filename=Path(filename).name[:300] or "file",
         content_type=content_type or "application/octet-stream",
         storage_name=f"{uuid.uuid4().hex}{suffix}",
@@ -754,7 +814,7 @@ async def list_attachments(session: AsyncSession, task_id: int) -> list[Attachme
 
 async def chat_attachments(session: AsyncSession, project_id: int, ids: list[int]) -> list[Attachment]:
     """Files of a chat message (they belong to the project, not to a ticket)."""
-    q = select(Attachment).where(Attachment.project_id == project_id, Attachment.task_id.is_(None), Attachment.id.in_(ids))
+    q = select(Attachment).where(Attachment.project_id == project_id, Attachment.task_id.is_(None), Attachment.idea_id.is_(None), Attachment.doc_site_id.is_(None), Attachment.id.in_(ids))
     return list((await session.scalars(q.order_by(Attachment.id))).all())
 
 
@@ -763,6 +823,8 @@ async def project_attachments(session: AsyncSession, project_id: int, ids: list[
     found = {a.id: a for a in await session.scalars(select(Attachment).where(Attachment.project_id == project_id, Attachment.id.in_(ids)))}
     if missing := [i for i in ids if i not in found]:
         raise NotFound(f"Unknown attachment: {', '.join(map(str, missing))}")
+    if gone := [i for i in ids if found[i].purged_at is not None]:
+        raise ServiceError(f"File deleted by the retention: {', '.join(map(str, gone))}")
     return [found[i] for i in dict.fromkeys(ids)]
 
 
@@ -774,12 +836,17 @@ async def get_attachment(session: AsyncSession, attachment_id: int) -> Attachmen
 
 
 async def delete_attachment(session: AsyncSession, attachment: Attachment) -> None:
-    project_id, attachment_id, task_id = attachment.project_id, attachment.id, attachment.task_id
+    project_id, attachment_id, task_id, idea_id = attachment.project_id, attachment.id, attachment.task_id, attachment.idea_id
     _remove_file(attachment)
     await session.delete(attachment)
     await session.commit()
-    bus.publish(project_id, "attachment.deleted", {"id": attachment_id, "task_id": task_id})
+    bus.publish(project_id, "attachment.deleted", {"id": attachment_id, "task_id": task_id, "idea_id": idea_id})
     await publish_task_id(session, task_id)
+    if idea_id is not None:
+        from . import ideas as idea_service
+
+        if (idea := await session.get(Idea, idea_id)) is not None:
+            await idea_service.publish(session, project_id, [idea])
 
 
 async def list_decisions(session: AsyncSession, task_id: int) -> list[Decision]:

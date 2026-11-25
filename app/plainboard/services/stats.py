@@ -10,8 +10,8 @@ from statistics import median
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ..models import Account, Agent, Assignment, Landing, TrainStatus, AssignmentStatus, Comment, Conversation, FlowEvent, InboxItem, Message, Run, RunStatus, Task, TaskStatus, TaskTransition, Train, utcnow
-from ..schemas import StatsAgent, StatsDay, StatsOut, StatsPeriod, StatsVersion
+from ..models import Account, Agent, Assignment, Landing, TrainStatus, AssignmentStatus, Comment, Conversation, FlowEvent, InboxItem, Message, Project, Run, RunStatus, Task, TaskStatus, TaskTransition, Train, utcnow
+from ..schemas import StatsAgent, StatsDay, StatsOut, StatsPeriod, StatsVersion, TokenProject, TokenUsageOut
 from . import version as version_service
 from . import timing
 
@@ -291,3 +291,40 @@ async def work_report(session: AsyncSession, project_id: int, days: int = 14) ->
             for key, item in by_account.items()
         ],
     }
+
+
+async def tokens(session: AsyncSession, project_ids: set[int] | None, days: int = 30, now: datetime | None = None) -> TokenUsageOut:
+    """Tokens and cost of these projects (None: all) per day and in total, to compare them (Settings, Usage)."""
+    today = (now or utcnow()).date()
+    since = datetime.combine(today - timedelta(days=days - 1), datetime.min.time())
+    dates = [(today - timedelta(days=n)).isoformat() for n in range(days - 1, -1, -1)]
+    index = {d: i for i, d in enumerate(dates)}
+    query = select(Project.id, Project.name)
+    if project_ids is not None:
+        query = query.where(Project.id.in_(project_ids or {-1}))
+    out = {pid: TokenProject(id=pid, name=name, tokens=[0] * days, costs=[0.0] * days) for pid, name in await session.execute(query)}
+    if not out:
+        return TokenUsageOut(days=dates, projects=[])
+    rows = await session.execute(
+        select(Run.project_id, Run.created_at, Run.input_tokens, Run.output_tokens, Run.cache_read_tokens, Run.cache_creation_tokens, Run.cost_usd).where(
+            Run.created_at >= since, Run.project_id.in_(list(out))
+        )
+    )
+    for pid, created_at, inp, outp, cache_read, cache_creation, cost in rows:
+        item, day = out[pid], index.get(created_at.date().isoformat())
+        if day is None:
+            continue
+        item.runs += 1
+        item.input_tokens += inp or 0
+        item.output_tokens += outp or 0
+        item.cache_read_tokens += cache_read or 0
+        item.cache_creation_tokens += cache_creation or 0
+        item.cost_usd += cost or 0.0
+        item.tokens[day] += (inp or 0) + (outp or 0)
+        item.costs[day] += cost or 0.0
+    projects = [p for p in out.values() if p.runs]
+    for p in projects:
+        p.cost_usd = round(p.cost_usd, 4)
+        p.costs = [round(c, 4) for c in p.costs]
+    projects.sort(key=lambda p: (-p.cost_usd, -(p.input_tokens + p.output_tokens), p.name.lower()))
+    return TokenUsageOut(days=dates, projects=projects)

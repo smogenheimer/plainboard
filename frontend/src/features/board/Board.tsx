@@ -14,17 +14,19 @@ import {
 import { arrayMove, SortableContext, sortableKeyboardCoordinates, verticalListSortingStrategy } from "@dnd-kit/sortable";
 import { useQueryClient } from "@tanstack/react-query";
 import clsx from "clsx";
-import { Archive, ChevronDown, Plus, Search } from "lucide-react";
-import { useMemo, useState, type KeyboardEvent } from "react";
+import { Archive, Check, ChevronDown, Plus, Search } from "lucide-react";
+import { useEffect, useMemo, useRef, useState, type KeyboardEvent } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../api/client";
 import { qk, useTasks } from "../../api/queries";
 import type { Task, TaskStatus } from "../../api/types";
 import { Button, ChatPanelToggle, IconButton, Input, Spinner } from "../../components/ui";
-import { useMediaQuery, useStored } from "../../lib/hooks";
+import { useAutoGrow, useMediaQuery, useStored } from "../../lib/hooks";
 import { useShell } from "../layout/shell-context";
 import { ArchiveDialog } from "./ArchiveDialog";
 import { TaskCard } from "./TaskCard";
+import { TicketRequestDialog } from "./TicketRequestDialog";
+import { useTicketFilter } from "./ticketFilter";
 
 export const STATUSES: TaskStatus[] = ["backlog", "todo", "in_progress", "review", "done"];
 
@@ -33,9 +35,18 @@ const columnKey = (s: TaskStatus) => `c-${s}`;
 
 export function Board() {
   const { t } = useTranslation();
-  const { project, canWrite } = useShell();
+  const { project, canWrite, agents } = useShell();
   const qc = useQueryClient();
   const tasks = useTasks(project.id);
+  // With a manager, "Add ticket" hands a described wish to it; without one, a title goes into the Backlog.
+  const manager = agents.find((a) => a.is_manager && a.enabled);
+  const [requesting, setRequesting] = useState(false);
+  const [handedOver, setHandedOver] = useState(false);
+  useEffect(() => {
+    if (!handedOver) return;
+    const timer = window.setTimeout(() => setHandedOver(false), 5000);
+    return () => window.clearTimeout(timer);
+  }, [handedOver]);
   // Side by side from here; below, the statuses stack and can be folded.
   const columnsLayout = useMediaQuery("(min-width: 768px)");
   const [shut, setShut] = useStored<TaskStatus[]>("plainboard.boardShut", ["backlog", "done"]);
@@ -50,20 +61,13 @@ export function Board() {
     useSensor(KeyboardSensor, { coordinateGetter: sortableKeyboardCoordinates }),
   );
 
+  const { matches: visible } = useTicketFilter(project.id, filter, tasks.data);
   const columns = useMemo(() => {
-    const needle = filter.trim().toLowerCase();
-    const visible = (tasks.data ?? []).filter(
-      (task) =>
-        !needle ||
-        task.title.toLowerCase().includes(needle) ||
-        `#${task.number}` === needle ||
-        task.labels.some((l) => l.toLowerCase().includes(needle)),
-    );
     const byStatus = Object.fromEntries(STATUSES.map((s) => [s, [] as Task[]])) as Record<TaskStatus, Task[]>;
     for (const task of visible) byStatus[task.status]?.push(task);
     for (const s of STATUSES) byStatus[s].sort((a, b) => a.position - b.position);
     return byStatus;
-  }, [tasks.data, filter]);
+  }, [visible]);
 
   const findTask = (key: string | number) => tasks.data?.find((task) => taskKey(task.id) === key);
 
@@ -126,13 +130,31 @@ export function Board() {
           <span className="label-line max-sm:hidden">{t("archive.title")}</span>
         </Button>
         {canWrite && (
-          <Button variant="primary" className="max-sm:w-11 max-sm:px-0" icon={<Plus className="size-4" />} aria-label={t("board.addTicket")} onClick={() => setAdding("backlog")}>
+          <Button variant="primary" className="max-sm:w-11 max-sm:px-0" icon={<Plus className="size-4" />} aria-label={t("board.addTicket")} onClick={() => (manager ? setRequesting(true) : setAdding("backlog"))}>
             <span className="label-line max-sm:hidden">{t("board.addTicket")}</span>
           </Button>
         )}
         <ChatPanelToggle where="view" divider />
       </div>
       {archiveOpen && <ArchiveDialog onClose={() => setArchiveOpen(false)} />}
+      {requesting && manager && (
+        <TicketRequestDialog
+          manager={manager}
+          onClose={() => setRequesting(false)}
+          onSent={() => {
+            setRequesting(false);
+            setHandedOver(true);
+          }}
+        />
+      )}
+      {handedOver && (
+        <div role="status" data-part="ticket-request-sent" className="fixed inset-x-0 bottom-[max(1rem,env(safe-area-inset-bottom))] z-50 flex justify-center px-4 pointer-events-none">
+          <div className="pointer-events-auto flex max-w-full items-center gap-2 rounded-sm bg-bg px-3 py-2 font-medium shadow-lg ring-1 ring-line-2">
+            <Check className="size-4 shrink-0" />
+            <span className="min-w-0">{t("board.request.sent", { name: manager?.name ?? "" })}</span>
+          </div>
+        </div>
+      )}
       {empty && adding === null && <p className="mx-4 mb-3 max-w-prose text-fg-2">{t("board.hint")}</p>}
       <DndContext sensors={sensors} collisionDetection={closestCorners} onDragStart={onDragStart} onDragEnd={onDragEnd} onDragCancel={() => setActiveId(null)}>
         <div data-part="board" className="scroll-thin min-h-0 flex-1 overflow-y-auto border-t border-line md:grid md:auto-cols-[minmax(172px,1fr)] md:grid-flow-col md:grid-rows-[minmax(0,1fr)] md:overflow-x-auto md:overflow-y-hidden md:border-t md:border-line">
@@ -225,6 +247,8 @@ function NewTicket({ status, onDone }: { status: TaskStatus; onDone: () => void 
   const { project, openTask } = useShell();
   const qc = useQueryClient();
   const [title, setTitle] = useState("");
+  const field = useRef<HTMLTextAreaElement>(null);
+  useAutoGrow(field, title);
 
   const create = async (open: boolean) => {
     if (!title.trim()) return onDone();
@@ -248,6 +272,7 @@ function NewTicket({ status, onDone }: { status: TaskStatus; onDone: () => void 
   return (
     <div data-part="new-ticket" className="border-b border-line bg-sunk px-4 py-2.5 ring-2 ring-fg ring-inset md:px-2.5">
       <textarea
+        ref={field}
         autoFocus
         rows={2}
         value={title}
@@ -256,7 +281,7 @@ function NewTicket({ status, onDone }: { status: TaskStatus; onDone: () => void 
         onBlur={() => !title.trim() && onDone()}
         placeholder={t("board.newTicketPlaceholder")}
         aria-label={t("board.newTicketPlaceholder")}
-        className="block w-full resize-none bg-transparent outline-none"
+        className="scroll-thin block max-h-48 w-full resize-none bg-transparent outline-none"
       />
       <p className="text-fg-3 touch:hidden">{t("board.newTicketKeys")}</p>
     </div>

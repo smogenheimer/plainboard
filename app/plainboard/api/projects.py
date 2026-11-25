@@ -3,16 +3,16 @@ from __future__ import annotations
 import os
 import tempfile
 
-from fastapi import APIRouter, File, Form, UploadFile
+from fastapi import APIRouter, File, Form, Query, UploadFile
 from fastapi.responses import FileResponse
 from plainboard_protocol import ProviderInfo
 from sqlalchemy import select
 from starlette.background import BackgroundTask
 
 from ..events import bus
-from ..models import ACTIVE_RUN_STATUSES, ProjectRole, Run
+from ..models import ACTIVE_RUN_STATUSES, ProjectRole, Run, utcnow
 from ..orchestration.runner_client import RunnerError
-from ..schemas import AgentCreate, AgentOut, AgentUpdate, CheckOut, ExportIn, ImportOut, PreviewOut, ProjectAccountsIn, ProjectCreate, ProjectOut, ProjectUpdate, PublicApiKeyIn, PublicApiKeyOut
+from ..schemas import AgentCreate, AgentOut, AgentUpdate, CheckOut, ExportIn, ImportOut, PreviewOut, ProjectAccountBlockIn, ProjectAccountGiveIn, ProjectAccountOut, ProjectAccountsIn, ProjectCreate, ProjectOut, ProjectUpdate, PublicApiKeyIn, PublicApiKeyOut, RetentionPreviewOut
 from ..services import accounts as account_service
 from ..services import agents as agent_service
 from ..services import api_keys as api_key_service
@@ -23,6 +23,7 @@ from ..services import permissions
 from ..services import preview as preview_service
 from ..services import projects as project_service
 from ..services import repositories as repo_service
+from ..services import retention as retention_service
 from ..services import transfer as transfer_service
 from ..services.errors import ServiceError
 from ..services import users as user_service
@@ -90,11 +91,19 @@ async def update_project(project_id: int, body: ProjectUpdate, session: Session,
     return out
 
 
+@router.get("/projects/{project_id}/attachment-retention", response_model=RetentionPreviewOut)
+async def retention_preview(project_id: int, session: Session, days: int = Query(ge=0, le=3650), min_mb: int = Query(default=0, ge=0, le=100000)) -> RetentionPreviewOut:
+    """What a retention setting would delete, before it is saved."""
+    return await retention_service.preview(session, await project_service.get(session, project_id), days, min_mb, utcnow())
+
+
 @router.get("/projects/{project_id}/accounts", response_model=list[int])
-async def usable_accounts(project_id: int, session: Session) -> list[int]:
-    """The subscriptions this project's agents may run on: its own limit and what its owner may use."""
+async def usable_accounts(project_id: int, session: Session, runs: Runs) -> list[int]:
+    """The subscriptions this project's agents may run on: its own limit and what its owner may use, with a
+    working sign-in on the project's runner (``accounts.unusable``)."""
     allowed = await permissions.account_ids(session, await project_service.get(session, project_id)) or set()
-    return [a.id for a in await account_service.list_accounts(session) if a.id in allowed]
+    where = runs.runners.where(project_id)
+    return [a.id for a in await account_service.list_accounts(session) if a.id in allowed and not account_service.unusable(a, where)]
 
 
 @router.put("/projects/{project_id}/accounts", response_model=ProjectOut)
@@ -104,6 +113,30 @@ async def limit_accounts(project_id: int, body: ProjectAccountsIn, session: Sess
     out = project_service.to_out(project, await user_service.role_in(session, who.user, project_id) if who.user else None)
     bus.publish(project.id, "project.updated", project_service.to_out(project))
     return out
+
+
+@router.get("/projects/{project_id}/given-accounts", response_model=list[ProjectAccountOut])
+async def given_accounts(project_id: int, session: Session, who: Who) -> list[ProjectAccountOut]:
+    """The subscriptions members gave the project themselves (#93), and the viewer's own ones they could give it."""
+    return await account_service.given(session, await project_service.get(session, project_id), who.user)
+
+
+@router.put("/projects/{project_id}/given-accounts/{account_id}", response_model=list[ProjectAccountOut])
+async def give_account(project_id: int, account_id: int, body: ProjectAccountGiveIn, session: Session, runs: Runs, who: Who) -> list[ProjectAccountOut]:
+    """A member gives the project one of their own subscriptions, or takes it back."""
+    project = await project_service.get(session, project_id)
+    await account_service.give(session, project, await account_service.get(session, account_id), who.user, body.given)
+    runs.recheck()  # a turn waiting for a subscription may start now
+    return await account_service.given(session, project, who.user)
+
+
+@router.put("/projects/{project_id}/blocked-accounts/{account_id}", response_model=list[ProjectAccountOut])
+async def block_account(project_id: int, account_id: int, body: ProjectAccountBlockIn, session: Session, runs: Runs, who: Who) -> list[ProjectAccountOut]:
+    """The project's owner switches a subscription a member gave it off for the project, or on again."""
+    project = await project_service.get(session, project_id)
+    await account_service.block(session, project, await account_service.get(session, account_id), body.blocked)
+    runs.recheck()
+    return await account_service.given(session, project, who.user)
 
 
 @router.post("/projects/{project_id}/pause", response_model=ProjectOut)

@@ -22,6 +22,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from websockets.asyncio.client import connect
 
 from ..models import Project
+from ..services.accounts import Where
 from plainboard_protocol.tunnel import CLOSE_REFUSED, CLOSE_REPLACED
 
 from .runner_client import RunnerClient
@@ -81,6 +82,15 @@ class Runners:
 
     def connected(self, runner_id: int | None) -> bool:
         return runner_id is None or ((tunnel := self.tunnels.get(runner_id)) is not None and not tunnel.closed)
+
+    def signins(self, runner_id: int | None) -> bool:
+        """The runner takes kept sign-ins (``Credentials.login_files``); the built-in one has the app's version."""
+        return runner_id is None or "signins" in ((self.hello.get(runner_id) or {}).get("features") or [])
+
+    def where(self, project_id: int | None) -> Where:
+        """The project's runner, as far as the choice of a subscription goes."""
+        runner_id = self.runner_id(project_id)
+        return Where(runner_id=runner_id, signins=self.signins(runner_id))
 
     def ready(self, project_id: int) -> bool:
         """Turns of the project can start: its runner is there. Else they wait in the queue."""

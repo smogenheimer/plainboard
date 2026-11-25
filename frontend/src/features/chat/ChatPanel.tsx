@@ -1,6 +1,6 @@
 import { useQueryClient } from "@tanstack/react-query";
 import clsx from "clsx";
-import { ArrowUp, ChevronDown, CircleHelp, Eye, EyeOff, Loader2, Maximize2, MoreHorizontal, Paperclip, Square, Trash2, X } from "lucide-react";
+import { ArrowUp, ChevronDown, CircleHelp, Eye, EyeOff, Loader2, Maximize2, MoreHorizontal, Paperclip, Square, Trash2 } from "lucide-react";
 import { useEffect, useLayoutEffect, useRef, useState, type ClipboardEvent, type DragEvent, type KeyboardEvent } from "react";
 import { useTranslation } from "react-i18next";
 import { api, errorMessage } from "../../api/client";
@@ -9,11 +9,13 @@ import { qk, useConversation, useMe, useRuns, useSettings } from "../../api/quer
 import type { Attachment, Conversation } from "../../api/types";
 import { Avatar } from "../../components/Avatar";
 import { Markdown } from "../../components/Markdown";
+import { PendingFile } from "../../components/PendingFile";
 import { useMentionPicker, useReadMentionsOf } from "../../components/Mentions";
-import { AgentSquare, ChatPanelToggle, IconButton, Select, Spinner } from "../../components/ui";
+import { AgentSquare, ChatPanelToggle, SwitchTrack, IconButton, Select, Spinner } from "../../components/ui";
 import { formatCost, formatTokens } from "../../lib/format";
-import { useStored } from "../../lib/hooks";
+import { useAutoGrow, useDismiss, useInView, useStored } from "../../lib/hooks";
 import { useNow } from "../../lib/time";
+import { useDraft, useDraftFiles } from "../../lib/drafts";
 import { useShell } from "../layout/shell-context";
 import { AskDialog } from "./AskDialog";
 import { LimitsRing } from "./LimitsRing";
@@ -47,10 +49,15 @@ export function ChatPanel({
   const copying = useCopying(project.id);
   const people = usePeople();
   const scroller = useRef<HTMLDivElement>(null);
+  const content = useRef<HTMLDivElement>(null);
   const stickToBottom = useRef(true);
-  const [loadingOlder, setLoadingOlder] = useState(false);
+  // The row at the top of the view and its distance from the end of the content, so what changes
+  // below it (live text, new messages, a picture that loads) doesn't move what one reads.
+  const anchor = useRef<{ row: Element; fromEnd: number } | null>(null);
+  const rest = useRef(0);
+  const fetchingOlder = useRef(false);
   const [details, setDetails] = useStored<boolean>("plainboard.chatDetails", false);
-  const [files, setFiles] = useState<File[]>([]);
+  const [files, setFiles] = useDraftFiles(`chat:${agentId}`);
   const [seed, setSeed] = useState<{ text: string; n: number } | null>(null);
 
   const activeRuns = (runs.data ?? []).filter((r) => r.agent_id === agentId && (r.status === "queued" || r.status === "running"));
@@ -114,38 +121,96 @@ export function ChatPanel({
       </div>
     ));
 
-  useLayoutEffect(() => {
+  // The scroller is reversed (column-reverse): its offset counts from the end, so older messages put
+  // on top keep the view still by themselves. Only a change below the anchor row moves the view; it is
+  // measured against the content, not against the scroll offset, so a scroll whose event has not
+  // arrived yet (touch momentum) is never undone, and scrollTop is only touched when something moved.
+  const keepView = () => {
     const el = scroller.current;
-    if (el && stickToBottom.current) el.scrollTop = el.scrollHeight;
-  }, [messages.length, streaming, queued.length, agentId, activeRuns.length]);
+    const inner = content.current;
+    if (!el || !inner) return;
+    // At the end the reversed scroller keeps the end in view by itself. Setting scrollTop here would
+    // pull every scroll that starts upwards back down while it is still within reach of the end.
+    if (stickToBottom.current) {
+      anchor.current = null;
+      rest.current = 0;
+      return;
+    }
+    if (anchor.current?.row.isConnected) {
+      // Some browsers keep whole pixels only: what is left over is made up next time.
+      const moved = inner.getBoundingClientRect().bottom - anchor.current.row.getBoundingClientRect().top - anchor.current.fromEnd + rest.current;
+      rest.current = 0;
+      if (Math.abs(moved) >= 1) {
+        const before = el.scrollTop;
+        el.scrollTop = before - moved;
+        const left = moved - (before - el.scrollTop);
+        rest.current = Math.abs(left) < 1 ? left : 0;
+      } else rest.current = moved;
+    }
+    const top = el.getBoundingClientRect().top;
+    const row = Array.from(inner.querySelectorAll("[data-part]")).find((r) => r.getBoundingClientRect().bottom > top);
+    anchor.current = row ? { row, fromEnd: inner.getBoundingClientRect().bottom - row.getBoundingClientRect().top } : null;
+  };
 
+  useLayoutEffect(keepView, [messages, streaming, queued.length, agentId, activeRuns.length]);
+
+  // Heights also change on their own: pictures load, diagrams render, details open.
   useEffect(() => {
+    const inner = content.current;
+    if (!inner) return;
+    const observer = new ResizeObserver(() => keepView());
+    observer.observe(inner);
+    return () => observer.disconnect();
+  }, [!!agent]);
+
+  useLayoutEffect(() => {
     stickToBottom.current = true;
+    if (scroller.current) scroller.current.scrollTop = 0;
   }, [agentId]);
+
+  // Older messages are fetched while the reader is still a few screens below the top, page after
+  // page, so scrolling up never runs into the end of what is loaded.
+  const loadOlder = () => {
+    const el = scroller.current;
+    const conv = conversation.data;
+    if (!el || !conv?.has_more || !conv.messages.length || fetchingOlder.current) return;
+    if (el.scrollHeight - el.clientHeight + el.scrollTop > Math.max(2000, 3 * el.clientHeight)) return;
+    fetchingOlder.current = true;
+    const id = agentId;
+    const before = conv.messages[0].id;
+    api
+      .get<Conversation>(`/agents/${id}/conversation?before_id=${before}&limit=100`)
+      .then((older) =>
+        qc.setQueryData<Conversation>(qk.conversation(id), (cur) =>
+          cur && cur.messages[0]?.id === before ? { ...cur, messages: [...older.messages, ...cur.messages], has_more: older.has_more } : cur,
+        ),
+      )
+      .catch(() => undefined)
+      .finally(() => {
+        fetchingOlder.current = false;
+      });
+  };
+
+  useEffect(loadOlder, [conversation.data]);
 
   const onScroll = () => {
     const el = scroller.current;
-    if (el) stickToBottom.current = el.scrollHeight - el.scrollTop - el.clientHeight < 80;
-  };
-
-  const loadOlder = async () => {
+    if (!el) return;
+    stickToBottom.current = -el.scrollTop < 80;
+    // Back at the bottom, what was loaded far above is let go again: it comes back the same way.
     const conv = conversation.data;
-    if (!conv?.messages.length) return;
-    setLoadingOlder(true);
-    try {
-      const older = await api.get<Conversation>(`/agents/${agentId}/conversation?before_id=${conv.messages[0].id}`);
-      qc.setQueryData<Conversation>(qk.conversation(agentId), (cur) =>
-        cur ? { ...cur, messages: [...older.messages, ...cur.messages], has_more: older.has_more } : cur,
-      );
-    } finally {
-      setLoadingOlder(false);
-    }
+    if (stickToBottom.current && conv && conv.messages.length > 400 && !fetchingOlder.current)
+      qc.setQueryData<Conversation>(qk.conversation(agentId), { ...conv, messages: conv.messages.slice(-100), has_more: true });
+    // A change that came in since the last look still counts: scrolling itself doesn't move the anchor.
+    keepView();
+    loadOlder();
   };
 
   if (!agent) return null;
   // On the full page, keep a comfortable reading width.
   const membersOff = !!agent && !agent.is_manager && !!settings.data && !settings.data.values.member_chat;
   const column = variant === "page" ? "mx-auto w-full max-w-3xl" : "";
+  const contextText = `${formatTokens(conversation.data?.context_tokens ?? agent.context_tokens)} / ${formatTokens(agent.context_limit_tokens)}`;
   const hasFiles = (e: DragEvent) => e.dataTransfer.types.includes("Files");
   const onDragOver = (e: DragEvent) => {
     if (hasFiles(e)) e.preventDefault();
@@ -165,11 +230,10 @@ export function ChatPanel({
             onChange={(e) => onSelectAgent(Number(e.target.value))}
             aria-label={t("chat.selectAgent")}
             trigger={
-              <span className="flex h-8 items-center gap-2" title={`${agent.role} · ${agent.model}`}>
+              <span className="flex h-8 min-w-0 items-center gap-2" title={`${agent.role} · ${agent.model}`}>
                 <AgentSquare agent={agent} />
                 <span className="truncate font-extrabold">{agent.name}</span>
                 <ChevronDown className="size-3.5 shrink-0 text-fg-3" />
-                <span className="min-w-0 flex-1 truncate text-fg-3">{agent.role}</span>
               </span>
             }
           >
@@ -181,15 +245,7 @@ export function ChatPanel({
           </Select>
         </div>
         {details && <ContextGauge used={conversation.data?.context_tokens ?? agent.context_tokens} limit={agent.context_limit_tokens} base={agent.base_context_tokens} />}
-        <IconButton label={details ? t("chat.hideDetails") : t("chat.showDetails")} onClick={() => setDetails(!details)} className={clsx(details && "bg-sunk text-fg")}>
-          {details ? <Eye className="size-4" /> : <EyeOff className="size-4" />}
-        </IconButton>
-        <ChatMenu
-          agentId={agentId}
-          cost={agent.total_cost_usd}
-          context={`${formatTokens(conversation.data?.context_tokens ?? agent.context_tokens)} / ${formatTokens(agent.context_limit_tokens)}`}
-          disabled={!!running || !canWrite}
-        />
+        <ChatMenu agentId={agentId} cost={agent.total_cost_usd} context={contextText} disabled={!!running || !canWrite} details={details} onDetails={setDetails} />
         {onExpand && (
           <IconButton label={t("chat.expand")} onClick={onExpand}>
             <Maximize2 className="size-4" />
@@ -198,17 +254,17 @@ export function ChatPanel({
         {onClose && <ChatPanelToggle where="chat" />}
       </header>
 
-      <div ref={scroller} onScroll={onScroll} className="scroll-thin min-h-0 flex-1 overflow-x-hidden overflow-y-auto">
-        <div className={column}>
+      <div ref={scroller} onScroll={onScroll} className="scroll-thin flex min-h-0 flex-1 flex-col-reverse overflow-x-hidden overflow-y-auto [overflow-anchor:none]">
+        <div ref={content} className={clsx(column, "mb-auto")}>
         {conversation.isLoading && (
           <div className="flex justify-center py-8">
             <Spinner />
           </div>
         )}
         {conversation.data?.has_more && (
-          <button type="button" onClick={loadOlder} className="block w-full border-b border-line px-4 py-2 text-center text-fg-2 hover:bg-sunk hover:text-fg" disabled={loadingOlder}>
-            {loadingOlder ? t("common.loading") : t("chat.loadOlder")}
-          </button>
+          <div className="flex justify-center py-3" aria-label={t("common.loading")}>
+            <Spinner />
+          </div>
         )}
         {!conversation.isLoading && messages.length === 0 && !queued.length && (
           <ChatIntro isManager={agent.is_manager} onPick={canWrite && agent.enabled ? (text) => setSeed((last) => ({ text, n: (last?.n ?? 0) + 1 })) : undefined} />
@@ -317,12 +373,30 @@ function ContextGauge({ used, limit, base }: { used: number; limit: number; base
   );
 }
 
-function ChatMenu({ agentId, cost, context, disabled }: { agentId: number; cost: number; context: string; disabled: boolean }) {
+/** What one rarely needs for a conversation: details on/off, compress, fresh session, context and cost. */
+function ChatMenu({
+  agentId,
+  cost,
+  context,
+  disabled,
+  details,
+  onDetails,
+}: {
+  agentId: number;
+  cost: number;
+  context: string;
+  disabled: boolean;
+  details: boolean;
+  onDetails: (on: boolean) => void;
+}) {
   const { t } = useTranslation();
   const qc = useQueryClient();
   const [open, setOpen] = useState(false);
   const [busy, setBusy] = useState<string | null>(null);
   const [note, setNote] = useState<string | null>(null);
+  const ref = useRef<HTMLDivElement>(null);
+  const [menuRef, inView] = useInView<HTMLDivElement>(open);
+  useDismiss(ref, open, () => setOpen(false));
 
   const action = async (name: "compress" | "reset-session") => {
     setBusy(name);
@@ -340,12 +414,24 @@ function ChatMenu({ agentId, cost, context, disabled }: { agentId: number; cost:
   };
 
   return (
-    <div className="relative">
-      <IconButton label={t("chat.menu")} onClick={() => setOpen(!open)}>
+    <div ref={ref} className="relative">
+      <IconButton label={t("chat.menu")} aria-haspopup="menu" aria-expanded={open} onClick={() => setOpen(!open)} className={clsx(open && "bg-sunk text-fg")}>
         <MoreHorizontal className="size-4" />
       </IconButton>
       {open && (
-        <div data-part="menu" className="absolute top-full right-0 z-40 mt-1 w-64 max-w-[calc(100vw-1rem)] rounded-sm bg-bg p-1 shadow-lg ring-1 ring-line-2">
+        <div ref={menuRef} style={inView} data-part="menu" className="absolute top-full right-0 z-40 mt-1 w-64 max-w-[calc(100vw-1rem)] rounded-sm bg-bg p-1 shadow-lg ring-1 ring-line-2">
+          <button
+            type="button"
+            role="menuitemcheckbox"
+            aria-checked={details}
+            onClick={() => onDetails(!details)}
+            className="flex w-full items-center gap-2 rounded-sm px-2 py-2 text-left font-semibold hover:bg-sunk touch:py-2.5"
+          >
+            {details ? <Eye className="size-4 shrink-0" /> : <EyeOff className="size-4 shrink-0 text-fg-3" />}
+            <span className="flex-1">{t("chat.details")}</span>
+            <SwitchTrack checked={details} />
+          </button>
+          <div className="my-1 border-t border-line" />
           <MenuItem label={t("chat.compressNow")} hint={t("chat.compressHint")} busy={busy === "compress"} disabled={disabled} onClick={() => action("compress")} />
           <MenuItem label={t("chat.resetSession")} hint={t("chat.resetHint")} busy={busy === "reset-session"} disabled={disabled} onClick={() => action("reset-session")} />
           <div className="border-t border-line px-2 py-1.5 text-fg-3">{t("chat.context", { context })} · {t("chat.totalCost", { cost: formatCost(cost) })}</div>
@@ -378,38 +464,6 @@ function Elapsed({ since }: { since: string }) {
   );
 }
 
-function PendingFile({ file, onRemove }: { file: File; onRemove: () => void }) {
-  const { t } = useTranslation();
-  const [preview, setPreview] = useState<string>();
-  useEffect(() => {
-    if (!file.type.startsWith("image/")) return;
-    const url = URL.createObjectURL(file);
-    setPreview(url);
-    return () => URL.revokeObjectURL(url);
-  }, [file]);
-  const name = file.name || "pasted.png";
-  return (
-    <div className="relative max-w-40" title={name}>
-      {preview ? (
-        <img src={preview} alt={name} className="size-16 rounded-sm object-cover ring-1 ring-line-2" />
-      ) : (
-        <div className="flex h-8 items-center gap-1.5 rounded-sm pr-8 pl-2 text-fg ring-1 ring-line-2 ring-inset">
-          <Paperclip className="size-4 shrink-0 text-fg-3" />
-          <span className="truncate">{name}</span>
-        </div>
-      )}
-      <button
-        type="button"
-        onClick={onRemove}
-        aria-label={t("chat.removeFile", { name })}
-        className={clsx("absolute flex size-6 items-center justify-center rounded-sm text-fg-2 hover:text-fg", preview ? "top-0.5 right-0.5 bg-bg" : "top-1 right-1")}
-      >
-        <X className="size-4" />
-      </button>
-    </div>
-  );
-}
-
 function Composer({
   seed,
   agentId,
@@ -439,11 +493,10 @@ function Composer({
   const { t } = useTranslation();
   const { project } = useShell();
   const qc = useQueryClient();
-  const [text, setText] = useState("");
+  const [text, setText] = useDraft(`chat:${agentId}`);
   const [error, setError] = useState<string | null>(null);
   const [sending, setSending] = useState(false);
-  // A question instead of a message (Ctrl+Enter, or this switch on a phone): answered in a window of its own.
-  const [askMode, setAskMode] = useState(false);
+  // A question instead of a message (Ctrl+Enter or the ? button): answered in a window of its own.
   const [asking, setAsking] = useState<string | null>(null);
   const shortcut = /Mac|iPhone|iPad/.test(navigator.userAgent) ? "⌘+Enter" : "Ctrl+Enter";
   const area = useRef<HTMLTextAreaElement>(null);
@@ -456,12 +509,7 @@ function Composer({
   }, [seed]);
   const picker = useRef<HTMLInputElement>(null);
 
-  useLayoutEffect(() => {
-    const el = area.current;
-    if (!el) return;
-    el.style.height = "auto";
-    el.style.height = `${Math.min(el.scrollHeight, 200)}px`;
-  }, [text]);
+  useAutoGrow(area, text);
 
   const send = async () => {
     const value = text.trim();
@@ -493,7 +541,6 @@ function Composer({
     const value = text.trim();
     if (!value || asking !== null) return;
     setText("");
-    setAskMode(false);
     setAsking(value);
   };
 
@@ -515,8 +562,7 @@ function Composer({
       askQuestion();
     } else if (e.key === "Enter" && !e.shiftKey && !touch && !e.nativeEvent.isComposing) {
       e.preventDefault();
-      if (askMode) askQuestion();
-      else void send();
+      void send();
     }
   };
 
@@ -566,9 +612,9 @@ function Composer({
           onSelect={mention.track}
           onKeyDown={onKey}
           onPaste={onPaste}
-          placeholder={disabled ? t("chat.agentDisabled") : askMode ? t("ask.placeholder") : t("chat.placeholder", { name: agentName })}
+          placeholder={disabled ? t("chat.agentDisabled") : runningId ? t("chat.queued") : t("chat.placeholder", { name: agentName })}
           aria-label={t("chat.placeholder", { name: agentName })}
-          className="scroll-thin max-h-[200px] min-h-8 min-w-0 flex-1 resize-none bg-transparent px-1.5 py-1.5 outline-none touch:min-h-11 touch:py-2.5"
+          className="scroll-thin max-h-[200px] min-h-8 min-w-0 flex-1 resize-none bg-transparent placeholder:truncate px-1.5 py-1.5 outline-none touch:min-h-11 touch:py-2.5"
         />
         {runningId ? (
           <IconButton label={t("chat.stop")} onClick={() => api.post(`/runs/${runningId}/cancel`)} className="size-8 text-fg-2 ring-1 ring-line-2 ring-inset touch:size-11">
@@ -576,23 +622,22 @@ function Composer({
           </IconButton>
         ) : null}
         <IconButton
-          label={t("ask.toggle", { shortcut })}
-          aria-pressed={askMode}
-          data-part="ask-toggle"
+          label={t("ask.button", { shortcut })}
+          data-part="ask"
           disabled={disabled}
           onClick={() => {
-            setAskMode((on) => !on);
-            area.current?.focus();
+            if (text.trim()) askQuestion();
+            else area.current?.focus();
           }}
-          className={clsx("size-8 touch:size-11", askMode && "text-fg ring-2 ring-fg ring-inset")}
+          className="size-8 touch:size-11"
         >
           <CircleHelp className="size-4" />
         </IconButton>
         <button
-          onClick={askMode ? askQuestion : send}
-          disabled={askMode ? !text.trim() || disabled || asking !== null : (!text.trim() && !files.length) || disabled || sending}
-          aria-label={askMode ? t("ask.send") : t("chat.send")}
-          title={askMode ? t("ask.send") : undefined}
+          onClick={send}
+          disabled={(!text.trim() && !files.length) || disabled || sending}
+          aria-label={runningId ? t("chat.queued") : t("chat.send")}
+          title={runningId ? t("chat.queued") : undefined}
           data-part="send"
           className="plate flex size-8 shrink-0 items-center justify-center rounded-sm transition-colors hover:bg-fg-2 disabled:bg-line disabled:text-fg-3 touch:size-11"
         >
@@ -600,7 +645,6 @@ function Composer({
         </button>
       </div>
       <div className="mt-2 flex flex-wrap items-center gap-x-3 gap-y-1">
-        {runningId && <p className="min-w-0 flex-1 basis-48 text-fg-3">{t("chat.queueHint")}</p>}
         <div className="ml-auto flex flex-wrap items-center justify-end gap-x-2">
           <LimitsRing />
         </div>

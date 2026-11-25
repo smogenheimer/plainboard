@@ -110,6 +110,20 @@ async def _attach_file(bridge: ToolBridge, args: dict[str, Any]) -> ToolCallResu
     return ToolCallResult.model_validate(resp.json())
 
 
+@local_tool("attach_doc_file")
+async def _attach_doc_file(bridge: ToolBridge, args: dict[str, Any]) -> ToolCallResult:
+    raw = Path(str(args.get("path", "")))
+    file = raw if raw.is_absolute() else bridge.workspace / raw
+    if not file.is_file():
+        return ToolCallResult(text=f"File not found: {file}", is_error=True)
+    mime = mimetypes.guess_type(file.name)[0] or "application/octet-stream"
+    with file.open("rb") as fh:
+        resp = await bridge._client.post(f"/api/internal/runs/{bridge.spec.run_id}/doc-files", data={"site": str(args.get("site", ""))}, files={"file": (file.name, fh, mime)})
+    if resp.status_code >= 400:
+        return ToolCallResult(text=f"Upload failed: {resp.text[:300]}", is_error=True)
+    return ToolCallResult.model_validate(resp.json())
+
+
 @local_tool("send_files")
 async def _send_files(bridge: ToolBridge, args: dict[str, Any]) -> ToolCallResult:
     paths = [p if p.is_absolute() else bridge.workspace / p for p in (Path(str(raw)) for raw in args.get("paths") or [])]
@@ -151,3 +165,6 @@ async def _workspace_snapshots(bridge: ToolBridge, args: dict[str, Any]) -> Tool
     except snapshots.SnapshotError as exc:
         return ToolCallResult(text=str(exc), is_error=True)
     return ToolCallResult(text=text)
+
+
+from . import code_read, doc_shots  # noqa: E402,F401  (register the code tools of a doc site's assistant, the theme previews)

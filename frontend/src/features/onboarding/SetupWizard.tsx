@@ -17,7 +17,7 @@ import { Advice, Wizard, type WizardStep } from "./Wizard";
 
 type Values = Record<string, any>;
 
-const SUBSCRIPTIONS = ["claude_code", "codex", "antigravity"];
+const SUBSCRIPTIONS = ["claude_code", "codex", "antigravity", "gemini_cli"];
 /** An account agents can work with: it has its secret, or is signed in on the runner itself. An
     endpoint may need no key (a model server of one's own); whether it answers, the check says. */
 export const usable = (a: Account) =>
@@ -90,7 +90,8 @@ export function SetupWizard() {
       onNext: async () => {
         const failures: string[] = [];
         for (const account of (accounts.data ?? []).filter(usable)) {
-          const model = account.models[0] ?? smallModel(providers.find((p) => p.name === account.provider));
+          const provider = providers.find((p) => p.name === account.provider);
+          const model = (provider?.endpoint ? account.models[0] : undefined) ?? smallModel(provider);
           const result = model ? await checks.account(account.id, model) : { ok: false, detail: t("status.runnerDown") };
           if (result.ok) return;
           failures.push(`${account.label}: ${result.detail}`);
@@ -111,6 +112,12 @@ export function SetupWizard() {
             <div className="space-y-2">
               <h2 className="font-semibold">{t("settings.antigravity")}</h2>
               <AccountsEditor provider="antigravity" />
+            </div>
+          )}
+          {providers.some((p) => p.name === "gemini_cli") && (
+            <div className="space-y-2">
+              <h2 className="font-semibold">{t("settings.gemini")}</h2>
+              <AccountsEditor provider="gemini_cli" />
             </div>
           )}
           {!!meta.data?.endpoints?.length && (

@@ -8,6 +8,7 @@ import { squarePicture } from "../../components/Avatar";
 import { askToNotify } from "../../components/Mentions";
 import { PictureField } from "../../components/PictureField";
 import { Button, ErrorText, Field, Input, Toggle } from "../../components/ui";
+import { clearDrafts } from "../../lib/drafts";
 
 /** One's own account: picture, name, password, signing out. Saved right away. */
 export function AccountEditor() {
@@ -59,6 +60,7 @@ export function AccountEditor() {
   };
   const signOut = async () => {
     await api.post("/auth/logout");
+    clearDrafts();
     window.location.reload(); // nothing of this user stays in memory
   };
 

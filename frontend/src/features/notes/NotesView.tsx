@@ -9,17 +9,19 @@ import type { Note } from "../../api/types";
 import { Markdown } from "../../components/Markdown";
 import { Button, ChatPanelToggle, EmptyState, ErrorText, Input, Textarea, Toggle } from "../../components/ui";
 import { timeAgo } from "../../lib/format";
+import { useDraft } from "../../lib/drafts";
 import { useShell } from "../layout/shell-context";
 
-export function NotesView() {
+/** `initial`: the note to show first (one found in the command palette). */
+export function NotesView({ initial }: { initial?: number } = {}) {
   const { t } = useTranslation();
   const { project, agentById, canWrite } = useShell();
   const qc = useQueryClient();
   const notes = useNotes(project.id);
-  const [selected, setSelected] = useState<number | "new" | null>(null);
+  const [selected, setSelected] = useState<number | "new" | null>(initial ?? null);
   const [query, setQuery] = useState("");
   // Phones show either the list or one note.
-  const [detail, setDetail] = useState(false);
+  const [detail, setDetail] = useState(initial !== undefined);
   const open = (id: number | "new") => {
     setSelected(id);
     setDetail(true);
@@ -114,10 +116,12 @@ export function NotesView() {
 function NoteEditor({ note, onSaved, onDeleted }: { note?: Note; onSaved: (n: Note) => void; onDeleted?: () => void }) {
   const { t } = useTranslation();
   const { project, canWrite } = useShell();
-  const [title, setTitle] = useState(note?.title ?? "");
-  const [content, setContent] = useState(note?.content ?? "");
+  const draftKey = canWrite ? `note:${project.id}:${note?.id ?? "new"}` : null;
+  const [title, setTitle, clearTitle] = useDraft(draftKey && `${draftKey}:title`, note?.title ?? "");
+  const [content, setContent, clearContent] = useDraft(draftKey, note?.content ?? "");
   const [pinned, setPinned] = useState(note?.pinned ?? false);
-  const [editing, setEditing] = useState(!note);
+  // A draft left from before opens the editor again.
+  const [editing, setEditing] = useState(!note || title !== note.title || content !== note.content);
   const [error, setError] = useState<unknown>(null);
 
   useEffect(() => {
@@ -134,6 +138,10 @@ function NoteEditor({ note, onSaved, onDeleted }: { note?: Note; onSaved: (n: No
       const body = { title, content, pinned };
       const saved = note ? await api.patch<Note>(`/projects/${project.id}/notes/${note.id}`, body) : await api.post<Note>(`/projects/${project.id}/notes`, body);
       setEditing(false);
+      if (!note) {
+        clearTitle();
+        clearContent();
+      }
       onSaved(saved);
     } catch (err) {
       setError(err);

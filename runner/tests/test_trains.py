@@ -237,3 +237,25 @@ async def test_the_commit_log_of_the_base_branch_goes_on_from_the_last_commit_re
 
     there = await trains.present(GitPresentSpec(key="p1-r1", base="main", shas=[later.head, "f" * 40], paths=["b.txt", "gone.txt"]))
     assert there.on_base == [later.head] and there.missing == ["gone.txt"]
+
+
+async def test_the_commit_log_names_renames_and_present_tells_patterns_that_match_nothing(remote, tmp_path):
+    from plainboard_protocol import GitLogSpec, GitPresentSpec
+
+    work = tmp_path / "work"
+    (work / "app" / "pay").mkdir(parents=True)
+    commit(work, "app/pay/hooks.py", "def retry():\n    return 'a long enough body for git to see a rename'\n", "Add hooks")
+    git(work, "push", "-q", "origin", "main")
+    log_spec = GitLogSpec(credentials=Credentials(), key="p1-r1", remote=RepoSpec(name="api", url=str(remote)))
+    first = await trains.commit_log(log_spec)
+    git(work, "mv", "app/pay", "app/payments")
+    git(work, "commit", "-qm", "Rename pay")
+    git(work, "mv", "a.txt", "b.txt")
+    git(work, "commit", "-qm", "Rename a")
+    git(work, "push", "-q", "origin", "main")
+    later = await trains.commit_log(log_spec.model_copy(update={"since": first.head}))
+    assert [c.renames for c in later.commits] == [{"a.txt": "b.txt"}, {"app/pay/hooks.py": "app/payments/hooks.py"}]
+    assert later.commits[1].files == ["app/pay/hooks.py", "app/payments/hooks.py"] and later.commits[1].file_count == 1
+    there = await trains.present(GitPresentSpec(key="p1-r1", base="main", patterns=["app/pay", "app/payments", "app/payments/hooks.py", "lib/*.py", "app/*/*.py", "a.txt", "app/"]))
+    assert there.unmatched == ["app/pay", "lib/*.py", "a.txt"]
+    assert trains.renamed("x/{a => b}/c.py") == ("x/a/c.py", "x/b/c.py") and trains.renamed("x/{ => b}/c.py") == ("x/c.py", "x/b/c.py") and trains.renamed("plain.py") is None

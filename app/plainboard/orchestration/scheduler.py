@@ -49,18 +49,22 @@ class Scheduler:
                 run_id = None
                 agent = await s.get(Agent, schedule.agent_id)
                 project = await s.get(Project, agent.project_id) if agent is not None else None
-                # A paused project: the time passes without a turn, so nothing piles up for the day it goes on.
-                if agent is not None and agent.enabled and project is not None and project.paused_at is None and schedule.skip_quiet and await schedule_service.quiet(s, schedule):
+                # A paused project (by a person, or before its limits): the time passes without a turn, so nothing piles up for the day it goes on.
+                if agent is not None and agent.enabled and project is not None and project.paused_at is None and project.limit_paused_at is None and schedule.skip_quiet and await schedule_service.quiet(s, schedule):
                     await schedule_service.mark_skipped(s, schedule, now)  # nothing happened: nothing to report, no turn
                     continue
-                if agent is not None and agent.enabled and project is not None and project.paused_at is None:
+                if agent is not None and agent.enabled and project is not None and project.paused_at is None and project.limit_paused_at is None:
                     text = f'Scheduled task "{schedule.name}" (schedule {schedule.id}):\n\n{schedule.prompt}'
                     run = await self._runs.enqueue(s, agent, RunTrigger.SCHEDULE, text, schedule_id=schedule.id)
                     run_id = run.id
                     fired += 1
                 await schedule_service.mark_fired(s, schedule, run_id, now)
             await self._runs.refresh_closed_tickets(s)
-            await board_service.accept_reviews(s)
+            # The manager decides what happens to tickets left in review, nothing moves them to done by itself.
+            for project, manager, tasks in await board_service.stale_reviews(s):
+                await inbox.push(s, manager.id, prompts.stale_reviews(tasks, now))
+                if project.auto_wake_manager:
+                    await self._runs.request_wake(s, manager.id)
             await board_service.auto_archive(s)
             await todo_service.purge(s)
             # Arrives with the member's next turn; nobody is woken for it.

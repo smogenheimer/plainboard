@@ -9,7 +9,7 @@ from fastapi import Depends, FastAPI, Request
 from fastapi.responses import FileResponse, JSONResponse
 from fastapi.staticfiles import StaticFiles
 
-from .api import accounts, auth, browser, chat, internal, knowledge, mcp_server, preview, projects, public, questions, repositories, runners, secrets, system, tasks, todos, tokens, users, ws
+from .api import accounts, auth, browser, chat, docs, docs_api, docs_public, ideas, internal, knowledge, mcp_server, preview, projects, public, questions, repositories, runners, secrets, system, tasks, todos, tokens, users, ws
 from .api.deps import authorize
 from .api.guard import Guard
 from .config import get_config
@@ -21,10 +21,12 @@ from .orchestration.job_watcher import JobWatcher
 from .orchestration.landing import LandingWatcher
 from .orchestration.tidy import BranchTidy
 from .orchestration.cleanup import CleanupWatcher
+from .orchestration.docs_watcher import DocsWatcher
 from .orchestration.limits_watcher import LimitsWatcher
 from .orchestration.update_watcher import UpdateWatcher
 from .orchestration.scheduler import Scheduler
 from .orchestration.search_indexer import SearchIndexer
+from .orchestration.limit_pause import LimitPauseWatcher
 from .orchestration.standstill import StandstillWatcher
 from .models import utcnow
 from .security import init_security
@@ -55,9 +57,11 @@ async def lifespan(app: FastAPI):
     tidy = app.state.tidy = BranchTidy(sessionmaker(), runs, config.tidy_interval_seconds)
     standstill = app.state.standstill = StandstillWatcher(sessionmaker(), runs, config.standstill_interval_seconds)
     limits_watcher = LimitsWatcher(runs, config.limits_interval_seconds)
+    limit_pause = app.state.limit_pause = LimitPauseWatcher(sessionmaker(), runs, config.limit_pause_interval_seconds)
     updates = app.state.updates = UpdateWatcher(sessionmaker(), runner, config.update_interval_seconds)
     cleanup = app.state.cleanup = CleanupWatcher(sessionmaker(), runs, config.cleanup_interval_seconds)
     search_index = app.state.search = SearchIndexer(sessionmaker(), runs, config.search_interval_seconds)
+    docs_watcher = app.state.docs_watcher = DocsWatcher(sessionmaker(), runs, config.docs_interval_seconds)
     app.state.preview_client = preview.new_client()
     await runs.start()
     scheduler.start()
@@ -66,17 +70,21 @@ async def lifespan(app: FastAPI):
     tidy.start()
     standstill.start()
     limits_watcher.start()
+    limit_pause.start()
     updates.start()
     cleanup.start()
     search_index.start()
+    docs_watcher.start()
     log.info("PlainBoard ready")
     try:
         async with app.state.mcp.run():
             yield
     finally:
+        await docs_watcher.stop()
         await search_index.stop()
         await cleanup.stop()
         await updates.stop()
+        await limit_pause.stop()
         await limits_watcher.stop()
         await standstill.stop()
         await tidy.stop()
@@ -91,7 +99,7 @@ async def lifespan(app: FastAPI):
 
 
 # Every route of these is checked against its rule in services/access.py before it runs.
-API_MODULES = (auth, system, accounts, users, tokens, projects, public, repositories, runners, secrets, tasks, todos, chat, questions, knowledge, internal)
+API_MODULES = (auth, system, accounts, users, tokens, projects, public, docs_public, docs_api, repositories, runners, secrets, tasks, todos, chat, questions, ideas, docs, knowledge, internal)
 
 
 def create_app() -> FastAPI:
@@ -114,11 +122,13 @@ def create_app() -> FastAPI:
     app.include_router(runners.sockets)  # an external runner's tunnel: its token
     for module in (ws, browser, preview):  # sockets and the preview proxy check by themselves
         app.include_router(module.router)
+    app.include_router(docs_public.pages)  # published doc sites as HTML: no login, they check by themselves
 
     # PlainBoard as an MCP server for a person's own AI client: a personal token, never the login cookie.
     app.state.mcp = mcp_server.Endpoint(app)
     app.add_route(mcp_server.PATH, app.state.mcp, methods=["GET", "POST", "DELETE"], include_in_schema=False)
     _mount_spa(app, get_config().static_dir)
+    app.add_middleware(docs_public.DocHost)  # a doc site's own domain: that site and nothing else
     app.add_middleware(Guard)  # outermost: before anything else sees the request
     return app
 

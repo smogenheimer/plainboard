@@ -3,7 +3,7 @@ import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, errorMessage } from "../../api/client";
 import { checks, qk, useAccounts, useMeta, useRepositories, useSettings } from "../../api/queries";
-import type { CheckResult, Project } from "../../api/types";
+import type { CheckResult, Project, RetentionPreview } from "../../api/types";
 import { ApiKeyEditor } from "../../components/ApiKeyEditor";
 import { SaveRow, SavedAtOnce, SettingsLayout, type SettingsSection } from "../../components/SettingsLayout";
 import { Button, ErrorText, Field, Input, Modal, PageHead, Select, Textarea, Toggle } from "../../components/ui";
@@ -15,11 +15,14 @@ import { CheckBadge } from "../settings/SettingsDialog";
 import { MembersEditor } from "./MembersEditor";
 import { ProjectAccounts, allowedAccounts, sameAccounts, useUsableAccounts } from "./ProjectAccounts";
 import { ProjectPauseSwitch } from "./ProjectPause";
+import { RetentionConfirm, retentionText } from "./RetentionConfirm";
 import { ProjectRunnerEditor } from "./ProjectRunner";
 import { ExportProject } from "./MoveProject";
+import { GivenAccounts } from "./GivenAccounts";
 import { CustomerLanguages } from "./CustomerLanguages";
 import { RepositoriesEditor, toBody, toDraft } from "./RepositoriesEditor";
 import { SkillsEditor } from "./SkillsEditor";
+import { ToolsView } from "../tools/ToolsView";
 
 const days = (value: string, max: number) => Math.max(0, Math.min(max, Math.round(Number(value) || 0)));
 
@@ -27,7 +30,7 @@ const days = (value: string, max: number) => Math.max(0, Math.min(max, Math.roun
  * navigation, one section per subject, every setting with its name and what it does. */
 export function ProjectSettings({ onOpenTeam, onDeleted }: { onOpenTeam: () => void; onDeleted: () => void }) {
   const { t } = useTranslation();
-  const { project, isOwner } = useShell();
+  const { project, isOwner, canWrite } = useShell();
   const qc = useQueryClient();
   const [current, setCurrent] = useStored<string>("plainboard.projectSection", "general");
   const settings = useSettings();
@@ -49,14 +52,23 @@ export function ProjectSettings({ onOpenTeam, onDeleted }: { onOpenTeam: () => v
     account_ids: project.account_ids ?? [],
     auto_archive_days: project.auto_archive_days,
     review_days: project.review_days,
+    attachment_retention_days: project.attachment_retention_days ?? null,
+    attachment_retention_min_mb: project.attachment_retention_min_mb ?? null,
     ask_provider: project.ask_provider ?? "",
     ask_model: project.ask_model ?? "",
     ask_effort: project.ask_effort ?? "",
+    idea_provider: project.idea_provider ?? "",
+    idea_model: project.idea_model ?? "",
+    idea_effort: project.idea_effort ?? "",
   });
   const [check, setCheck] = useState<CheckResult | null>(null);
   const [error, setError] = useState<unknown>(null);
   const set = (patch: Partial<typeof form>) => setForm((f) => ({ ...f, ...patch }));
-  const stored: Record<string, unknown> = { ...project, workspace_path: project.workspace_path ?? "", github_token: "" };
+  const stored: Record<string, unknown> = {
+    ...project,
+    attachment_retention_days: project.attachment_retention_days ?? null,
+    attachment_retention_min_mb: project.attachment_retention_min_mb ?? null,
+    workspace_path: project.workspace_path ?? "", github_token: "" };
   const dirty = (...keys: (keyof typeof form)[]) => keys.some((k) => form[k] !== stored[k]);
   const save = async (...keys: (keyof typeof form)[]) => {
     const body: Record<string, unknown> = Object.fromEntries(keys.map((k) => [k, form[k]]));
@@ -75,7 +87,7 @@ export function ProjectSettings({ onOpenTeam, onDeleted }: { onOpenTeam: () => v
       await api.put(`/projects/${project.id}/accounts`, { account_ids: form.account_ids });
       await qc.invalidateQueries({ queryKey: ["project-accounts", project.id] });
     }
-    await save("parallel_agents", "account_id", "auto_wake_manager", "continue_with_backlog", "ask_provider", "ask_model", "ask_effort");
+    await save("parallel_agents", "account_id", "auto_wake_manager", "continue_with_backlog", "ask_provider", "ask_model", "ask_effort", "idea_provider", "idea_model", "idea_effort");
   };
   // Quick questions: the provider's small model with effort high, unless chosen here.
   const providers = meta.data?.providers ?? [];
@@ -84,6 +96,41 @@ export function ProjectSettings({ onOpenTeam, onDeleted }: { onOpenTeam: () => v
   const askSmall = askModels.filter((m) => m.tier === "small");
   const askDefault = askSmall.find((m) => m.id.includes("haiku")) ?? askSmall[0] ?? askModels[askModels.length - 1];
   const askEfforts = askProvider?.efforts ?? [];
+  // Deleting files is never a surprise: before a retention is switched on or changed, it says what would go, and is saved only after that.
+  const [retention, setRetention] = useState<RetentionPreview | null>(null);
+  const [retentionBusy, setRetentionBusy] = useState(false);
+  const [retentionError, setRetentionError] = useState<unknown>(null);
+  // null: the PlainBoard default, which the preview then shows for this project.
+  const defaultDays = Number(settings.data?.values.attachment_retention_days ?? 0);
+  const defaultMinMb = Number(settings.data?.values.attachment_retention_min_mb ?? 0);
+  const useDefault = form.attachment_retention_days === null;
+  const ownDays = form.attachment_retention_days ?? 0;
+  const saveRetention = async () => {
+    const [effDays, effMinMb] = useDefault ? [defaultDays, defaultMinMb] : [ownDays, form.attachment_retention_min_mb ?? 0];
+    if (effDays > 0) {
+      const q = `days=${effDays}&min_mb=${effMinMb}`;
+      setRetention(await api.get<RetentionPreview>(`/projects/${project.id}/attachment-retention?${q}`));
+      return; // saved when confirmed
+    }
+    await save("attachment_retention_days", "attachment_retention_min_mb");
+  };
+  const confirmRetention = async () => {
+    setRetentionBusy(true);
+    setRetentionError(null);
+    try {
+      await save("attachment_retention_days", "attachment_retention_min_mb");
+      setRetention(null);
+    } catch (err) {
+      setRetentionError(err);
+    } finally {
+      setRetentionBusy(false);
+    }
+  };
+  const ideaProvider = providers.find((p) => p.name === (form.idea_provider || "claude_code"));
+  const ideaModels = ideaProvider?.models ?? [];
+  const ideaSmall = ideaModels.filter((m) => m.tier === "small");
+  const ideaDefault = ideaSmall.find((m) => m.id.includes("haiku")) ?? ideaSmall[0] ?? ideaModels[ideaModels.length - 1];
+  const ideaEfforts = ideaProvider?.efforts ?? [];
   const refreshRepos = () => qc.invalidateQueries({ queryKey: qk.repos(project.id) });
   // Deleting asks first, and asks what happens to the folders the agents worked in.
   const [deleting, setDeleting] = useState(false);
@@ -107,7 +154,25 @@ export function ProjectSettings({ onOpenTeam, onDeleted }: { onOpenTeam: () => v
     return (
       <div className="flex h-full flex-col">
         <PageHead title={t("projectSettings.title")} />
-        <p className="p-4 text-fg-2">{t("projectSettings.ownersOnly")}</p>
+        <div className="min-h-0 flex-1 space-y-6 overflow-y-auto p-4">
+          <p className="text-fg-2">{t("projectSettings.ownersOnly")}</p>
+          {canWrite && (
+            <section className="max-w-2xl space-y-3">
+              <div>
+                <h2 className="font-semibold">{t("givenAccounts.label")}</h2>
+                <p className="text-fg-3">{t("givenAccounts.description")}</p>
+              </div>
+              <GivenAccounts projectId={project.id} isOwner={false} />
+            </section>
+          )}
+          <section className="max-w-2xl space-y-3">
+            <div>
+              <h2 className="font-semibold">{t("tools.title")}</h2>
+              <p className="text-fg-3">{t("tools.subtitle")}</p>
+            </div>
+            <ToolsView embedded />
+          </section>
+        </div>
       </div>
     );
   }
@@ -195,6 +260,17 @@ export function ProjectSettings({ onOpenTeam, onDeleted }: { onOpenTeam: () => v
       content: (
         <div className="space-y-4">
           <ProjectPauseSwitch project={project} />
+          <div className="space-y-1">
+            <Toggle
+              checked={project.limit_pause}
+              onChange={async (v) => {
+                await api.patch<Project>(`/projects/${project.id}`, { limit_pause: v });
+                await qc.invalidateQueries({ queryKey: qk.projects });
+              }}
+              label={t("projects.limitPause")}
+            />
+            <p className="text-fg-3">{t("projects.limitPauseHint")}</p>
+          </div>
           <Field label={t("projects.parallel")} hint={t("projects.parallelHint", { count: defaultParallel })}>
             <Input
               type="number"
@@ -270,8 +346,48 @@ export function ProjectSettings({ onOpenTeam, onDeleted }: { onOpenTeam: () => v
               </div>
             </div>
           </Field>
+          <Field group label={t("projects.ideaModel")} hint={t("projects.ideaModelHint")}>
+            <div data-part="idea-model" className="flex flex-wrap items-start gap-2">
+              {providers.length > 1 && (
+                <div className="w-full sm:w-44">
+                  <Select
+                    aria-label={t("projects.ideaProvider")}
+                    value={form.idea_provider || "claude_code"}
+                    onChange={(e) => set({ idea_provider: e.target.value === "claude_code" ? "" : e.target.value, idea_model: "", idea_effort: "" })}
+                  >
+                    {providers.map((p) => (
+                      <option key={p.name} value={p.name}>
+                        {p.label}
+                      </option>
+                    ))}
+                  </Select>
+                </div>
+              )}
+              <div className="min-w-0 flex-1 basis-48">
+                <Select aria-label={t("projects.ideaModel")} value={form.idea_model} onChange={(e) => set({ idea_model: e.target.value })}>
+                  <option value="">{t("projects.askModelSmall", { model: ideaDefault?.label ?? "Claude Haiku" })}</option>
+                  {ideaModels.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.label}
+                    </option>
+                  ))}
+                  {form.idea_model && !ideaModels.some((m) => m.id === form.idea_model) && <option value={form.idea_model}>{form.idea_model}</option>}
+                </Select>
+              </div>
+              <div className="w-full sm:w-48">
+                <Select aria-label={t("settings.defaultEffort")} value={form.idea_effort} onChange={(e) => set({ idea_effort: e.target.value })}>
+                  <option value="">{t("settings.effortOwn")}</option>
+                  {ideaEfforts.map((e) => (
+                    <option key={e} value={e}>
+                      {t("settings.effortOption", { effort: e })}
+                    </option>
+                  ))}
+                </Select>
+              </div>
+            </div>
+          </Field>
           <SaveRow
-            dirty={accountsDirty || dirty("parallel_agents", "account_id", "auto_wake_manager", "continue_with_backlog", "ask_provider", "ask_model", "ask_effort")}
+            dirty={accountsDirty || dirty("parallel_agents", "account_id", "auto_wake_manager", "continue_with_backlog", "ask_provider", "ask_model", "ask_effort", "idea_provider", "idea_model", "idea_effort")}
             onSave={saveTeam}
           >
             <Button variant="ghost" onClick={onOpenTeam}>
@@ -309,6 +425,48 @@ export function ProjectSettings({ onOpenTeam, onDeleted }: { onOpenTeam: () => v
             <Input type="number" min={0} max={3650} className="w-28" value={form.auto_archive_days} onChange={(e) => set({ auto_archive_days: days(e.target.value, 3650) })} />
           </Field>
           <SaveRow dirty={dirty("review_days", "auto_archive_days")} onSave={() => save("review_days", "auto_archive_days")} />
+          <div className="space-y-3 pt-2">
+            <Toggle
+              checked={useDefault}
+              onChange={(v) => set(v ? { attachment_retention_days: null, attachment_retention_min_mb: null } : { attachment_retention_days: defaultDays, attachment_retention_min_mb: defaultMinMb })}
+              label={<span className="font-semibold">{t("projects.retentionUseDefault", { current: retentionText(t, defaultDays, defaultMinMb) })}</span>}
+            />
+            <p className="text-fg-3">{t("projects.retentionUseDefaultHint")}</p>
+            {!useDefault && (
+              <Toggle
+                checked={ownDays > 0}
+                onChange={(v) => set({ attachment_retention_days: v ? project.attachment_retention_days || defaultDays || 90 : 0, attachment_retention_min_mb: form.attachment_retention_min_mb ?? 0 })}
+                label={<span className="font-semibold">{t("projects.retention")}</span>}
+              />
+            )}
+            {!useDefault && <p className="text-fg-3">{t("projects.retentionHint")}</p>}
+            {!useDefault && ownDays > 0 && (
+              <div className="flex flex-wrap gap-4">
+                <Field label={t("projects.retentionDays")}>
+                  <Input
+                    type="number"
+                    min={1}
+                    max={3650}
+                    className="w-28"
+                    value={ownDays}
+                    onChange={(e) => set({ attachment_retention_days: Math.max(1, days(e.target.value, 3650)) })}
+                  />
+                </Field>
+                <Field label={t("projects.retentionMinMb")}>
+                  <Input
+                    type="number"
+                    min={0}
+                    max={100000}
+                    className="w-28"
+                    value={form.attachment_retention_min_mb ?? 0}
+                    onChange={(e) => set({ attachment_retention_min_mb: days(e.target.value, 100000) })}
+                  />
+                </Field>
+              </div>
+            )}
+            <SaveRow dirty={dirty("attachment_retention_days", "attachment_retention_min_mb")} onSave={saveRetention} />
+          </div>
+          <RetentionConfirm preview={retention} busy={retentionBusy} error={retentionError} onCancel={() => setRetention(null)} onConfirm={confirmRetention} />
         </div>
       ),
     },
@@ -330,6 +488,17 @@ export function ProjectSettings({ onOpenTeam, onDeleted }: { onOpenTeam: () => v
       content: (
         <div className="space-y-4">
           <SkillsEditor projectId={project.id} />
+          <SavedAtOnce />
+        </div>
+      ),
+    },
+    {
+      id: "givenAccounts",
+      label: t("givenAccounts.label"),
+      description: t("givenAccounts.description"),
+      content: (
+        <div className="space-y-4">
+          <GivenAccounts projectId={project.id} isOwner />
           <SavedAtOnce />
         </div>
       ),
@@ -357,6 +526,7 @@ export function ProjectSettings({ onOpenTeam, onDeleted }: { onOpenTeam: () => v
         </div>
       ),
     },
+    { id: "tools", label: t("tools.title"), description: t("tools.subtitle"), content: <ToolsView embedded /> },
     { id: "runner", label: t("projectRunner.title"), description: t("projectRunner.description"), content: <ProjectRunnerEditor projectId={project.id} isOwner={isOwner} /> },
     { id: "move", label: t("move.label"), description: t("move.description"), content: <ExportProject project={project} /> },
     {

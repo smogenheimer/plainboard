@@ -87,6 +87,8 @@ def _setup(client, project, monkeypatch, runner):
     monkeypatch.setattr(version_service, "running_commit", lambda: OWN)
     hub = client.app_ref.state.runs.runners
     hub.make_client = lambda _rid: runner
+    claude = next(a for a in client.get("/api/accounts").json() if a["provider"] == "claude_code")
+    client.patch(f"/api/accounts/{claude['id']}", json={"auth_mode": "oauth_token", "secret": "tok"})  # the home's sign-in is the built-in runner's
     created = client.post("/api/runners", json={"name": "build-server"}).json()
     rid = created["runner"]["id"]
     assert client.put(f"/api/projects/{project['id']}/runner", json={"runner_id": rid}).status_code == 200

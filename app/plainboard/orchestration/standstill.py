@@ -56,7 +56,7 @@ class StandstillWatcher:
         now = now or utcnow()
         woken = 0
         async with self._sm() as s:
-            for project in list(await s.scalars(select(Project).where(Project.paused_at.is_(None)).order_by(Project.id))):
+            for project in list(await s.scalars(select(Project).where(Project.paused_at.is_(None), Project.limit_paused_at.is_(None)).order_by(Project.id))):
                 found = await standstill_service.find(s, project, await project_service.parallel_limit(s, project), self._runs.waiting_for_job(), now)
                 if told := self._told.get(project.id):
                     # A ticket that is no longer ready (someone works on it, it waits for the user) is

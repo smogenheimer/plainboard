@@ -1,13 +1,14 @@
 import { useQueryClient } from "@tanstack/react-query";
 import clsx from "clsx";
-import { Plus, Trash2 } from "lucide-react";
-import { useEffect, useState } from "react";
+import { Check, Plus, Trash2 } from "lucide-react";
+import { useEffect, useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { api, errorMessage } from "../../api/client";
-import { checks, qk, useAccounts, useDirectory, useLimits, useMe, useMeta } from "../../api/queries";
+import { checks, qk, useAccounts, useDirectory, useLimits, useMe, useMeta, useProjects, useSettings } from "../../api/queries";
 import type { Account, CheckResult } from "../../api/types";
 import { Button, ErrorText, IconButton, Input, Toggle } from "../../components/ui";
 import { smallModel } from "../../lib/models";
+import { doneCount, StatusMark, useAccountStatus, type StatusItem } from "./AccountStatus";
 import { CheckBadge } from "./SettingsDialog";
 import { SignIn } from "./SignIn";
 
@@ -15,21 +16,21 @@ const MODES: Record<string, string[]> = {
   claude_code: ["api_key", "oauth_token", "runner_login"],
   codex: ["chatgpt", "api_key"],
   antigravity: ["google", "api_key"],
+  gemini_cli: ["google", "api_key"],
 };
-// The text of a sign-in kind: a person's own Claude login is made in the browser, the installation's in the runner's terminal.
-const modeText = (provider: string, mode: string, own: boolean) => `${MODE_TEXTS[provider]}.${mode}${own && provider === "claude_code" && mode === "runner_login" ? "Own" : ""}`;
+// The text of a sign-in kind. A sign-in in the browser is kept by PlainBoard and works on every runner.
+const modeText = (provider: string, mode: string) => `${MODE_TEXTS[provider]}.${mode}`;
 const SHARES = ["private", "people", "everyone"] as const;
 // i18n group of the sign-in kinds per provider
-const MODE_TEXTS: Record<string, string> = {
-  claude_code: "settings.auth",
-  codex: "settings.codexAuth",
-  antigravity: "settings.antigravityAuth",
-};
+const MODE_TEXTS: Record<string, string> = { claude_code: "settings.auth", codex: "settings.codexAuth", antigravity: "settings.antigravityAuth", gemini_cli: "settings.geminiAuth" };
+// The note under a sign-in with one's own account, per provider
+const OWN_LOGIN_NOTICES: Record<string, string> = { codex: "settings.codexOwnLoginNotice", antigravity: "settings.antigravityOwnLoginNotice", gemini_cli: "settings.geminiOwnLoginNotice" };
 const SECRET_LABELS: Record<string, string> = {
   "claude_code:oauth_token": "settings.oauthToken",
   "claude_code:api_key": "settings.apiKey",
   "codex:api_key": "settings.openaiApiKey",
   "antigravity:api_key": "settings.geminiApiKey",
+  "gemini_cli:api_key": "settings.geminiApiKey",
 };
 
 /** The accounts of one provider: the installation's, or with ``own`` people's own ones (a non-admin:
@@ -40,7 +41,8 @@ export function AccountsEditor({ provider, own = false }: { provider: string; ow
   const me = useMe();
   const accounts = useAccounts();
   const [error, setError] = useState<unknown>(null);
-  const adds = !own || !me?.is_admin;
+  const allowed = useSettings().data?.values.own_accounts ?? true; // #138: an admin may turn adding one's own off
+  const adds = !own || (!me?.is_admin && allowed);
   const mine = (accounts.data ?? []).filter((a) => a.provider === provider && (own ? a.owner_id != null && a.can_manage : a.owner_id == null));
 
   const run = async (action: () => Promise<unknown>) => {
@@ -66,7 +68,7 @@ export function AccountsEditor({ provider, own = false }: { provider: string; ow
           {t("accounts.add")}
         </Button>
       )}
-      {!adds && !mine.length && <p className="text-fg-3">{t("accounts.noneOwn")}</p>}
+      {own && me?.is_admin && !mine.length && <p className="text-fg-3">{t("accounts.noneOwn")}</p>}
       <ErrorText error={error} />
     </div>
   );
@@ -77,7 +79,6 @@ function AccountCard({ account, onChange }: { account: Account; onChange: (actio
   const meta = useMeta();
   const me = useMe();
   const modes = MODES[account.provider]; // a person's own has every sign-in too: one in the browser is kept for it alone
-  const own = account.owner_id != null;
   const limits = useLimits();
   const detected = limits.data?.accounts.find((entry) => entry.account_id === account.id);
   const [label, setLabel] = useState(account.label);
@@ -86,6 +87,8 @@ function AccountCard({ account, onChange }: { account: Account; onChange: (actio
   const [check, setCheck] = useState<CheckResult | null>(null);
   useEffect(() => setLabel(account.label), [account.label]);
   useEffect(() => setSize(account.plan_size?.toString() ?? ""), [account.plan_size]);
+  const status = useAccountStatus(account);
+
 
   const patch = (body: Record<string, unknown>) => onChange(() => api.patch(`/accounts/${account.id}`, body));
   const secretLabel = SECRET_LABELS[`${account.provider}:${account.auth_mode}`];
@@ -103,23 +106,26 @@ function AccountCard({ account, onChange }: { account: Account; onChange: (actio
     }
   };
 
-  return (
-    <div className={clsx("space-y-3 rounded-sm p-3 ring-1 ring-line", !account.enabled && "opacity-60")}>
-      <div className="flex items-center gap-2">
-        <Input
-          aria-label={t("accounts.label")}
-          className="min-w-0 flex-1 font-medium"
-          value={label}
-          onChange={(e) => setLabel(e.target.value)}
-          onBlur={() => label.trim() && label !== account.label && patch({ label })}
-        />
-        <Toggle checked={account.enabled} onChange={(enabled) => patch({ enabled })} label={<span>{t("accounts.enabled")}</span>} />
-        <IconButton label={t("accounts.delete")} onClick={remove}>
-          <Trash2 className="size-3.5" />
-        </IconButton>
-      </div>
-      {account.owner_id != null && account.owner_id !== me?.id && <p className="text-fg-3">{t("accounts.ownedBy", { name: account.owner_name })}</p>}
-      {account.owner_id != null && <Sharing account={account} patch={patch} />}
+  const head = (
+    <div className="flex items-center gap-2">
+      <Input
+        aria-label={t("accounts.label")}
+        className="min-w-0 flex-1 font-medium"
+        value={label}
+        onChange={(e) => setLabel(e.target.value)}
+        onBlur={() => label.trim() && label !== account.label && patch({ label })}
+      />
+      <Toggle checked={account.enabled} onChange={(enabled) => patch({ enabled })} label={<span>{t("accounts.enabled")}</span>} />
+      <IconButton label={t("accounts.delete")} onClick={remove}>
+        <Trash2 className="size-3.5" />
+      </IconButton>
+    </div>
+  );
+  const ownedBy = account.owner_id != null && account.owner_id !== me?.id && <p className="text-fg-3">{t("accounts.ownedBy", { name: account.owner_name })}</p>;
+  const sharing = account.owner_id != null && <Sharing account={account} patch={patch} />;
+  const give = account.owner_id != null && account.owner_id === me?.id && <GiveToProjects account={account} onChange={onChange} />;
+  const signIn = (
+    <div className="space-y-3" data-part="account-signin">
       <div className={clsx("grid gap-2", modes.length === 3 ? "sm:grid-cols-3" : modes.length === 2 ? "grid-cols-2" : "grid-cols-1")}>
         {modes.map((mode) => (
           <button
@@ -130,8 +136,8 @@ function AccountCard({ account, onChange }: { account: Account; onChange: (actio
               account.auth_mode === mode ? "bg-sunk ring-fg" : "ring-line hover:bg-sunk",
             )}
           >
-            <div className="font-medium">{t(modeText(account.provider, mode, own))}</div>
-            <div className="text-fg-3">{t(`${modeText(account.provider, mode, own)}Hint`)}</div>
+            <div className="font-medium">{t(modeText(account.provider, mode))}</div>
+            <div className="text-fg-3">{t(`${modeText(account.provider, mode)}Hint`)}</div>
           </button>
         ))}
       </div>
@@ -160,14 +166,8 @@ function AccountCard({ account, onChange }: { account: Account; onChange: (actio
           </span>
         </div>
       )}
-      {account.auth_mode === "runner_login" && own && <SignIn accountId={account.id} provider={account.provider} />}
-      {account.auth_mode === "runner_login" && !own && (
-        <p className="rounded-sm bg-sunk p-3 text-fg-2">
-          {t("settings.runnerLoginHint")} <code className="font-mono">docker compose exec -it runner claude</code>
-        </p>
-      )}
-      {account.provider === "codex" && account.auth_mode === "chatgpt" && <SignIn accountId={account.id} provider={account.provider} />}
-      {account.provider === "antigravity" && account.auth_mode === "google" && <SignIn accountId={account.id} provider={account.provider} />}
+      {account.auth_mode === "runner_login" && <SignIn accountId={account.id} provider={account.provider} />}
+      {((account.provider === "codex" && account.auth_mode === "chatgpt") || account.auth_mode === "google") && <SignIn accountId={account.id} provider={account.provider} />}
       {account.auth_mode !== "api_key" && (
         <label className="block space-y-1">
           <span className="block font-medium text-fg-2">{t("accounts.planSize")}</span>
@@ -188,15 +188,7 @@ function AccountCard({ account, onChange }: { account: Account; onChange: (actio
         </label>
       )}
       {account.auth_mode !== "api_key" && (
-        <p className="text-fg-2">
-          {t(
-            account.provider === "codex"
-              ? "settings.codexOwnLoginNotice"
-              : account.provider === "antigravity"
-                ? "settings.antigravityOwnLoginNotice"
-                : "settings.ownLoginNotice",
-          )}
-        </p>
+        <p className="text-fg-2">{t(OWN_LOGIN_NOTICES[account.provider] ?? "settings.ownLoginNotice")}</p>
       )}
       <div className="flex items-center gap-3">
         <Button size="sm" onClick={test}>
@@ -205,6 +197,57 @@ function AccountCard({ account, onChange }: { account: Account; onChange: (actio
         <CheckBadge result={check} />
       </div>
     </div>
+  );
+  return (
+    <div className={clsx("space-y-3 rounded-sm p-3 ring-1 ring-line", !account.enabled && "opacity-60")}>
+      {head}
+      {ownedBy}
+      <p className="text-fg-3">{t("accountStatus.progress", doneCount(status))}</p>
+      <ol data-part="account-steps">
+        <Step n={1} item={status[0]} title={t("accountStatus.step.login")}>
+          {signIn}
+        </Step>
+        <Step n={2} item={status[1]} title={t("accountStatus.step.share")}>
+          {sharing || <p className="text-fg-3">{t("accountStatus.share.installationHint")}</p>}
+        </Step>
+        <Step n={3} item={status[2]} title={t("accountStatus.step.projects")}>
+          {give}
+          <p className="text-fg-3">{t(account.owner_id == null ? "accountStatus.projects.installationHint" : "accountStatus.projects.ownHint")}</p>
+        </Step>
+        <Step n={4} item={status[3]} title={status[3].label ?? t("accountStatus.step.limits")} last>
+          <p className="text-fg-3">{t(account.auth_mode === "api_key" ? "accountStatus.use.hint" : "accountStatus.limits.hint")}</p>
+        </Step>
+      </ol>
+    </div>
+  );
+}
+
+/** One numbered step of setting a subscription up, checked once it is in order (#140). */
+export function Step({ n, item, title, last, children }: { n: number; item: StatusItem; title: string; last?: boolean; children: ReactNode }) {
+  return (
+    <li className="grid grid-cols-[1.5rem_minmax(0,1fr)] gap-x-3" data-step={item.key}>
+      <div className="flex flex-col items-center">
+        <span
+          className={clsx(
+            "flex size-6 flex-none items-center justify-center rounded-full font-medium ring-1",
+            item.tone === "done" ? "text-ok ring-ok" : item.tone === "todo" ? "bg-you-bg text-you-fg ring-you" : "text-fg-3 ring-line-2",
+          )}
+        >
+          {item.tone === "done" ? <Check className="size-3.5" /> : n}
+        </span>
+        {!last && <span className="my-1 w-px flex-1 bg-line" />}
+      </div>
+      <div className={clsx("min-w-0 space-y-2", !last && "pb-5")}>
+        <div className="flex min-h-6 flex-wrap items-center gap-x-2">
+          <span className="font-semibold">{title}</span>
+          <span className={clsx("flex min-w-0 items-center gap-1.5", item.tone === "todo" ? "text-you-fg" : "text-fg-3")}>
+            <StatusMark tone={item.tone} />
+            <span className="min-w-0">{item.text}</span>
+          </span>
+        </div>
+        {children}
+      </div>
+    </li>
   );
 }
 
@@ -247,6 +290,37 @@ export function Sharing({ account, patch }: { account: Account; patch: (body: Re
           <p className="text-fg-3">{t("accounts.share.nobody")}</p>
         ))}
       <p className="text-fg-3">{t("accounts.share.hint")}</p>
+    </div>
+  );
+}
+
+/** The projects one works in that get one's own subscription for their runs, whoever it is shared with. */
+function GiveToProjects({ account, onChange }: { account: Account; onChange: (action: () => Promise<unknown>) => Promise<boolean> }) {
+  const { t } = useTranslation();
+  const qc = useQueryClient();
+  const projects = (useProjects().data ?? []).filter((p) => p.role === "member" || p.role === "owner");
+  const given = account.project_ids ?? [];
+  if (!projects.length) return null;
+  const toggle = (projectId: number) =>
+    onChange(async () => {
+      await api.put(`/projects/${projectId}/given-accounts/${account.id}`, { given: !given.includes(projectId) });
+      await Promise.all([qc.invalidateQueries({ queryKey: ["project-accounts", projectId] }), qc.invalidateQueries({ queryKey: ["given-accounts", projectId] })]);
+    });
+
+  return (
+    <div className="space-y-1.5" data-part="account-projects">
+      <span className="block font-medium text-fg-2">{t("givenAccounts.toProjects")}</span>
+      <ul className="flex flex-wrap gap-x-3 gap-y-0.5">
+        {projects.map((p) => (
+          <li key={p.id}>
+            <label className="flex cursor-pointer items-center gap-1.5 py-0.5">
+              <input type="checkbox" checked={given.includes(p.id)} onChange={() => toggle(p.id)} />
+              <span className="truncate">{p.name}</span>
+            </label>
+          </li>
+        ))}
+      </ul>
+      <p className="text-fg-3">{t("givenAccounts.toProjectsHint")}</p>
     </div>
   );
 }

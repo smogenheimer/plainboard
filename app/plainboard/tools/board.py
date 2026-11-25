@@ -275,4 +275,6 @@ async def resolve_decision(ctx: ToolContext, args: ResolveDecisionArgs) -> str:
         return f"Withdrew decision {decision.id}."
     option_index = args.option - 1 if args.option else None
     await decision_service.answer(ctx.session, decision, option_index=option_index, text=args.note, by="agent", agent_id=ctx.agent.id)
+    if decision.requested_by_agent_id not in (None, ctx.agent.id):  # e.g. a doc agent's proposal (#156)
+        await ctx.runs.decision_answered(ctx.session, decision)
     return f"Recorded decision {decision.id}."

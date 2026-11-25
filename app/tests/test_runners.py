@@ -267,6 +267,8 @@ def test_each_project_runs_on_its_own_runner_and_a_runner_never_gets_another_pro
     reaches the external one, and the other way round (its credentials and secrets with them)."""
     builtin = client.app_ref.state.runner
     external = FakeRunner("tunnel")
+    claude = next(a for a in client.get("/api/accounts").json() if a["provider"] == "claude_code")
+    client.patch(f"/api/accounts/{claude['id']}", json={"auth_mode": "oauth_token", "secret": "tok"})  # the home's sign-in is the built-in runner's
     hub = _hub(client)
     hub.make_client = lambda _rid: external
     rid = _add_runner(client)["runner"]["id"]

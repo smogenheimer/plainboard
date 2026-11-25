@@ -270,11 +270,11 @@
 :is([data-design="classic"], [data-design="slop2gether"]) [data-part="toggle"] > span {
   border-radius: 9999px;
 }
-:is([data-design="classic"], [data-design="slop2gether"]) [data-part="toggle"][aria-checked="true"] {
+:is([data-design="classic"], [data-design="slop2gether"]) [data-part="toggle"][data-on="true"] {
   background: var(--accent);
   --tw-ring-color: var(--accent);
 }
-:is([data-design="classic"], [data-design="slop2gether"]) [data-part="toggle"][aria-checked="true"] > span {
+:is([data-design="classic"], [data-design="slop2gether"]) [data-part="toggle"][data-on="true"] > span {
   background: #fff;
 }
 :is([data-design="classic"], [data-design="slop2gether"]) [data-part="error"] {

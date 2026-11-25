@@ -27,11 +27,13 @@ def _register_builtin() -> None:
     from .claude_code import ClaudeCodeProvider
     from .codex import CodexProvider
     from .endpoints import providers as endpoint_providers
+    from .gemini_cli import GeminiCliProvider
     from .mock import MockProvider
 
     register_provider(ClaudeCodeProvider())
     register_provider(CodexProvider())
     register_provider(AntigravityProvider())
+    register_provider(GeminiCliProvider())
     for provider in endpoint_providers():
         register_provider(provider)
     register_provider(MockProvider())

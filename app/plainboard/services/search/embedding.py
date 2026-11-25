@@ -328,7 +328,7 @@ MODELS: tuple[ModelCard, ...] = (
     ModelCard(
         "multilingual-e5-small", "multilingual-e5-small", "small",
         "Lean: ~100 languages, the least memory and the quickest index; finds well, the larger ones find better.",
-        dim=384, max_tokens=512, licence="MIT", download_mb=135, ram_mb=550, speed=30.0, hint_similarity=0.9, mmteb=55.5, mmteb_retrieval=49.3,
+        dim=384, max_tokens=512, licence="MIT", download_mb=135, ram_mb=550, speed=30.0, hint_similarity=0.93, mmteb=55.5, mmteb_retrieval=49.3,
         repo="Xenova/multilingual-e5-small", revision="761b726dd34fb83930e26aab4e9ac3899aa1fa78",
         files={"model.onnx": ("onnx/model_quantized.onnx", "f80102d3f2a1229f387d3c81909990d8945513e347b0eab049f7de3c6f98c193"),
                "tokenizer.json": ("tokenizer.json", "0b44a9d7b51c3c62626640cda0e2c2f70fdacdc25bbbd68038369d14ebdf4c39")},
@@ -337,7 +337,7 @@ MODELS: tuple[ModelCard, ...] = (
     ModelCard(
         "gte-multilingual-base", "gte-multilingual-base", "balanced",
         "On benchmarks a little ahead of e5 base at finding, 70+ languages, long texts; but less than half its speed here, and more memory.",
-        dim=768, max_tokens=8192, licence="Apache-2.0", download_mb=357, ram_mb=950, speed=5.4, hint_similarity=0.79, mmteb=58.2, mmteb_retrieval=56.5,
+        dim=768, max_tokens=8192, licence="Apache-2.0", download_mb=357, ram_mb=950, speed=5.4, hint_similarity=0.85, mmteb=58.2, mmteb_retrieval=56.5,
         repo="onnx-community/gte-multilingual-base", revision="2edbf5e672aab465f9ed4c154a8b61791c082c69",
         files={"model.onnx": ("onnx/model_quantized.onnx", "ab2bd164ebd8ca9003dc49a981b611e849b5d326f504c8873ba76e07fa6c0082"),
                "tokenizer.json": ("tokenizer.json", "3a56def25aa40facc030ea8b0b87f3688e4b3c39eb8b45d5702b3a1300fe2a20")},
@@ -346,7 +346,7 @@ MODELS: tuple[ModelCard, ...] = (
     ModelCard(
         "multilingual-e5-base", "multilingual-e5-base", "balanced",
         "Recommended, balanced: ~100 languages, finds clearly better than small at less than half its speed; the default.",
-        dim=768, max_tokens=512, licence="MIT", download_mb=296, ram_mb=750, speed=12.4, hint_similarity=0.86, mmteb=57.0, mmteb_retrieval=52.7, recommended=True,
+        dim=768, max_tokens=512, licence="MIT", download_mb=296, ram_mb=750, speed=12.4, hint_similarity=0.9, mmteb=57.0, mmteb_retrieval=52.7, recommended=True,
         repo="Xenova/multilingual-e5-base", revision="1ec9243030a27d1a115d5c340572074c125b58b2",
         files={"model.onnx": ("onnx/model_quantized.onnx", "df7a9a29309e3ad491e1783adf8baee710262cc06079c7cbab63c630277fac94"),
                "tokenizer.json": ("tokenizer.json", "62c24cdc13d4c9952d63718d6c9fa4c287974249e16b7ade6d5a85e7bbb75626")},
@@ -355,7 +355,7 @@ MODELS: tuple[ModelCard, ...] = (
     ModelCard(
         "bge-m3", "bge-m3", "large",
         "Best quality: 100+ languages and long texts (8k tokens), about 9x slower than small; for a strong server.",
-        dim=1024, max_tokens=8192, licence="MIT", download_mb=587, ram_mb=1200, speed=3.5, hint_similarity=0.71, mmteb=None, mmteb_retrieval=55.6,
+        dim=1024, max_tokens=8192, licence="MIT", download_mb=587, ram_mb=1200, speed=3.5, hint_similarity=0.79, mmteb=None, mmteb_retrieval=55.6,
         repo="Xenova/bge-m3", revision="4de13258303883538bd53b696b452bf8099f0858",
         files={"model.onnx": ("onnx/model_quantized.onnx", "0826f8c1ab9edf1801db86c61919d4d108e8bfc0b809ec823ad366882ff0b77d"),
                "tokenizer.json": ("tokenizer.json", "6710678b12670bc442b99edc952c4d996ae309a7020c1fa0096dd245c2faf790")},
@@ -364,7 +364,7 @@ MODELS: tuple[ModelCard, ...] = (
     ModelCard(
         "multilingual-e5-large", "multilingual-e5-large", "large",
         "Best quality of the e5: ~100 languages, about 7x slower than small; for a strong server.",
-        dim=1024, max_tokens=512, licence="MIT", download_mb=579, ram_mb=1200, speed=4.2, hint_similarity=0.88, mmteb=58.6, mmteb_retrieval=54.1,
+        dim=1024, max_tokens=512, licence="MIT", download_mb=579, ram_mb=1200, speed=4.2, hint_similarity=0.91, mmteb=58.6, mmteb_retrieval=54.1,
         repo="Xenova/multilingual-e5-large", revision="00fc3aeb3dbb95842de2ac1961d33c6319acf57b",
         files={"model.onnx": ("onnx/model_quantized.onnx", "0a8d65db9a36f810ba5da15249f13145fcdc7890e6656f1fd38cd8b7c4db1fca"),
                "tokenizer.json": ("tokenizer.json", "62c24cdc13d4c9952d63718d6c9fa4c287974249e16b7ade6d5a85e7bbb75626")},

@@ -91,7 +91,7 @@ def test_deleting_a_project_can_take_its_folders_along(client):
     repo = client.post(f"/api/projects/{kept['id']}/repositories", json={"name": "api", "url": "https://github.com/acme/api.git"}).json()
     # Not asked for: the agents' folders stay, the runner's own clones of the repositories go.
     assert client.delete(f"/api/projects/{kept['id']}").status_code == 204
-    assert runner.removed[-1].workspace is None and runner.removed[-1].trains == [f"p{kept['id']}-r{repo['id']}"]
+    assert runner.removed[-1].workspace is None and runner.removed[-1].trains == [f"p{kept['id']}-r{repo['id']}", f"p{kept['id']}-r{repo['id']}-release"]
 
     # Asked for: a new project of the same name gets the same folder, so the old one has to go.
     again = client.post("/api/projects", json={"name": "Shop"}).json()
@@ -318,33 +318,56 @@ def test_done_tickets_are_archived_and_restored(client, project):
     assert client.portal.call(age_and_auto_archive) == 0
 
 
-def test_tickets_left_in_review_move_to_done_unless_they_wait_for_the_user(client, project):
+def test_tickets_left_in_review_go_to_the_manager_once_per_stale_period(client, project):
     from datetime import timedelta
 
     from plainboard.db import sessionmaker
-    from plainboard.models import Task, utcnow
-    from plainboard.services import board as board_service
+    from plainboard.models import Agent, Task, utcnow
+    from plainboard.orchestration import inbox
     from sqlalchemy import update
 
     pid = project["id"]
     assert project["review_days"] == 3
-    old, marked, new = (client.post(f"/api/projects/{pid}/tasks", json={"title": t, "status": "review"}).json() for t in ("Old", "Marked", "New"))
+    client.patch(f"/api/projects/{pid}", json={"auto_wake_manager": False})
+    old, other, marked, new = (client.post(f"/api/projects/{pid}/tasks", json={"title": t, "status": "review"}).json() for t in ("Old", "Other", "Marked", "New"))
     client.patch(f"/api/tasks/{marked['id']}", json={"user_action": "Try the login"})
+    manager_id = next(a["id"] for a in client.get(f"/api/projects/{pid}/agents").json() if a["is_manager"])
 
-    async def age_and_accept():
+    async def age(ids, days, handed_days=None):
         async with sessionmaker()() as s:
-            await s.execute(update(Task).where(Task.id.in_((old["id"], marked["id"]))).values(updated_at=utcnow() - timedelta(days=4)))
+            values = {"updated_at": utcnow() - timedelta(days=days)}
+            if handed_days is not None:
+                values["review_handed_at"] = utcnow() - timedelta(days=handed_days)
+            await s.execute(update(Task).where(Task.id.in_(ids)).values(**values))
             await s.commit()
-            return await board_service.accept_reviews(s)
 
+    async def tick():
+        await client.app_ref.state.scheduler.tick()
+        async with sessionmaker()() as s:
+            return await inbox.consume(s, manager_id)
+
+    client.portal.call(age, [old["id"], other["id"], marked["id"]], 4)
     client.patch(f"/api/projects/{pid}", json={"review_days": 0})
-    assert client.portal.call(age_and_accept) == 0
+    assert client.portal.call(tick) == []
     client.patch(f"/api/projects/{pid}", json={"review_days": 3})
-    assert client.portal.call(age_and_accept) == 1
+    [update_] = client.portal.call(tick)
+    assert f"#{old['number']} Old: unchanged for 4 d" in update_ and f"#{other['number']} Other" in update_
+    assert f"#{marked['number']}" not in update_ and f"#{new['number']}" not in update_
     detail = lambda t: client.get(f"/api/tasks/{t['id']}").json()  # noqa: E731
-    assert [detail(t)["status"] for t in (old, marked, new)] == ["done", "review", "review"]
-    comment = detail(old)["comments"][-1]
-    assert comment["author_kind"] == "system" and "3 days in review" in comment["body"]
+    assert [detail(t)["status"] for t in (old, other, marked, new)] == ["review"] * 4
+    assert client.portal.call(tick) == []  # once per stale period, not every tick
+    client.portal.call(age, [old["id"]], 8, 4)  # left as it was for another period: it comes again
+    [again] = client.portal.call(tick)
+    assert f"#{old['number']}" in again and f"#{other['number']}" not in again
+
+    async def without_manager():
+        async with sessionmaker()() as s:
+            await s.execute(update(Agent).where(Agent.id == manager_id).values(is_manager=False))
+            await s.commit()
+
+    client.portal.call(without_manager)
+    client.portal.call(age, [old["id"]], 8, 4)
+    assert client.portal.call(tick) == []
 
 
 def test_preview_opens_a_server_in_the_runner_through_plainboard(client, project, monkeypatch):
@@ -403,6 +426,9 @@ def test_preview_opens_a_server_in_the_runner_through_plainboard(client, project
     assert client.get("/api/health", headers=part).status_code == 200
     assert client.get("/static/app.js", headers={"sec-fetch-site": "same-origin", "sec-fetch-dest": "document"}, follow_redirects=False).status_code != 307
     assert client.get("/static/app.js", headers=part | {"referer": "http://testserver/some/page"}, follow_redirects=False).status_code != 307
+    # A doc site opened in a tab that PlainBoard's service worker controls: it fetches the page again, as "empty" (#142).
+    from_worker = {"sec-fetch-site": "same-origin", "sec-fetch-mode": "navigate", "sec-fetch-dest": "empty"}
+    assert client.get("/docs/guide/", headers=from_worker, follow_redirects=False).status_code != 307
 
     # A server that was told its base path gets the path as it is.
     assert client.get("/preview-base/5173/about?x=1").json() == {"page": "based"}
@@ -557,7 +583,7 @@ def test_a_long_tool_call_is_answered_pending_and_asked_for_again(client, projec
     monkeypatch.setattr(internal, "TOOL_ANSWER_SECONDS", 5.0)
     assert client.post(f"/api/internal/runs/1/tools/pending/{first['pending']}", headers=auth).json()["text"] == "merge_when_green done"
     assert client.post(f"/api/internal/runs/1/tools/pending/{first['pending']}", headers=auth).json()["is_error"]  # given once
-    assert client.post("/api/internal/runs/1/tools/x", headers=auth, json={}).json() == {"text": "x done", "is_error": False, "pending": ""}  # an older runner waits
+    assert client.post("/api/internal/runs/1/tools/x", headers=auth, json={}).json() == {"text": "x done", "is_error": False, "pending": "", "images": []}  # an older runner waits
 
 
 def test_a_ticket_whose_branch_waits_to_land_says_so_and_the_board_hears_when_that_ends(client, project):
@@ -605,3 +631,64 @@ def test_a_ticket_whose_branch_waits_to_land_says_so_and_the_board_hears_when_th
         return bool(seen) and seen[-1] is None and "waiting" in seen
 
     wait_for(heard)
+
+
+def test_tickets_whose_branches_a_repair_branch_carries_show_its_way_until_it_lands(client, project):
+    """A repair that merges a failed train's branches into one of its own (#98): their tickets show that one's landing state."""
+    from plainboard.db import sessionmaker
+    from plainboard.events import bus
+    from plainboard.models import Landing, LandingStatus, Repository, Train, TrainStatus
+    from plainboard.services import landings
+    from sqlalchemy import select
+
+    pid = project["id"]
+    tickets = [client.post(f"/api/projects/{pid}/tasks", json={"title": t}).json() for t in ("A", "B")]
+    queue = bus.subscribe(pid)
+
+    async def repair() -> None:
+        async with sessionmaker()() as session:
+            repo = Repository(project_id=pid, name="api", url="https://example.com/api.git")
+            session.add(repo)
+            await session.flush()
+            train = Train(project_id=pid, repository_id=repo.id, mode="command", status=TrainStatus.FAILED, size=2)
+            session.add(train)
+            await session.flush()
+            for branch, ticket in zip(("feat-a", "feat-b"), tickets, strict=True):
+                session.add(Landing(project_id=pid, repository_id=repo.id, branch=branch, task_id=ticket["id"], status=LandingStatus.BACK, train_id=train.id))
+            carrier = Landing(project_id=pid, repository_id=repo.id, branch="fix/both")
+            session.add(carrier)
+            await session.commit()
+            assert [m.branch for m in await landings.carry(session, carrier, train.id)] == ["feat-a", "feat-b"]
+
+    async def carrier_to(status: LandingStatus) -> None:
+        async with sessionmaker()() as session:
+            carrier = await session.scalar(select(Landing).where(Landing.branch == "fix/both"))
+            carrier.status = status
+            await session.commit()
+
+    def landing_of() -> list:
+        cards = {t["id"]: t["landing"] for t in client.get(f"/api/projects/{pid}/tasks").json()}
+        return [cards[t["id"]] for t in tickets]
+
+    client.portal.call(repair)
+    assert landing_of() == ["waiting", "waiting"]
+    client.portal.call(carrier_to, LandingStatus.TRAIN)
+    assert landing_of() == ["checking", "checking"]
+    (branch,) = client.get(f"/api/tasks/{tickets[0]['id']}/flow").json()
+    assert branch["branch"]["status"] == "checking" and branch["branch"]["title"].startswith("fix/both carrying feat-a")
+    assert [s["state"] for s in branch["steps"] if s["key"] == "checking"] == ["now"]
+
+    seen: list = []
+
+    def heard() -> bool:
+        while not queue.empty():
+            event = queue.get_nowait()
+            if event["type"] == "task.upserted" and event["data"]["id"] == tickets[1]["id"]:
+                seen.append(event["data"]["landing"])
+        return bool(seen) and seen[-1] is None
+
+    client.portal.call(carrier_to, LandingStatus.MERGED)
+    assert landing_of() == [None, None]
+    wait_for(heard)
+    (branch,) = client.get(f"/api/tasks/{tickets[0]['id']}/flow").json()
+    assert branch["branch"]["status"] == "merged" and [s["state"] for s in branch["steps"] if s["key"] == "landed"] == ["done"]

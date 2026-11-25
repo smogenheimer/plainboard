@@ -2,9 +2,11 @@
 # Settings > Runners in PlainBoard shows this file with your URL and token filled in.
 # Save it as docker-compose.yml in an empty folder, then: docker compose up -d
 # It updates itself to PlainBoard's version. Should PlainBoard ask for it: docker compose pull && docker compose up -d
+# The image must match PlainBoard: latest (or its X.Y.Z) for a release, edge for a PlainBoard on :edge or
+# built from source. Choose it with RUNNER_TAG (in .env next to this file); PlainBoard fills in the right one.
 services:
   runner:
-    image: thoenehannes/plainboard-runner:latest
+    image: thoenehannes/plainboard-runner:${RUNNER_TAG:-latest}
     container_name: plainboard-runner
     restart: unless-stopped
     environment:

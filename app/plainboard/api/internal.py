@@ -11,6 +11,7 @@ from plainboard_protocol import TOOL_PENDING_HEADER, ToolCallResult
 
 from ..services import agents as agent_service
 from ..services import board as board_service
+from ..services import docs as docs_service
 from ..services import skills as skill_service
 from ..services.errors import ServiceError
 from .deps import Runs, Session
@@ -103,6 +104,28 @@ async def upload_attachment(
     except ServiceError as exc:
         return ToolCallResult(text=str(exc), is_error=True)
     return ToolCallResult(text=f"Attached {attachment.filename} to ticket #{task.number} (attachment id {attachment.id}).")
+
+
+@router.post("/runs/{run_id}/doc-files", response_model=ToolCallResult)
+async def upload_doc_file(
+    run_id: int,
+    runs: Runs,
+    session: Session,
+    file: UploadFile,
+    site: str = Form(...),
+    authorization: str | None = Header(default=None),
+) -> ToolCallResult:
+    """The attach_doc_file tool: a file of a doc site, kept for good (services/docs.py)."""
+    ctx = _writer(_context(runs, run_id, authorization))
+    try:
+        found = await docs_service.find_site(session, ctx.project_id, site)
+        writer = await agent_service.get(session, ctx.agent_id)
+        if writer.doc_site_id != found.id:
+            return ToolCallResult(text=f"Only the doc agent of {found.slug} adds its files.", is_error=True)
+        attachment = await docs_service.add_file(session, found, file.filename or "file", file.content_type or "", file.file, agent_id=ctx.agent_id)
+    except ServiceError as exc:
+        return ToolCallResult(text=str(exc), is_error=True)
+    return ToolCallResult(text=f"Added {attachment.filename} to doc site {found.slug} (file {attachment.id}). In a page: {docs_service.file_markdown(attachment)}")
 
 
 @router.post("/runs/{run_id}/chat-files", response_model=ToolCallResult)

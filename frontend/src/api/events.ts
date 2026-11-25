@@ -1,12 +1,15 @@
 import { useQueryClient, type QueryClient } from "@tanstack/react-query";
 import { useEffect, useSyncExternalStore } from "react";
 import { qk } from "./queries";
-import type { Agent, Conversation, Message } from "./types";
+import type { Agent, Conversation, Idea, IdeaChange, IdeasData, IdeaTopic, Message } from "./types";
 
 // --- streaming text store (live deltas per agent, not persisted) -----------------------------
 
 type StreamState = Record<number, string>;
 let streams: StreamState = {};
+// Whose conversation a stream belongs to: a stored message names only its conversation, and the
+// conversation of an agent whose chat is not open is not in the cache.
+const streamAgent: Record<number, number> = {};
 const listeners = new Set<() => void>();
 const emit = () => listeners.forEach((l) => l());
 
@@ -19,6 +22,10 @@ const streamStore = {
     if (!(agentId in streams)) return;
     const { [agentId]: _, ...rest } = streams;
     streams = rest;
+    emit();
+  },
+  clearAll() {
+    streams = {};
     emit();
   },
   subscribe(listener: () => void) {
@@ -52,6 +59,72 @@ export function useCopying(pid: number): Copying | undefined {
   return useSyncExternalStore(subscribeCopying, () => copying[pid]);
 }
 
+// --- steps on the board of ideas to show with an undo (live, not persisted) --------------------
+
+let ideaChange: IdeaChange | null = null;
+const changeListeners = new Set<() => void>();
+
+/** Show this step of the ideas (what the AI did with an input, or how it rearranged the topics). */
+export function showIdeaChange(change: IdeaChange | null) {
+  ideaChange = change;
+  changeListeners.forEach((l) => l());
+}
+
+export function useIdeaChange(): IdeaChange | null {
+  return useSyncExternalStore(
+    (l) => {
+      changeListeners.add(l);
+      return () => changeListeners.delete(l);
+    },
+    () => ideaChange,
+  );
+}
+
+function upsertIdea(qc: QueryClient, pid: number, idea: Idea) {
+  qc.setQueryData<IdeasData>(qk.ideas(pid), (old) => {
+    if (!old) return old;
+    const exists = old.ideas.some((i) => i.id === idea.id);
+    // A closed idea stays a moment, to show where it went (the view lets it leave).
+    if (!exists && idea.status !== "open") return old;
+    return { ...old, ideas: exists ? old.ideas.map((i) => (i.id === idea.id ? idea : i)) : [...old.ideas, idea] };
+  });
+}
+
+function handleIdeas(qc: QueryClient, pid: number, type: string, data: any) {
+  switch (type) {
+    case "idea.upserted":
+      upsertIdea(qc, pid, data as Idea);
+      invalidateSoon(qc, qk.ideaQuestions(pid));
+      invalidateSoon(qc, qk.ideaVersions(data.id));
+      break;
+    case "idea.deleted":
+      qc.setQueryData<IdeasData>(qk.ideas(pid), (old) => old && { ...old, ideas: old.ideas.filter((i) => i.id !== data.id) });
+      invalidateSoon(qc, qk.ideaQuestions(pid));
+      break;
+    case "idea_topic.upserted":
+      qc.setQueryData<IdeasData>(qk.ideas(pid), (old) => {
+        if (!old) return old;
+        const topic = data as IdeaTopic;
+        const exists = old.topics.some((t) => t.id === topic.id);
+        return { ...old, topics: exists ? old.topics.map((t) => (t.id === topic.id ? topic : t)) : [...old.topics, topic] };
+      });
+      break;
+    case "idea_topic.deleted":
+      qc.setQueryData<IdeasData>(qk.ideas(pid), (old) => old && { ...old, topics: old.topics.filter((t) => t.id !== data.id) });
+      break;
+    case "idea_change.upserted": {
+      const change = data as IdeaChange;
+      if (change.undone_at) {
+        if (ideaChange?.id === change.id) showIdeaChange(null);
+      } else if ((change.kind === "reorder" || change.source === "auto") && ideaChange?.id !== change.id) showIdeaChange(change);
+      break;
+    }
+    case "ideas.sorting":
+      qc.setQueryData<IdeasData>(qk.ideas(pid), (old) => old && { ...old, sorting: !!data.sorting });
+      break;
+  }
+}
+
 // --- websocket event handling ----------------------------------------------------------------
 
 interface ServerEvent {
@@ -60,6 +133,7 @@ interface ServerEvent {
 }
 
 function upsertMessage(qc: QueryClient, agentId: number | undefined, conversationId: number, msg: Message) {
+  agentId = agentId ?? streamAgent[conversationId];
   const caches = qc.getQueriesData<Conversation>({ queryKey: ["conversation"] });
   for (const [key, conv] of caches) {
     if (!conv || conv.id !== conversationId) continue;
@@ -101,6 +175,7 @@ function handle(qc: QueryClient, pid: number, event: ServerEvent) {
     case "decision":
       invalidateSoon(qc, qk.tasks(pid));
       invalidateSoon(qc, ["task"]);
+      if (entity === "attachment") invalidateSoon(qc, ["docs", pid, "files"]);
       break;
     case "todo":
       invalidateSoon(qc, ["todos"]);
@@ -130,7 +205,10 @@ function handle(qc: QueryClient, pid: number, event: ServerEvent) {
       if (type === "run.upserted" && data.status !== "running" && data.status !== "queued") streamStore.clear(data.agent_id);
       break;
     case "message":
-      if (type === "message.delta") streamStore.append(data.agent_id, data.text);
+      if (type === "message.delta") {
+        streamAgent[data.conversation_id] = data.agent_id;
+        streamStore.append(data.agent_id, data.text);
+      }
       else upsertMessage(qc, undefined, data.conversation_id, data as Message);
       break;
     case "conversation":
@@ -164,6 +242,16 @@ function handle(qc: QueryClient, pid: number, event: ServerEvent) {
     case "mention":
       invalidateSoon(qc, qk.mentions);
       break;
+    case "doc_site":
+    case "doc_page":
+      invalidateSoon(qc, ["docs", pid]);
+      break;
+    case "idea":
+    case "idea_topic":
+    case "idea_change":
+    case "ideas":
+      handleIdeas(qc, pid, type, data);
+      break;
   }
 }
 
@@ -182,7 +270,11 @@ export function useProjectEvents(pid: number | null) {
       const proto = location.protocol === "https:" ? "wss" : "ws";
       socket = new WebSocket(`${proto}://${location.host}/api/projects/${pid}/ws`);
       socket.onopen = () => {
-        if (retry > 0) qc.invalidateQueries(); // resync everything after a reconnect
+        if (retry > 0) {
+          // Resync everything after a reconnect. A stream that missed events is incomplete or already stored.
+          streamStore.clearAll();
+          qc.invalidateQueries();
+        }
         retry = 0;
         ping = window.setInterval(() => socket?.readyState === WebSocket.OPEN && socket.send("ping"), 25_000);
       };

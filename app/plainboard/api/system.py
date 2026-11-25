@@ -13,16 +13,20 @@ from pydantic import BaseModel
 
 from .. import db_move
 from ..config import get_config
-from ..models import TaskStatus
+from ..models import TaskStatus, utcnow
 from ..orchestration.prompts import PINNED_BUDGET_CHARS
-from ..schemas import AccessKeyOut, CheckOut, LimitsOut, PauseOut, PublicApiKeyIn, SearchModelIn, SearchStatusOut, SettingsOut, SettingsUpdate, UsageOut
+from ..schemas import AccessKeyOut, CheckOut, LimitsOut, PauseOut, PublicApiKeyIn, SearchModelIn, RetentionPreviewOut, SearchStatusOut, SettingsOut, SettingsUpdate, TokenUsageOut, UsageOut
 from ..services import access_keys as access_key_service
 from ..services import accounts as account_service
 from ..services import db_read as db_read_service
 from ..services import limits as limits_service
 from ..services import pause as pause_service
+from ..services import retention as retention_service
+from ..services import runners as runner_service
 from ..services import search as search_service
 from ..services import settings as settings_service
+from ..services import stats as stats_service
+from ..services import users as user_service
 from ..services import usage as usage_service
 from ..services import version as version_service
 from ..services.errors import ServiceError
@@ -64,6 +68,8 @@ async def meta(runner: Runner, session: Session) -> dict[str, Any]:
         # The running commit and how far it is behind the newest PlainBoard; None: not known or not wanted.
         "version": version_service.current() if await settings_service.get(session, "update_check") else None,
         "database": "postgresql" if get_config().postgres else "sqlite",
+        # The runner image tag that matches this PlainBoard: latest (release) or edge (:edge, built from source).
+        "runner_tag": runner_service.tag(),
     }
 
 
@@ -173,6 +179,13 @@ async def usage(session: Session, runs: Runs) -> UsageOut:
     return await usage_service.overview(session, runs)
 
 
+@router.get("/usage/tokens", response_model=TokenUsageOut)
+async def token_usage(session: Session, who: Who, days: int = Query(default=30, ge=1, le=90)) -> TokenUsageOut:
+    """Tokens and cost per project and day, to compare the projects: an admin's all, everyone else's those they see."""
+    ids = None if who.user is None or who.user.is_admin else set(await user_service.roles(session, who.user))
+    return await stats_service.tokens(session, ids, days)
+
+
 @router.post("/usage/measure", response_model=UsageOut)
 async def measure_usage(session: Session, runs: Runs) -> UsageOut:
     """Measure the folders again, in the background."""
@@ -210,6 +223,8 @@ async def put_settings(body: SettingsUpdate, session: Session, runs: Runs, reque
     except ValueError as exc:
         raise ServiceError(str(exc)) from exc
     runs.recheck()  # more parallel agents: waiting turns may start now
+    if {"own_accounts", "own_accounts_off"} & body.values.keys():
+        await account_service.switch_off_own(session)
     if "update_check" in body.values:
         background.add_task(request.app.state.updates.tick)  # switched on: don't wait hours for the first answer
     return await get_settings(session)
@@ -217,6 +232,12 @@ async def put_settings(body: SettingsUpdate, session: Session, runs: Runs, reque
 
 class SshKeyIn(BaseModel):
     private_key: str | None = None  # empty: PlainBoard creates a key pair
+
+
+@router.get("/settings/attachment-retention", response_model=RetentionPreviewOut)
+async def default_retention_preview(session: Session, days: int = Query(ge=0, le=3650), min_mb: int = Query(default=0, ge=0, le=100000)) -> RetentionPreviewOut:
+    """What a default retention would delete in all projects that follow it, before it is saved."""
+    return await retention_service.preview_default(session, days, min_mb, utcnow())
 
 
 @router.post("/settings/git-ssh-key", response_model=SettingsOut)

@@ -27,11 +27,17 @@ import type {
   FlowHistory,
   FlowLive,
   FlowTicketBranch,
+  Promotion,
+  PromotionPreview,
+  Idea,
+  IdeasData,
+  IdeaVersion,
   Stats,
   Task,
   TaskDetail,
   TodoPage,
   TodoState,
+  TokenUsage,
   Usage,
 } from "./types";
 
@@ -65,6 +71,9 @@ export const qk = {
   pause: ["pause"] as const,
   secrets: (pid: number | null) => ["secrets", pid ?? "global"] as const,
   stats: (pid: number, days: number) => ["stats", pid, days] as const,
+  ideas: (pid: number) => ["ideas", pid] as const,
+  ideaQuestions: (pid: number) => ["ideaQuestions", pid] as const,
+  ideaVersions: (id: number) => ["ideaVersions", id] as const,
 };
 
 export interface AuthStatus {
@@ -132,12 +141,22 @@ export const useTodos = (agentId: number, state: TodoState) =>
   });
 export const useOwnNotes = (agentId: number) =>
   useQuery({ queryKey: qk.ownNotes(agentId), queryFn: () => api.get<OwnNote[]>(`/agents/${agentId}/notes`) });
-export const useConversation =(agentId: number | null) =>
-  useQuery({
+export function useConversation(agentId: number | null) {
+  const qc = useQueryClient();
+  return useQuery({
     queryKey: qk.conversation(agentId ?? 0),
-    queryFn: () => api.get<Conversation>(`/agents/${agentId}/conversation`),
+    queryFn: async () => {
+      const fresh = await api.get<Conversation>(`/agents/${agentId}/conversation`);
+      // A refetch (reconnect, back to the chat) brings the newest page only: the older pages one has
+      // scrolled up to stay, or the message one reads would vanish from under one's eyes.
+      const cur = qc.getQueryData<Conversation>(qk.conversation(agentId ?? 0));
+      const first = fresh.messages[0]?.id;
+      if (!cur || cur.id !== fresh.id || first === undefined || !cur.messages.some((m) => m.id === first)) return fresh;
+      return { ...fresh, messages: [...cur.messages.filter((m) => m.id < first), ...fresh.messages], has_more: cur.has_more };
+    },
     enabled: agentId !== null,
   });
+}
 export const useRuns = (pid: number) =>
   useQuery({ queryKey: qk.runs(pid), queryFn: () => api.get<Run[]>(`/projects/${pid}/runs?limit=100`) });
 export const useAssignments = (pid: number) =>
@@ -149,11 +168,21 @@ export const useSchedules = (pid: number) =>
 export const useMcpServers = (pid: number) =>
   useQuery({ queryKey: qk.mcp(pid), queryFn: () => api.get<McpServer[]>(`/projects/${pid}/mcp-servers`) });
 
+export const useIdeas = (pid: number) => useQuery({ queryKey: qk.ideas(pid), queryFn: () => api.get<IdeasData>(`/projects/${pid}/ideas`) });
+/** The AI's open questions about ideas, for "for you". */
+export const useIdeaQuestions = (pid: number, enabled = true) =>
+  useQuery({ queryKey: qk.ideaQuestions(pid), queryFn: () => api.get<Idea[]>(`/projects/${pid}/ideas/questions`), enabled });
+export const useIdeaVersions = (pid: number, id: number, enabled = true) =>
+  useQuery({ queryKey: qk.ideaVersions(id), queryFn: () => api.get<IdeaVersion[]>(`/projects/${pid}/ideas/${id}/versions`), enabled });
+
 export const useRepositories = (pid: number) =>
   useQuery({ queryKey: qk.repos(pid), queryFn: () => api.get<Repository[]>(`/projects/${pid}/repositories`) });
 
 export const useStats = (pid: number, days: number) =>
   useQuery({ queryKey: qk.stats(pid, days), queryFn: () => api.get<Stats>(`/projects/${pid}/stats?days=${days}`), refetchInterval: 60_000 });
+
+export const useTokenUsage = (days: number) =>
+  useQuery({ queryKey: ["token-usage", days], queryFn: () => api.get<TokenUsage>(`/usage/tokens?days=${days}`), refetchInterval: 120_000 });
 
 export const useFlowCheck = (pid: number, hours: number) =>
   useQuery({ queryKey: ["flow-check", pid, hours], queryFn: () => api.get<FlowFinding[]>(`/projects/${pid}/flow-check?hours=${hours}`), refetchInterval: 120_000 });
@@ -208,5 +237,13 @@ export const useFlowHistory = (pid: number, repositoryId: number | null) =>
     },
     getNextPageParam: (last) => last.next_before,
   });
+/** What promoting a repository's base branch to its release branch would bring now (#129): read from git when the dialog opens. */
+export const usePromotionPreview = (repoId: number, enabled: boolean) =>
+  useQuery({ queryKey: ["promotion", repoId], queryFn: () => api.get<PromotionPreview>(`/repositories/${repoId}/promotion`), enabled, staleTime: 0, retry: false });
+export const usePromote = (pid: number) =>
+  useApiMutation(
+    ({ repoId, tag, sha }: { repoId: number; tag: string; sha: string }) => api.post<Promotion>(`/repositories/${repoId}/promotion`, { tag, sha }),
+    () => [qk.flow(pid)],
+  );
 /** The way a ticket's branches take to the base branch. */
 export const useTaskFlow = (taskId: number) => useQuery({ queryKey: ["taskflow", taskId], queryFn: () => api.get<FlowTicketBranch[]>(`/tasks/${taskId}/flow`) });

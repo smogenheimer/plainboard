@@ -9,6 +9,7 @@ import type { Agent, Todo, TodoState } from "../../api/types";
 import { Markdown } from "../../components/Markdown";
 import { Button, EmptyState, Input, Modal, Select, Spinner, Textarea } from "../../components/ui";
 import { timeAgo } from "../../lib/format";
+import { useDraft } from "../../lib/drafts";
 import { useShell } from "../layout/shell-context";
 
 const STATES: TodoState[] = ["open", "done", "archived"];
@@ -54,8 +55,8 @@ export function TodoDialog({ agent, onClose }: { agent: Agent; onClose: () => vo
 function NewTodo({ agentId }: { agentId: number }) {
   const { t } = useTranslation();
   const refresh = useRefresh();
-  const [title, setTitle] = useState("");
-  const [description, setDescription] = useState("");
+  const [title, setTitle] = useDraft(`todo:${agentId}:title`);
+  const [description, setDescription] = useDraft(`todo:${agentId}`);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
 

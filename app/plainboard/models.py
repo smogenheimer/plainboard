@@ -8,7 +8,7 @@ from typing import Any
 
 from sqlalchemy import JSON, BigInteger, Boolean, Column, Computed, DateTime, Float, ForeignKey, Index, Integer, LargeBinary, String, Table, Text, UniqueConstraint, cast, false, true
 from sqlalchemy.dialects.postgresql import TSVECTOR
-from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
+from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship, validates
 from sqlalchemy.types import UserDefinedType
 
 
@@ -53,6 +53,9 @@ class RunTrigger(StrEnum):
     SCHEDULE = "schedule"
     WAKE = "wake"  # inbox updates (e.g. finished assignments) for the agent
     QUESTION = "question"  # a person's question (orchestration/questions.py): stored when it ends, for the statistics only
+    IDEAS = "ideas"  # sorting ideas or planning tickets from them (orchestration/ideas.py): for the statistics only
+    DOCS = "docs"  # translating doc pages (services/docs_translate.py): for the statistics only
+    DOC_ASSISTANT = "doc_assistant"  # a visitor's question to a doc site's assistant (orchestration/docs_assistant.py): statistics only
 
 
 class AssignmentStatus(StrEnum):
@@ -125,6 +128,12 @@ class Account(Timestamps, Base):
     owner_id: Mapped[int | None] = mapped_column(ForeignKey("users.id", ondelete="CASCADE"))
     share: Mapped[str] = mapped_column(String(20), default="private", server_default="private")
     shared_with: Mapped[list[int] | None] = mapped_column(JSON)
+    # The installation's browser sign-in from before #84, still in the built-in runner's home only: the app
+    # copies it over once (services/accounts.take_over), from then on it is kept here like any other.
+    home_login: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    # The projects its owner gave it to themselves, as a member of each (#93): their runs may use it, whatever
+    # ``share`` says, while the owner works in the project and its owner has not switched it off there.
+    project_ids: Mapped[list[int] | None] = mapped_column(JSON)
 
 
 class Setting(Base):
@@ -181,6 +190,8 @@ class Project(Timestamps, Base):
     # The only accounts this project's agents may run on, set by an admin (empty: any). A project
     # shared with others does not draw on a subscription that is meant for something else.
     account_ids: Mapped[list[int]] = mapped_column(JSON, default=list)
+    # Subscriptions members gave the project (``Account.project_ids``) that its owner switched off for it.
+    blocked_account_ids: Mapped[list[int] | None] = mapped_column(JSON)
     # The runner its agents, jobs and trains run on. Unset: the built-in one.
     runner_id: Mapped[int | None] = mapped_column(ForeignKey("runners.id", ondelete="SET NULL"))
     # Whose project it is: the person who created it. What that person may use (``services/permissions.py``)
@@ -190,14 +201,27 @@ class Project(Timestamps, Base):
     # (RunManager.pause_project). Not ended by a restart, nor when "pause everything" ends.
     paused_at: Mapped[datetime | None] = mapped_column(DateTime)
     paused_by: Mapped[str] = mapped_column(String(100), default="", server_default="")
+    # Paused by PlainBoard itself while every subscription it may use is nearly used up (services/limit_pause.py),
+    # and when that is expected to end (None: unknown). Apart from the pause above: it ends by itself.
+    limit_paused_at: Mapped[datetime | None] = mapped_column(DateTime)
+    limit_resumes_at: Mapped[datetime | None] = mapped_column(DateTime)
+    limit_pause: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())  # off: it never pauses so
     task_counter: Mapped[int] = mapped_column(Integer, default=0)
     label_colors: Mapped[dict[str, str]] = mapped_column(JSON, default=dict)  # label name -> color name
     auto_archive_days: Mapped[int] = mapped_column(Integer, default=14)  # done tickets leave the board after this; 0 = never
-    review_days: Mapped[int] = mapped_column(Integer, default=3)  # tickets left in review move to done after this; 0 = never
+    review_days: Mapped[int] = mapped_column(Integer, default=3)  # tickets left in review go to the manager after this; 0 = never
+    # Files of tickets done this long ago are deleted, their entries stay (services/retention.py); 0 = never.
+    # Files of done tickets (services/retention.py); None: the PlainBoard default (settings), 0: never.
+    attachment_retention_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
+    attachment_retention_min_mb: Mapped[int | None] = mapped_column(Integer, nullable=True)  # only files from this size; 0: all; None with the days: the default
     # What answers people's questions (orchestration/questions.py). Empty: the default (questions.DEFAULT_*).
     ask_provider: Mapped[str] = mapped_column(String(50), default="", server_default="")
     ask_model: Mapped[str] = mapped_column(String(100), default="", server_default="")
     ask_effort: Mapped[str] = mapped_column(String(20), default="", server_default="")
+    # What sorts its ideas into topics (orchestration/ideas.py). Empty: the same as its questions.
+    idea_provider: Mapped[str] = mapped_column(String(50), default="", server_default="")
+    idea_model: Mapped[str] = mapped_column(String(100), default="", server_default="")
+    idea_effort: Mapped[str] = mapped_column(String(20), default="", server_default="")
 
     agents: Mapped[list[Agent]] = relationship(back_populates="project", cascade="all, delete-orphan", passive_deletes=True)
 
@@ -361,6 +385,8 @@ class Repository(Timestamps, Base):
     token_enc: Mapped[str | None] = mapped_column(Text)
     ssh_key_enc: Mapped[str | None] = mapped_column(Text)
     ssh_public_key: Mapped[str] = mapped_column(Text, default="", server_default="")
+    # Promotion (#129): the branch the base branch is promoted to when asked (e.g. main). Empty: none.
+    release_branch: Mapped[str] = mapped_column(String(200), default="", server_default="")
 
 
 agent_repositories = Table(
@@ -404,6 +430,8 @@ class Agent(Timestamps, Base):
     color: Mapped[str] = mapped_column(String(20), default="#6366f1")
     all_repos: Mapped[bool] = mapped_column(Boolean, default=True)  # False = only `repositories`
     account_id: Mapped[int | None] = mapped_column(ForeignKey("accounts.id", ondelete="SET NULL"))  # None = automatic
+    # The doc agent of this doc site (#118): it alone writes the site's pages; hidden from the team and the board.
+    doc_site_id: Mapped[int | None] = mapped_column(ForeignKey("doc_sites.id", ondelete="CASCADE"), index=True)
 
     project: Mapped[Project] = relationship(back_populates="agents")
     repositories: Mapped[list[Repository]] = relationship(secondary=agent_repositories, lazy="selectin")
@@ -437,7 +465,102 @@ class Task(Timestamps, Base):
     user_action: Mapped[str] = mapped_column(String(500), default="")
     # Archived tickets are off the board but keep their history and links.
     archived_at: Mapped[datetime | None] = mapped_column(DateTime, index=True)
+    # When it last went to the manager for lying in review unchanged (projects.review_days).
+    review_handed_at: Mapped[datetime | None] = mapped_column(DateTime)
     created_by_agent_id: Mapped[int | None] = mapped_column(ForeignKey("agents.id", ondelete="SET NULL"))
+
+
+class IdeaStatus(StrEnum):
+    OPEN = "open"
+    TAKEN = "taken"  # became (part of) a ticket: task_id
+    DISMISSED = "dismissed"  # left out on purpose (closed_reason), or its creation was undone
+    MERGED = "merged"  # went into another idea (merged_into_id)
+
+
+class IdeaTopic(Timestamps, Base):
+    """A topic of a project's ideas: an island on the board of ideas, made by the model that sorts them
+    (services/ideas.py) or by a person."""
+
+    __tablename__ = "idea_topics"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(100))
+    color: Mapped[int] = mapped_column(Integer, default=0)  # index into the design's --chart-1..10 (0-9)
+    hint: Mapped[str] = mapped_column(String(300), default="")  # the model's short note, e.g. "3 ideas about payment"
+    x: Mapped[float | None] = mapped_column(Float)  # where the island lies; None: the UI places it
+    y: Mapped[float | None] = mapped_column(Float)
+    manual: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())  # made or renamed by a person: the model keeps its name
+
+
+class Idea(Timestamps, Base):
+    """An idea of a project. Collecting and sorting ideas starts nothing: only a person turns them into tickets."""
+
+    __tablename__ = "ideas"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    title: Mapped[str] = mapped_column(String(200), default="")
+    text: Mapped[str] = mapped_column(Text, default="")
+    author: Mapped[str] = mapped_column(String(100), default="")
+    status: Mapped[str] = mapped_column(String(20), default=IdeaStatus.OPEN, index=True)
+    topic_id: Mapped[int | None] = mapped_column(ForeignKey("idea_topics.id", ondelete="SET NULL"), index=True)
+    task_id: Mapped[int | None] = mapped_column(ForeignKey("tasks.id", ondelete="SET NULL"))  # the ticket it went into
+    hint: Mapped[str] = mapped_column(String(300), default="")  # the model's short note, e.g. "similar to ..."
+    # Sorting by the model: pending (waiting for it), sorted, failed (left unsorted; "sort again" retries).
+    sort_state: Mapped[str] = mapped_column(String(10), default="pending")
+    x: Mapped[float | None] = mapped_column(Float)  # where the card lies; None: the UI places it
+    y: Mapped[float | None] = mapped_column(Float)
+    votes: Mapped[int] = mapped_column(Integer, default=0)
+    closed_at: Mapped[datetime | None] = mapped_column(DateTime)  # taken, dismissed or merged
+    closed_reason: Mapped[str] = mapped_column(String(300), default="")
+    # Placed by a person (moved to a topic or on the board): the model leaves its topic alone.
+    topic_manual: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    merged_into_id: Mapped[int | None] = mapped_column(ForeignKey("ideas.id", ondelete="SET NULL"))
+    # The model's question about it, as a decision for the person: options [{label, description}], the first recommended.
+    question: Mapped[str] = mapped_column(Text, default="", server_default="")
+    question_options: Mapped[list[dict[str, Any]]] = mapped_column(JSON, default=list, server_default="[]")
+    question_status: Mapped[str] = mapped_column(String(10), default="", server_default="")  # "" | open | answered | withdrawn
+    question_answer: Mapped[str] = mapped_column(Text, default="", server_default="")
+    question_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class IdeaLink(Base):
+    """The model's finding that an idea is similar to, or a duplicate of, another one."""
+
+    __tablename__ = "idea_links"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    idea_id: Mapped[int] = mapped_column(ForeignKey("ideas.id", ondelete="CASCADE"), index=True)
+    other_id: Mapped[int] = mapped_column(ForeignKey("ideas.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(10), default="similar")  # services/ideas.py: duplicate | kept | split | conflict | resolved (similar: no longer made)
+
+
+class IdeaVersion(Base):
+    """An earlier title and text of an idea, kept whenever they change: by a person, the model, or an undo."""
+
+    __tablename__ = "idea_versions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    idea_id: Mapped[int] = mapped_column(ForeignKey("ideas.id", ondelete="CASCADE"), index=True)
+    title: Mapped[str] = mapped_column(String(200), default="")
+    text: Mapped[str] = mapped_column(Text, default="")
+    source: Mapped[str] = mapped_column(String(10), default="user")  # who replaced it: user | ai | undo
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class IdeaChange(Base):
+    """What happened to the ideas in one step (an input read by the model, an edit, a rearrangement of the
+    topics), for the UI to show and to undo. ``undo`` holds the state before it (services/ideas.undo)."""
+
+    __tablename__ = "idea_changes"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    kind: Mapped[str] = mapped_column(String(20))  # new | several | amend | merge | split | resolve | question | edit | reorder
+    source: Mapped[str] = mapped_column(String(10), default="input")  # input | answer | user | auto | button
+    author: Mapped[str] = mapped_column(String(100), default="")
+    summary: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    undo: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    undone_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
 class TicketState(Base):
@@ -479,12 +602,274 @@ class Attachment(Base):
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
     task_id: Mapped[int | None] = mapped_column(ForeignKey("tasks.id", ondelete="CASCADE"), index=True)
+    # A file of an idea (#100): never deleted by the retention, kept when the idea is closed.
+    idea_id: Mapped[int | None] = mapped_column(ForeignKey("ideas.id", ondelete="CASCADE"), index=True)
+    # A file of a doc site (#118): never deleted by the retention or the cleanup, only with its site or by hand.
+    doc_site_id: Mapped[int | None] = mapped_column(ForeignKey("doc_sites.id", ondelete="CASCADE"), index=True)
     filename: Mapped[str] = mapped_column(String(300))
     content_type: Mapped[str] = mapped_column(String(150))
     size: Mapped[int] = mapped_column(Integer)
     storage_name: Mapped[str] = mapped_column(String(100), unique=True)
     uploaded_by_agent_id: Mapped[int | None] = mapped_column(ForeignKey("agents.id", ondelete="SET NULL"))
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+    # Its file was deleted by the project's retention (services/retention.py); the entry stays with name and size.
+    purged_at: Mapped[datetime | None] = mapped_column(DateTime)
+    purged_after_days: Mapped[int | None] = mapped_column(Integer)
+
+
+class DocSite(Timestamps, Base):
+    """A documentation site of a project (#118, services/docs.py): pages in a tree, written by people and agents,
+    served without login at /docs/<slug> once published, and at its own domain once that is verified."""
+
+    __tablename__ = "doc_sites"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(200))
+    slug: Mapped[str] = mapped_column(String(80), unique=True)  # /docs/<slug>: unique in the installation
+    description: Mapped[str] = mapped_column(String(300), default="")  # for search engines and link previews
+    # The doc spec: what the user wants in it (content, structure, tone, audience), written by the manager with
+    # the user. Every agent that writes the site reads it with the site and follows it.
+    spec: Mapped[str] = mapped_column(Text, default="")
+    published: Mapped[bool] = mapped_column(Boolean, default=False)  # served at all (else a draft, in the app only)
+    public: Mapped[bool] = mapped_column(Boolean, default=False)  # served to everyone; else only to people with a role in the project
+    language: Mapped[str] = mapped_column(String(20), default="en")  # what its pages are written in
+    languages: Mapped[list[str]] = mapped_column(JSON, default=list)  # further languages, translated (services/docs_translate.py)
+    translator: Mapped[str] = mapped_column(String(10), default="")  # llm | deepl | google | "" (none: translations by hand)
+    translate_provider: Mapped[str] = mapped_column(String(50), default="")  # llm: the provider and model ("": the provider's small one)
+    translate_model: Mapped[str] = mapped_column(String(100), default="")
+    deepl_key_enc: Mapped[str | None] = mapped_column(Text)  # write-only
+    google_key_enc: Mapped[str | None] = mapped_column(Text)  # write-only
+    domain: Mapped[str | None] = mapped_column(String(253), unique=True)  # its own host name, served by Host header
+    domain_token: Mapped[str] = mapped_column(String(64), default="")  # answered at /.well-known/plainboard-docs on that host
+    domain_verified_at: Mapped[datetime | None] = mapped_column(DateTime)
+    cloudflare_token_enc: Mapped[str | None] = mapped_column(Text)  # write-only: creates the DNS record
+    # Its assistant for visitors (#119, orchestration/docs_assistant.py): off by default; its own model ("": the
+    # provider's small one); ``assistant_code`` lets it read the code and the board's public texts (a risk: see there).
+    assistant_enabled: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    assistant_provider: Mapped[str] = mapped_column(String(50), default="", server_default="")
+    assistant_model: Mapped[str] = mapped_column(String(100), default="", server_default="")
+    assistant_effort: Mapped[str] = mapped_column(String(20), default="", server_default="")
+    assistant_code: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    assistant_daily_messages: Mapped[int] = mapped_column(Integer, default=300, server_default="300")  # of all visitors
+    assistant_daily_cost: Mapped[float] = mapped_column(Float, default=0.0, server_default="0")  # USD; 0: no cap
+    assistant_max_tokens: Mapped[int] = mapped_column(Integer, default=1024, server_default="1024")  # per answer
+    # Its look (#121, services/docs_theme.py): logos, colours, font, corners, header links, custom CSS. Empty: the
+    # look every site has.
+    theme: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, server_default="{}")
+    # Versions (#126, services/docs_releases.py): off, the site always shows its current state (the working version,
+    # no version in its addresses); on with the first cut. Off again, its versions stay but are not served.
+    versioned: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
+    # Its doc agent checks now and then, once the site grew, whether a larger restructuring would help, and proposes
+    # it to the user (#156, services/docs_proposals.py); off: never. When it last checked and how many pages it had then.
+    restructure_check: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
+    structure_checked_at: Mapped[datetime | None] = mapped_column(DateTime)
+    structure_pages: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+
+
+class DocProposal(Timestamps, Base):
+    """A larger restructuring of a doc site its doc agent proposed (#156, services/docs_proposals.py): the user
+    decides on its ticket; approved, the doc agent does it, declined, the same is not proposed again."""
+
+    __tablename__ = "doc_proposals"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("doc_sites.id", ondelete="CASCADE"), index=True)
+    task_id: Mapped[int | None] = mapped_column(ForeignKey("tasks.id", ondelete="SET NULL"))
+    decision_id: Mapped[int | None] = mapped_column(ForeignKey("decisions.id", ondelete="SET NULL"), index=True)
+    title: Mapped[str] = mapped_column(String(200))
+    reason: Mapped[str] = mapped_column(Text, default="")
+    before: Mapped[str] = mapped_column(Text, default="")  # the outline as it is
+    after: Mapped[str] = mapped_column(Text, default="")  # the outline proposed
+    pages: Mapped[list[int]] = mapped_column(JSON, default=list)  # the pages concerned
+    fingerprint: Mapped[str] = mapped_column(String(64), default="")  # of the proposed outline: the same one again
+    status: Mapped[str] = mapped_column(String(20), default="open")  # open | approved | declined
+
+
+class DocPage(Timestamps, Base):
+    """A page of a doc site. Every saved state is a ``DocPageVersion``."""
+
+    __tablename__ = "doc_pages"
+    __table_args__ = (Index("ix_doc_pages_tree", "site_id", "parent_id", "position"), Index("ix_doc_pages_path", "site_id", "path"))
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("doc_sites.id", ondelete="CASCADE"), index=True)
+    parent_id: Mapped[int | None] = mapped_column(ForeignKey("doc_pages.id", ondelete="CASCADE"), index=True)
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    # Versions of the site (#126, services/docs_releases.py): a row holds the page in the versions ``since_seq`` up to
+    # ``until_seq`` (None: up to the working version); ``page_key`` is the page across versions (the id of its row
+    # with the highest range), what ``parent_id``, links (doc-page:<key>) and every API name it by.
+    page_key: Mapped[int | None] = mapped_column(ForeignKey("doc_pages.id", ondelete="CASCADE"), index=True)
+    since_seq: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    until_seq: Mapped[int | None] = mapped_column(Integer)
+    title: Mapped[str] = mapped_column(String(200))
+    slug: Mapped[str] = mapped_column(String(120))
+    path: Mapped[str] = mapped_column(String(2000), default="")  # its address under the site: the slugs from the top (kept on every move)
+    moved_from: Mapped[list[str]] = mapped_column(JSON, default=list, server_default="[]")  # its earlier addresses, the latest first: they still find it (#156)
+    depth: Mapped[int] = mapped_column(Integer, default=0)
+    body: Mapped[str] = mapped_column(Text, default="")
+    source_hash: Mapped[str] = mapped_column(String(16), default="")  # of title and text: a translation of another one is outdated
+    # Code paths it describes (prefixes or globs, e.g. app/plainboard/services/docs.py, runner/*): a change there
+    # after a landing marks it for an update (orchestration/docs_watcher.py).
+    paths: Mapped[list[str]] = mapped_column(JSON, default=list)
+    edited_by: Mapped[str] = mapped_column(String(100), default="")
+    edited_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)  # its text last changed (a move is no edit)
+    drift: Mapped[int] = mapped_column(Integer, default=0)  # commits that changed its paths since that
+    flagged_at: Mapped[datetime | None] = mapped_column(DateTime)  # since when it may be outdated (an edit clears it)
+    flag_reason: Mapped[str] = mapped_column(Text, default="")
+    reminded_at: Mapped[datetime | None] = mapped_column(DateTime)  # the manager last heard it is stale
+    # Its area and group in the navigation (#159, services/docs_areas.py): pages at the top only, by their keys.
+    area_id: Mapped[int | None] = mapped_column(ForeignKey("doc_areas.id", ondelete="SET NULL"), index=True)
+    group_id: Mapped[int | None] = mapped_column(ForeignKey("doc_groups.id", ondelete="SET NULL"), index=True)
+
+
+class DocArea(Timestamps, Base):
+    """An area of a doc site's navigation (#159, services/docs_areas.py): the pages at the top in sections like
+    "Guides" or "Reference", chosen in a switcher. Versioned like pages: a row holds it in the versions ``since_seq``
+    up to ``until_seq`` (None: up to the working one); ``area_key`` names it across versions (what pages point at)."""
+
+    __tablename__ = "doc_areas"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("doc_sites.id", ondelete="CASCADE"), index=True)
+    area_key: Mapped[int | None] = mapped_column(ForeignKey("doc_areas.id", ondelete="CASCADE"), index=True)
+    since_seq: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    until_seq: Mapped[int | None] = mapped_column(Integer)
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    title: Mapped[str] = mapped_column(String(100))
+    description: Mapped[str] = mapped_column(String(200), default="")
+    icon: Mapped[str] = mapped_column(String(40), default="")  # a lucide icon name (book-open), "": the default
+    texts: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, server_default="{}")  # lang -> {title, description}
+
+
+class DocGroup(Timestamps, Base):
+    """A group of pages at the top of a doc site (#159): a heading in the navigation, inside an area or, without one,
+    in every area (or on a site without areas). Versioned like ``DocArea`` (``group_key``)."""
+
+    __tablename__ = "doc_groups"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("doc_sites.id", ondelete="CASCADE"), index=True)
+    group_key: Mapped[int | None] = mapped_column(ForeignKey("doc_groups.id", ondelete="CASCADE"), index=True)
+    since_seq: Mapped[int] = mapped_column(Integer, default=1, server_default="1")
+    until_seq: Mapped[int | None] = mapped_column(Integer)
+    area_id: Mapped[int | None] = mapped_column(ForeignKey("doc_areas.id", ondelete="SET NULL"), index=True)  # its area's key
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    title: Mapped[str] = mapped_column(String(100))
+    texts: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, server_default="{}")  # lang -> {title}
+
+
+class DocRelease(Timestamps, Base):
+    """A version of a doc site (#126, services/docs_releases.py): the working one (``working``, one per site, what is
+    written now) or one cut from it (``seq``: the order of cutting). The working one's ``seq`` is the one the next cut
+    gets. ``hidden``: not served (for the working one: the switch whether it is public at all)."""
+
+    __tablename__ = "doc_releases"
+    __table_args__ = (UniqueConstraint("site_id", "slug"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("doc_sites.id", ondelete="CASCADE"), index=True)
+    seq: Mapped[int] = mapped_column(Integer, default=1)
+    working: Mapped[bool] = mapped_column(Boolean, default=False)
+    name: Mapped[str] = mapped_column(String(80))
+    slug: Mapped[str] = mapped_column(String(40))  # its address segment: /docs/<site>/<slug>/
+    notes: Mapped[str] = mapped_column(Text, default="")
+    released_on: Mapped[datetime | None] = mapped_column(DateTime)
+    deprecated: Mapped[bool] = mapped_column(Boolean, default=False)
+    hidden: Mapped[bool] = mapped_column(Boolean, default=False)
+    is_default: Mapped[bool] = mapped_column(Boolean, default=False)  # what visitors get at /docs/<site>/ (none: the latest released)
+
+
+class DocPageVersion(Base):
+    """A saved state of a page: who (a person or an agent), when, why. The newest is the page as it is."""
+
+    __tablename__ = "doc_page_versions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    page_id: Mapped[int] = mapped_column(ForeignKey("doc_pages.id", ondelete="CASCADE"), index=True)
+    title: Mapped[str] = mapped_column(String(200))
+    body: Mapped[str] = mapped_column(Text, default="")
+    author: Mapped[str] = mapped_column(String(100), default="")
+    agent_id: Mapped[int | None] = mapped_column(ForeignKey("agents.id", ondelete="SET NULL"))
+    reason: Mapped[str] = mapped_column(String(300), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class DocThemeVersion(Base):
+    """A saved state of a site's theme (#128, services/docs_theme.py): who, when, why. The newest is the theme as it is."""
+
+    __tablename__ = "doc_theme_versions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("doc_sites.id", ondelete="CASCADE"), index=True)
+    theme: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
+    author: Mapped[str] = mapped_column(String(100), default="")
+    agent_id: Mapped[int | None] = mapped_column(ForeignKey("agents.id", ondelete="SET NULL"))
+    reason: Mapped[str] = mapped_column(String(300), default="")
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class DocTranslation(Base):
+    """A page in another language of its site (services/docs_translate.py). ``source_hash``: of the page it was made from."""
+
+    __tablename__ = "doc_translations"
+    __table_args__ = (UniqueConstraint("page_id", "lang"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("doc_sites.id", ondelete="CASCADE"), index=True)
+    page_id: Mapped[int] = mapped_column(ForeignKey("doc_pages.id", ondelete="CASCADE"), index=True)
+    lang: Mapped[str] = mapped_column(String(20))
+    title: Mapped[str] = mapped_column(String(200), default="")
+    body: Mapped[str] = mapped_column(Text, default="")
+    source_hash: Mapped[str] = mapped_column(String(16), default="")
+    translated_by: Mapped[str] = mapped_column(String(100), default="")  # deepl | google | the model | a person's name
+    translated_at: Mapped[datetime | None] = mapped_column(DateTime)
+    error: Mapped[str] = mapped_column(Text, default="")  # the last attempt failed: tried again after a while
+    attempted_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class DocCustomPage(Timestamps, Base):
+    """A page of a site outside its docs tree (#121, services/docs_custom.py): an imprint, a privacy policy, linked
+    in the site's footer at /p/<slug>. Written by people only (legal texts): no agent tool reaches it, the search
+    and the assistant leave it out. ``texts``: its title and text in the site's further languages, by hand."""
+
+    __tablename__ = "doc_custom_pages"
+    __table_args__ = (UniqueConstraint("site_id", "slug"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("doc_sites.id", ondelete="CASCADE"), index=True)
+    position: Mapped[int] = mapped_column(Integer, default=0)
+    title: Mapped[str] = mapped_column(String(200))
+    slug: Mapped[str] = mapped_column(String(120))
+    body: Mapped[str] = mapped_column(Text, default="")
+    texts: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict, server_default="{}")  # lang -> {title, body}
+    edited_by: Mapped[str] = mapped_column(String(100), default="")
+
+
+class DocApiKey(Timestamps, Base):
+    """A read-only key for a doc site's API (#131, services/docs_api.py): it reads that one site, public or private,
+    and nothing else. Only the hash is stored: a key is shown once, when it is made."""
+
+    __tablename__ = "doc_api_keys"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    site_id: Mapped[int] = mapped_column(ForeignKey("doc_sites.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(200), default="")
+    key_hash: Mapped[str] = mapped_column(String(64), unique=True)
+    hint: Mapped[str] = mapped_column(String(8), default="")  # last characters, to recognise the key
+    created_by: Mapped[str] = mapped_column(String(100), default="")
+    expires_at: Mapped[datetime | None] = mapped_column(DateTime)
+    last_used_at: Mapped[datetime | None] = mapped_column(DateTime)
+
+
+class DocWatch(Base):
+    """How far the docs watcher read a repository of a project: its last commit, and the last landing it took in."""
+
+    __tablename__ = "doc_watch"
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), primary_key=True)
+    repository_id: Mapped[int] = mapped_column(ForeignKey("repositories.id", ondelete="CASCADE"), primary_key=True)
+    head: Mapped[str] = mapped_column(String(64), default="")
+    landed_at: Mapped[datetime | None] = mapped_column(DateTime)
+    checked_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
 
 
 class Decision(Timestamps, Base):
@@ -561,6 +946,15 @@ class Landing(Timestamps, Base):
     # is back, branches that change these files wait (landings.busy); once it is, it goes first.
     conflict_at: Mapped[datetime | None] = mapped_column(DateTime)
     conflict_files: Mapped[list[str]] = mapped_column(JSON, default=list)
+    # Held (#96): it does not land, but stays on the list. "message": its author got a message after handing
+    # it over and has to hand it over again (a new commit, or the same one to confirm it). "manager": held by
+    # hand until release_branch. "next": handed over again while on a train: not with that train, with the next.
+    hold: Mapped[str] = mapped_column(String(20), default="", server_default="")
+    held_at: Mapped[datetime | None] = mapped_column(DateTime)
+    hold_reason: Mapped[str] = mapped_column(String(300), default="", server_default="")
+    hold_told_at: Mapped[datetime | None] = mapped_column(DateTime)  # the manager heard it has been held for long
+    # Closed because a repair branch carries it (landings.carry): that landing's id. Its ticket shows that one's way.
+    carried_by: Mapped[int | None] = mapped_column(Integer, index=True)
 
 
 class Train(Timestamps, Base):
@@ -589,6 +983,38 @@ class Train(Timestamps, Base):
     failed_checks: Mapped[str] = mapped_column(Text, default="", server_default="")  # names, one per line
     escalated: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())  # the manager was told the base stays red
     rerun_at: Mapped[datetime | None] = mapped_column(DateTime)  # a look at the base branch (size 0): its failed jobs were run once more
+
+
+class PromotionStatus(StrEnum):
+    CHECKING = "checking"  # the check command runs on the commit (or the host's checks are awaited)
+    PROMOTED = "promoted"  # on the release branch
+    PULL_REQUEST = "pull_request"  # the release branch refused the push: a pull request is open for it
+    FAILED = "failed"  # nothing was pushed
+
+
+class Promotion(Timestamps, Base):
+    """A fixed commit of a repository's base branch brought to its release branch (#129), after one check
+    run on exactly that commit. Trains of the base branch go on meanwhile."""
+
+    __tablename__ = "promotions"
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    repository_id: Mapped[int] = mapped_column(ForeignKey("repositories.id", ondelete="CASCADE"), index=True)
+    base: Mapped[str] = mapped_column(String(200))
+    release: Mapped[str] = mapped_column(String(200))
+    sha: Mapped[str] = mapped_column(String(64))
+    release_sha: Mapped[str] = mapped_column(String(64), default="")  # the release branch before
+    tag: Mapped[str] = mapped_column(String(100), default="")
+    status: Mapped[str] = mapped_column(String(20), default=PromotionStatus.CHECKING, index=True)
+    mode: Mapped[str] = mapped_column(String(20), default="")  # command | github | none (no check: it passed before or there is none)
+    job_id: Mapped[str | None] = mapped_column(String(32))
+    how: Mapped[str] = mapped_column(String(20), default="")  # fast-forward | merge | pull-request
+    url: Mapped[str] = mapped_column(String(500), default="")  # the pull request
+    detail: Mapped[str] = mapped_column(Text, default="")  # why it failed, or a note (e.g. a tag that could not be set)
+    commits: Mapped[int] = mapped_column(Integer, default=0)
+    landing_ids: Mapped[list[int]] = mapped_column(JSON, default=list)  # the branches that landed on the base branch since the last promotion
+    by: Mapped[str] = mapped_column(String(100), default="")  # who asked: an agent's slug or a user's name
+    finished_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
 class FlowEvent(Base):
@@ -656,6 +1082,10 @@ class Message(Base):
     meta: Mapped[dict[str, Any]] = mapped_column(JSON, default=dict)
     run_id: Mapped[int | None] = mapped_column(Integer, index=True)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+    @validates("content")
+    def _no_nul(self, _key: str, value: str) -> str:
+        return value.replace("\x00", "") if value and "\x00" in value else value  # PostgreSQL text can't hold NUL (#120); meta: db._json
 
 
 class Run(Base):
@@ -913,7 +1343,7 @@ class SearchDocument(Base):
     )
     id: Mapped[int] = mapped_column(primary_key=True)
     project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"))
-    kind: Mapped[str] = mapped_column(String(20))  # an indexer's kind: ticket, report, decision, comment, note, commit
+    kind: Mapped[str] = mapped_column(String(20))  # an indexer's kind: ticket, report, decision, comment, note, commit, idea, doc, file
     source_id: Mapped[str] = mapped_column(String(100))  # the item within its kind (a row id, repository:sha)
     chunk: Mapped[int] = mapped_column(Integer, default=0)
     ref: Mapped[str] = mapped_column(String(120))  # how an agent names it: #64, assignment #5043, 1a2b3c4d5e
@@ -934,6 +1364,10 @@ class SearchDocument(Base):
     comment_id: Mapped[int | None] = mapped_column(ForeignKey("comments.id", ondelete="CASCADE"), index=True)
     note_id: Mapped[int | None] = mapped_column(ForeignKey("notes.id", ondelete="CASCADE"), index=True)
     repository_id: Mapped[int | None] = mapped_column(ForeignKey("repositories.id", ondelete="CASCADE"), index=True)
+    # A doc page: its foreign key is added by search.schema.ensure once doc_pages exists (migration 0073 makes this
+    # table from today's models, before 0088 made doc_pages).
+    doc_page_id: Mapped[int | None] = mapped_column(Integer, index=True)
+    attachment_id: Mapped[int | None] = mapped_column(ForeignKey("attachments.id", ondelete="CASCADE"), index=True)  # a file (kind file)
     tsv: Mapped[Any] = mapped_column(TSVECTOR, Computed("to_tsvector('simple', header || ' ' || body)", persisted=True), deferred=True)
     updated_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow, onupdate=utcnow)
 

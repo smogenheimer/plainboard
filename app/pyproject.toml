@@ -25,6 +25,7 @@ dependencies = [
     "onnxruntime>=1.18",
     "tokenizers>=0.19",
     "numpy>=1.26",
+    "markdown-it-py>=3",  # doc sites (services/docs_render.py): pages rendered to HTML on the server, for search engines
 ]
 
 [project.scripts]

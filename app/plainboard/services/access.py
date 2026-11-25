@@ -96,6 +96,7 @@ RULES: tuple[Rule, ...] = (
     Rule("/api/health", Need.PUBLIC),
     Rule("/api/internal", Need.PUBLIC),
     Rule("/api/public", Need.PUBLIC),
+    Rule("/api/v1/docs", Need.PUBLIC),  # a doc site's API (#131): its own keys, checked by services/docs_api.reader
     Rule("/api/runners/connect", Need.PUBLIC),  # an external runner's socket: its own token
     # --- the installation
     Rule("/api/auth/me", Need.USER),
@@ -103,7 +104,8 @@ RULES: tuple[Rule, ...] = (
     Rule("/api/limits", Need.USER),
     Rule("/api/pause", Need.USER, Need.ADMIN),  # everyone sees that everything is paused; an admin does it
     Rule("/api/settings", Need.USER, Need.ADMIN),  # reading shows no secret, and the UI needs the defaults
-    Rule("/api/settings/check/github", Need.CREATOR),  # a token typed for a new project; the installation's: admins
+    Rule("/api/settings/check/github", Need.CREATOR),
+    Rule("/api/settings/attachment-retention", Need.ADMIN),  # what the default retention would delete in the projects that follow it  # a token typed for a new project; the installation's: admins
     # Everyone adds their own subscriptions; who may change one is its owner or an admin (accounts.managed),
     # the list holds what the user may use (accounts.visible), secrets are never read back. That holds for the
     # sign-in in the browser too: an own one is kept per subscription, the installation's is an admin's.
@@ -115,6 +117,7 @@ RULES: tuple[Rule, ...] = (
     Rule("/api/runners", Need.ADMIN),  # external runners: their tokens and machines
     Rule("/api/runners/choices", Need.USER),  # names only: where the user's new project may start
     Rule("/api/usage", Need.ADMIN),  # disk and memory of the whole installation
+    Rule("/api/usage/tokens", Need.USER),  # tokens per project: the list holds the user's own projects only
     Rule("/api/search", Need.ADMIN),  # semantic search across all projects: how much is indexed
     Rule("/api/github", Need.ADMIN),  # lists what the installation's GitHub token sees
     Rule("/api/users", Need.ADMIN),
@@ -129,6 +132,12 @@ RULES: tuple[Rule, ...] = (
     _project("/questions", read=Need.MEMBER, write=Need.MEMBER),  # who may chat with the manager may ask (orchestration/questions.py)
     _project("/tasks", write=Need.MEMBER),
     _project("/notes", write=Need.MEMBER),
+    _project("/search"),  # the command palette: its history by meaning, for everyone who reads the project
+    _project("/ideas", write=Need.MEMBER),
+    _project("/docs", write=Need.MEMBER),  # doc sites (#118): viewers read, members write
+    _project("/docs/sites/{site_id}/domain", write=Need.OWNER),  # its own domain and the Cloudflare token: the owner's
+    _project("/docs/sites/{site_id}/api-keys", read=Need.MEMBER, write=Need.MEMBER),  # a site's API keys (#131): who writes the site
+    _project("/docs/sites/{site_id}/translator-keys", write=Need.OWNER),  # DeepL and Google keys: the owner's  # collecting and planning starts nothing (services/ideas.py)
     _project("/schedules", write=Need.MEMBER),
     _project("/browser", read=Need.MEMBER),  # the browser window is driven, not only watched
     _project("/previews", write=Need.MEMBER),  # which servers run; a member stops one
@@ -136,6 +145,9 @@ RULES: tuple[Rule, ...] = (
     _project("/secrets", read=Need.OWNER),
     _project("/skills"),  # its Claude skills: everyone sees which, its owner changes them
     _project("/accounts", write=Need.ADMIN),  # which of the installation's subscriptions it may use: not its owner's call
+    _project("/given-accounts", read=Need.MEMBER, write=Need.MEMBER),  # who works in it gives it their own subscriptions (accounts.give)
+    _project("/blocked-accounts", read=Need.OWNER),  # its owner switches one a member gave it off
+    _project("/attachment-retention", read=Need.OWNER),  # what a retention setting would delete (services/retention.py)
     _project("/runner"),
     _project("/owner", read=Need.OWNER),  # who owns it: an admin, or its owner (services/ownership.py)  # which runner its agents use: its owner chooses
     _project("/public-api-keys", read=Need.OWNER),
@@ -149,6 +161,7 @@ RULES: tuple[Rule, ...] = (
     _of("/api/attachments/{attachment_id}", "attachment_id", Attachment),
     _of("/api/decisions/{decision_id}", "decision_id", Decision),
     _of("/api/repositories/{repo_id}", "repo_id", Repository, write=Need.OWNER),
+    _of("/api/repositories/{repo_id}/promotion", "repo_id", Repository, write=Need.MEMBER),  # its preview, and promoting it (#129): a member can ask the manager anyway
     _of("/api/public-api-keys/{key_id}", "key_id", PublicApiKey, read=Need.OWNER, write=Need.OWNER),
     _of("/api/secrets/{secret_id}", "secret_id", Secret, read=Need.OWNER, write=Need.OWNER),  # a secret of no project: admins
 )

@@ -15,10 +15,11 @@ from pathlib import Path
 
 from fastapi import FastAPI, HTTPException, Query, Request, WebSocket
 from fastapi.responses import Response, StreamingResponse
-from plainboard_protocol import ACCOUNT_KEY_PATTERN, DEFAULT_ACCOUNT, BranchRef, CandidatesSpec, CheckResult, CleanupCandidate, CleanupResult, CleanupSpec, CommitRef, CompletionResult, CompletionSpec, Credentials, DeleteSpec, ErrorEvent, GitLogResult, GitLogSpec, GitPresentResult, GitPresentSpec, JobPort, JobTiming, JobSpec, JobState, LimitsEvent, MachineUsage, ProjectFiles, ProviderAccount, ProviderInfo, SignInAck, SignInFiles, PullRequestCheck, PullRequestRef, PullRequestState, RepoSpec, RerunRef, RunSpec, SkillFetch, TidyResult, TidySpec, TrainCheckSpec, TrainLandSpec, TrainResult, TrainSpec, TrimSpec, UnpushedSpec, UnpushedWork, UpstreamRef, UpstreamState
+from plainboard_protocol import ACCOUNT_KEY_PATTERN, DEFAULT_ACCOUNT, BranchRef, CandidatesSpec, CheckResult, CleanupCandidate, CleanupResult, CleanupSpec, CommitRef, CompletionResult, CompletionSpec, Credentials, DeleteSpec, ErrorEvent, GitLogResult, GitLogSpec, GitPresentResult, GitPresentSpec, PromotePlan, PromotePushSpec, PromoteResult, PromoteSpec, JobPort, JobTiming, JobSpec, JobState, LimitsEvent, MachineUsage, ProjectFiles, ProviderAccount, ProviderInfo, SignInAck, SignInFiles, SignInRefresh, files_digest, PullRequestCheck, PullRequestRef, PullRequestState, RepoSpec, RerunRef, RunSpec, SkillFetch, TidyResult, TidySpec, TrainCheckSpec, TrainLandSpec, TrainResult, TrainSpec, TrimSpec, UnpushedSpec, UnpushedWork, UpstreamRef, UpstreamState
 from pydantic import BaseModel, Field
 
 from . import cleanup
+from . import codex_cli, gemini_cli
 from . import config
 from . import connect
 from . import errors
@@ -27,6 +28,7 @@ from .browser import browsers
 from . import jobs
 from . import notices
 from . import ports
+from . import promote
 from . import selfupdate
 from . import signins
 from . import skills
@@ -51,6 +53,8 @@ async def lifespan(_app: FastAPI):
     signins.remove(signins.ROOT)  # private sign-in folders a former process left (killed mid-run): nothing uses them now
     _background.add(asyncio.create_task(usage.keep_measured()))
     _background.add(asyncio.create_task(usage.keep_sampling()))
+    _background.add(asyncio.create_task(codex_cli.keep_current()))  # a newer Codex CLI, for new models
+    _background.add(asyncio.create_task(gemini_cli.keep_current()))  # and Gemini CLI
     # An external runner connects out to PlainBoard (connect.py); the built-in one is called by the app.
     tasks = [asyncio.create_task(connect.serve(), name="connect"), asyncio.create_task(_tend_logs(), name="run-logs")] if connect.enabled() else []
     try:
@@ -202,6 +206,34 @@ async def provider_logout(name: str, key: str = AccountKey, own: bool = False) -
         raise HTTPException(502, str(exc)[:1000]) from exc
 
 
+@app.post("/providers/{name}/takeover", response_model=SignInFiles)
+async def provider_take_over(name: str, key: str = AccountKey) -> SignInFiles:
+    """The installation's sign-in of account ``key`` from this runner's home, for the app to keep from now on
+    (signins.py): copied, never moved; nothing here uses the home's copy again. 409 while it is in use."""
+    try:
+        files = await _signin_provider(name).take_over(key)
+    except NotImplementedError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except signins.Busy as exc:
+        raise HTTPException(409, str(exc)) from exc
+    return SignInFiles(provider=name, account=key, files=files, digest=files_digest(files))
+
+
+@app.post("/signins/refresh", status_code=204)
+async def sign_in_refresh(body: SignInRefresh) -> None:
+    """Refresh a kept sign-in ahead of time if it is due soon; what changed waits in ``/signins``."""
+    try:
+        await _signin_provider(body.provider).refresh_sign_in(body.credentials)
+    except Exception as exc:
+        raise HTTPException(502, str(exc)[:300]) from exc
+
+
+@app.post("/signins/update", status_code=204)
+async def sign_ins_update(body: list[SignInFiles]) -> None:
+    """Sign-ins another runner refreshed, into the folders of the accounts in use here."""
+    await SIGN_INS.update(body)
+
+
 @app.get("/signins", response_model=list[SignInFiles])
 async def sign_ins() -> list[SignInFiles]:
     """People's own sign-ins that are new or were refreshed here, for the app to keep (signins.py)."""
@@ -349,6 +381,20 @@ async def missing_uploads(names: list[str]) -> list[str]:
     return [name for name in names if _UPLOAD_NAME.fullmatch(name) and ".." not in name and not _upload(name).is_file()]
 
 
+@app.post("/uploads/delete")
+async def delete_uploads(names: list[str]) -> int:
+    """Attachment files whose retention ended in the app: this runner's copies go too. How many were here."""
+    gone = 0
+    for name in names:
+        if _UPLOAD_NAME.fullmatch(name) and ".." not in name and (path := _upload(name)).is_file():
+            try:
+                path.unlink()
+                gone += 1
+            except OSError:
+                pass  # read-only: the app's own volume, where the app deleted it
+    return gone
+
+
 @app.put("/uploads/{name}")
 async def put_upload(name: str, request: Request) -> dict[str, bool]:
     path = _upload(name)
@@ -449,7 +495,7 @@ async def limits(name: str, credentials: Credentials) -> LimitsEvent:
     """The plan limits of the account in ``credentials``; no windows if they can't be read."""
     provider = _signin_provider(name)
     try:
-        windows = await provider.limits(credentials)
+        windows, covers = await provider.limits_report(credentials)
     except Exception as exc:
         log.warning("No limits from %s: %s", provider.name, exc)
         return LimitsEvent()
@@ -458,7 +504,7 @@ async def limits(name: str, credentials: Credentials) -> LimitsEvent:
     except Exception as exc:
         log.info("No plan from %s: %s", provider.name, str(exc)[:200])
         plan, size = None, None
-    return LimitsEvent(windows=windows, complete=provider.limits_complete, plan=plan, plan_size=size)
+    return LimitsEvent(windows=windows, complete=provider.limits_complete, covers=covers, plan=plan, plan_size=size, models=await provider.offered(credentials))
 
 
 @app.post("/providers/{name}/models", response_model=list[str])
@@ -674,10 +720,27 @@ async def land_train(spec: TrainLandSpec) -> CheckResult:
     return await trains.land(spec)
 
 
+@app.post("/promotions/plan", response_model=PromotePlan)
+async def promotion_plan(spec: PromoteSpec) -> PromotePlan:
+    """What would go from the base branch to the release branch (#129); with checkout, prepared for its check."""
+    try:
+        return await promote.plan(spec)
+    except (WorkspaceError, ValueError, OSError) as exc:
+        raise HTTPException(502, str(exc)[:600]) from exc
+
+
+@app.post("/promotions/push", response_model=PromoteResult)
+async def promotion_push(spec: PromotePushSpec) -> PromoteResult:
+    try:
+        return await promote.push(spec)
+    except (WorkspaceError, ValueError, OSError) as exc:
+        return PromoteResult(ok=False, detail=str(exc)[:600])
+
+
 @app.post("/github/upstream")
 async def github_upstream(ref: UpstreamRef) -> UpstreamState | None:
     try:
-        return await github.upstream(ref.credentials, ref.repository, ref.branch, ref.commit)
+        return await github.upstream(ref.credentials, ref.repository, ref.branch, ref.commit, version=ref.version)
     except WorkspaceError as exc:
         raise HTTPException(502, str(exc)[:600]) from exc
 

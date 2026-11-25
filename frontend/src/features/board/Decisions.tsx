@@ -8,6 +8,7 @@ import { qk } from "../../api/queries";
 import type { Attachment, Decision } from "../../api/types";
 import { VideoThumb } from "../../components/VideoThumb";
 import { isImageFile, isMediaFile, isVideoFile } from "../../lib/media";
+import { useDraft } from "../../lib/drafts";
 import { AttachmentLink } from "../../components/AttachmentLink";
 import { Markdown, TicketText } from "../../components/Markdown";
 import { Button, ErrorText, Textarea } from "../../components/ui";
@@ -53,7 +54,7 @@ function OpenDecision({ decision, attachments, onView }: { decision: Decision; a
   const { t } = useTranslation();
   const { project, agents, agentById, openChat, canWrite } = useShell();
   const qc = useQueryClient();
-  const [note, setNote] = useState("");
+  const [note, setNote, clearNote] = useDraft(`decision:${decision.id}`);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<unknown>(null);
   const asker = agentById(decision.requested_by_agent_id) ?? agents.find((a) => a.is_manager);
@@ -64,6 +65,7 @@ function OpenDecision({ decision, attachments, onView }: { decision: Decision; a
     setError(null);
     try {
       await api.post(`/decisions/${decision.id}/answer`, { option_index: optionIndex, text: note });
+      clearNote();
       qc.invalidateQueries({ queryKey: qk.task(decision.task_id) });
       qc.invalidateQueries({ queryKey: qk.tasks(project.id) });
     } catch (err) {

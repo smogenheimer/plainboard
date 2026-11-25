@@ -9,7 +9,8 @@ from pydantic import BaseModel, Field, TypeAdapter
 # "full": all built-in coding tools (shell, edit, web ...) + PlainBoard tools.
 # "board": PlainBoard tools + shell and file editing. Much smaller prompt -> fewer tokens.
 # "read": reading only (files, search, the PlainBoard tools the app sends): no shell, no editing, no sub-agents.
-Toolset = Literal["full", "board", "read"]
+# "none": only the PlainBoard tools the app sends (a doc site's assistant for visitors): no built-in tool at all.
+Toolset = Literal["full", "board", "read", "none"]
 
 # A provider account's key on the runner. The default account keeps the sign-in from before accounts existed.
 DEFAULT_ACCOUNT = "default"
@@ -58,6 +59,8 @@ class Credentials(BaseModel):
     antigravity_auth_mode: Literal["google", "api_key", "own_login"] = "google"
     # Which of the runner's Antigravity sign-ins to use: every account has its own isolated GEMINI_HOME.
     antigravity_account: str = Field(default=DEFAULT_ACCOUNT, pattern=ACCOUNT_KEY_PATTERN)
+    # Gemini CLI: "own_login" a Google sign-in kept by the app (login_files); "api_key": gemini_api_key.
+    gemini_auth_mode: Literal["own_login", "api_key"] = "own_login"
     gemini_api_key: str | None = None
     login_account: str = Field(default=DEFAULT_ACCOUNT, pattern=ACCOUNT_KEY_PATTERN)
     login_files: dict[str, str] | None = None  # file name -> content; None: no own sign-in
@@ -68,7 +71,7 @@ class Credentials(BaseModel):
     github_token: str | None = None
     git_ssh_key: str | None = None  # private key for repositories with an SSH address and no key of their own
     git_author_name: str = "PlainBoard Agent"
-    git_author_email: str = "agent@plainboard.local"
+    git_author_email: str = "agent@slop2gether.com"
     secrets: dict[str, str] = Field(default_factory=dict)  # user-defined environment variables
 
 
@@ -207,9 +210,24 @@ class SignInAck(BaseModel):
     digest: str
 
 
+class SignInRefresh(BaseModel):
+    """A kept sign-in to refresh ahead of time where it is due soon (runner ``refresh_sign_in``)."""
+
+    provider: str
+    credentials: Credentials
+
+
+class ToolImage(BaseModel):
+    """A picture in a tool's result (a screenshot): the model sees it."""
+
+    media_type: str = "image/png"
+    data: str  # base64
+
+
 class ToolCallResult(BaseModel):
     text: str
     is_error: bool = False
+    images: list[ToolImage] = Field(default_factory=list)
     # Not done yet: ask again with this id (POST /api/internal/runs/<id>/tools/pending/<call>). Only to a bridge that
     # sent TOOL_PENDING_HEADER: a long call (a quick check, a question) must not run into a proxy's timeout.
     pending: str = ""
@@ -481,7 +499,8 @@ class GitCommit(BaseModel):
     author: str = ""
     date: str = ""  # ISO 8601 with offset, the commit date
     message: str = ""
-    files: list[str] = Field(default_factory=list)  # the first ones changed
+    files: list[str] = Field(default_factory=list)  # the first ones changed (a renamed file: its old and its new path)
+    renames: dict[str, str] = Field(default_factory=dict)  # old path -> new path, as git found them (-M)
     file_count: int = 0
     insertions: int = 0
     deletions: int = 0
@@ -502,11 +521,13 @@ class GitPresentSpec(BaseModel):
     base: str = Field(min_length=1, max_length=200)
     shas: list[Annotated[str, Field(pattern=r"^[0-9a-f]{7,64}$")]] = Field(default_factory=list, max_length=2000)  # also the index's sweep
     paths: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(default_factory=list, max_length=300)
+    patterns: list[Annotated[str, Field(min_length=1, max_length=500)]] = Field(default_factory=list, max_length=2000)  # prefixes or globs (doc pages' code paths)
 
 
 class GitPresentResult(BaseModel):
     on_base: list[str] = Field(default_factory=list)  # of the shas asked
     missing: list[str] = Field(default_factory=list)  # of the paths asked
+    unmatched: list[str] | None = None  # of the patterns asked: those that match no file at the tip (None: a runner from before it)
 
 
 class ProjectFiles(BaseModel):
@@ -576,6 +597,57 @@ class TrainLandSpec(BaseModel):
     delete_branches: dict[str, str] = Field(default_factory=dict)  # branch -> the commit that landed
 
 
+class PromoteSpec(BaseModel):
+    """Promotion (#129): what goes from the base branch (e.g. dev) to the release branch (e.g. main). In a
+    clone of its own, so trains of the base branch go on meanwhile. ``checkout``: the commit is checked out
+    there for the check command (the promotion), else only read (a preview)."""
+
+    credentials: Credentials
+    key: str = Field(pattern=TRAIN_KEY)
+    remote: RepoSpec
+    base: str | None = Field(default=None, max_length=200)  # None: the repository's default branch
+    release: str = Field(min_length=1, max_length=200)
+    sha: str | None = Field(default=None, pattern=r"^[0-9a-f]{7,64}$")  # None: the head of the base branch now
+    checkout: bool = False
+    limit: int = Field(default=200, ge=1, le=2000)
+
+
+class PromotePlan(BaseModel):
+    base: str
+    release: str
+    sha: str  # the fixed commit of the base branch that is promoted
+    release_sha: str | None = None  # the release branch now; None: it does not exist yet
+    fast_forward: bool = True  # the release branch is an ancestor of sha
+    total: int = 0  # commits on sha that the release branch lacks (merges included)
+    commits: list[GitCommit] = Field(default_factory=list)  # newest first, without merges, at most ``limit``
+    first_parent: list[str] = Field(default_factory=list)  # the base branch's own commits in the range (train heads), newest first
+
+
+class PromotePushSpec(BaseModel):
+    """Bring a checked commit of the base branch to the release branch: a fast-forward push, else a merge
+    commit. A push the host refuses (a protected branch) becomes a pull request when ``github`` names the
+    repository (owner/name)."""
+
+    credentials: Credentials
+    key: str = Field(pattern=TRAIN_KEY)
+    remote: RepoSpec
+    base: str = Field(min_length=1, max_length=200)
+    release: str = Field(min_length=1, max_length=200)
+    sha: str = Field(pattern=r"^[0-9a-f]{7,64}$")
+    tag: str = Field(default="", max_length=100)
+    github: str | None = None
+    title: str = Field(default="", max_length=300)
+
+
+class PromoteResult(BaseModel):
+    ok: bool
+    how: str = ""  # fast-forward | merge | pull-request | "" (failed)
+    sha: str = ""  # what the release branch points to now (a pull request: the commit it proposes)
+    number: int | None = None  # pull-request: its number
+    url: str = ""
+    detail: str = ""
+
+
 class BranchRef(BaseModel):
     credentials: Credentials
     remote: RepoSpec
@@ -589,11 +661,14 @@ class UpstreamRef(BaseModel):
     repository: str = Field(pattern=r"^[\w.-]+/[\w.-]+$")  # owner/name on GitHub
     branch: str = Field(pattern=r"^[\w./-]+$")
     commit: str = Field(pattern=r"^[0-9a-f]{7,64}$")
+    # The running release ("X.Y.Z"); "" for a build of a commit (:edge, a local build): then it is compared with the branch.
+    version: str = Field(default="", pattern=r"^(\d+\.\d+\.\d+)?$")
 
 
 class UpstreamState(BaseModel):
-    behind: int  # commits the branch has that the running commit has not
+    behind: int  # commits the branch has that the running commit has not; for a release: newer releases
     url: str = ""  # where to read them
+    latest: str = ""  # for a release: the newest one ("X.Y.Z"), if it is newer
 
 
 # ---------------------------------------------------------------------------
@@ -653,11 +728,17 @@ class LimitsEvent(BaseModel):
     # These are all the windows the account has: one that is missing no longer exists (a plan that
     # dropped a limit). False: only the windows that changed, the others stay as they were.
     complete: bool = False
+    # The windows this report speaks for in full: one of these it leaves out no longer exists, the
+    # others stay as they were (a provider that reports some windows only with requests touching them).
+    covers: list[str] = Field(default_factory=list)
     # The account's plan where the provider can tell (only in the answer to a read of the limits): its
     # name, and its size as a multiple of the provider's smallest plan, for comparing what is left in
     # absolute terms. None: not known.
     plan: str | None = None
     plan_size: float | None = None
+    # The models this account may use, where the provider lists them per account (only in the answer to a
+    # read of the limits). None: not known.
+    models: list[ModelInfo] | None = None
 
 
 class CompactionEvent(BaseModel):

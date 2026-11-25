@@ -108,9 +108,36 @@ def test_refused_calls_and_a_slow_quick_check_are_found(client, project):
     errors = found(client, pid)["tool_errors"]
     assert errors["title"] == "6 calls of PlainBoard's tools were refused" and errors["detail"].startswith("get_todo 6x (mostly: ")
 
-    # The job that runs a repository's quick check says what it is, so its time can be measured.
+    # A NUL character in a tool's output (#120): stored without it, and a row that already holds one (\u0000 in
+    # its JSON, which breaks every ->> on PostgreSQL) doesn't stop the check.
+    from sqlalchemy import Text, select, text
+
     from plainboard.db import sessionmaker
-    from plainboard.models import Job, utcnow
+    from plainboard.models import Conversation, Message, utcnow
+
+    async def nul_results() -> tuple[str, dict]:
+        async with sessionmaker()() as s:
+            conv = await s.scalar(select(Conversation).where(Conversation.agent_id == dev["id"]))
+            msg = Message(conversation_id=conv.id, role="assistant", kind="tool", content="get_todo\x00", meta={"result": "a\x00b", "is_error": True})
+            s.add(msg)
+            meta = json.dumps({"name": "get_todo", "result": "old\x00 output", "is_error": True})
+            assert "\\u0000" in meta
+            json_value = "CAST(:meta AS JSON)" if s.bind.dialect.name == "postgresql" else ":meta"
+            await s.execute(
+                text(f"INSERT INTO messages (conversation_id, role, kind, content, meta, created_at) VALUES (:conv, 'assistant', 'tool', 'get_todo', {json_value}, :at)"),
+                {"conv": conv.id, "meta": meta, "at": utcnow()},
+            )
+            await s.commit()
+            raw = await s.scalar(select(Message.meta.cast(Text)).where(Message.id == msg.id))
+            content = await s.scalar(select(Message.content).where(Message.id == msg.id))
+            return raw + content, (await s.get(Message, msg.id)).meta
+
+    raw, meta = client.portal.call(nul_results)
+    assert "\\u0000" not in raw and "\x00" not in raw and meta["result"] == "a\x00b"  # the session's own object is as it was given
+    assert found(client, pid)["tool_errors"]["title"] == "8 calls of PlainBoard's tools were refused"
+
+    # The job that runs a repository's quick check says what it is, so its time can be measured.
+    from plainboard.models import Job
     from plainboard.services.flow_check import QUICK_CHECK_MARK
     from plainboard.tools.flow import quick_check_script
 

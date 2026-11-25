@@ -29,7 +29,7 @@ SETTINGS: dict[str, SettingDef] = {
     "git_ssh_key": SettingDef(None, secret=True, managed=True),
     "git_ssh_public_key": SettingDef("", managed=True),
     "git_author_name": SettingDef("PlainBoard Agent"),
-    "git_author_email": SettingDef("agent@plainboard.local"),
+    "git_author_email": SettingDef("agent@slop2gether.com"),
     "default_provider": SettingDef("claude_code"),
     "default_manager_model": SettingDef("claude-sonnet-5-5"),
     "default_worker_model": SettingDef("claude-sonnet-5-5"),
@@ -55,6 +55,10 @@ SETTINGS: dict[str, SettingDef] = {
     "semantic_search_next": SettingDef(None, managed=True),
     # People may make tokens of their own for MCP clients and the API (services/personal_tokens.py, api/mcp_server.py).
     "mcp_enabled": SettingDef(True),
+    # People other than admins may add subscriptions of their own (#138). Off: no new ones; those they have keep
+    # working unless the admin also switches them off (``own_accounts_off``, permissions.switched_off), reversibly.
+    "own_accounts": SettingDef(True),
+    "own_accounts_off": SettingDef(False),
     "update_check": SettingDef(True),  # ask now and then whether a newer PlainBoard exists
     # The admin has gone through the basic settings once (the set-up in the browser). Until then the UI asks for them.
     "setup_done": SettingDef(False),
@@ -63,6 +67,9 @@ SETTINGS: dict[str, SettingDef] = {
     "scratchpad_retention_days": SettingDef(14),  # an ended assignment's scratchpad stays archived this long
     # Tool messages keep their full input and result this many days, then a preview (services/tool_details.py); 0: forever.
     "tool_details_days": SettingDef(30),
+    # Files of done tickets are deleted after this many days in every project without its own value (services/retention.py); 0: never.
+    "attachment_retention_days": SettingDef(0),
+    "attachment_retention_min_mb": SettingDef(0),  # only files from this size; 0: all
     # An external runner updating itself waits this long at most for running turns, jobs and check runs, then restarts (services/runner_update.py).
     "runner_update_drain_seconds": SettingDef(300),
     "tool_details_floor": SettingDef(0, managed=True),  # message id up to which tool messages were looked at
@@ -154,6 +161,6 @@ def credentials(
         github_token=github_token_override or values.get("github_token"),
         git_ssh_key=values.get("git_ssh_key"),
         git_author_name=values.get("git_author_name") or "PlainBoard Agent",
-        git_author_email=values.get("git_author_email") or "agent@plainboard.local",
+        git_author_email=values.get("git_author_email") or "agent@slop2gether.com",
         secrets=secrets or {},
     )

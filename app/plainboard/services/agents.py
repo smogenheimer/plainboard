@@ -58,7 +58,8 @@ async def _set_repositories(session: AsyncSession, agent: Agent, ids: list[int])
 
 
 async def create(
-    session: AsyncSession, project_id: int, data: AgentCreate, *, is_manager: bool = False, catalog: list[ProviderInfo] | None = None
+    session: AsyncSession, project_id: int, data: AgentCreate, *, is_manager: bool = False, catalog: list[ProviderInfo] | None = None,
+    doc_site_id: int | None = None,
 ) -> Agent:
     """``catalog`` (the runner's providers) lets an agent on another provider than the default get that provider's models."""
     s = await settings_service.get_all(session)
@@ -90,6 +91,7 @@ async def create(
         color=data.color or PALETTE[count % len(PALETTE)],
         all_repos=data.all_repos,
         account_id=data.account_id,
+        doc_site_id=doc_site_id,
     )
     agent.mcp_servers = []
     agent.repositories = []
@@ -177,8 +179,11 @@ async def get(session: AsyncSession, agent_id: int) -> Agent:
     return agent
 
 
-async def list_for_project(session: AsyncSession, project_id: int) -> list[Agent]:
+async def list_for_project(session: AsyncSession, project_id: int, *, doc_agents: bool = True) -> list[Agent]:
+    """``doc_agents=False``: the team as it is shown, without the hidden agents of the doc sites."""
     q = select(Agent).where(Agent.project_id == project_id).order_by(Agent.is_manager.desc(), Agent.id)
+    if not doc_agents:
+        q = q.where(Agent.doc_site_id.is_(None))
     return list((await session.scalars(q)).all())
 
 

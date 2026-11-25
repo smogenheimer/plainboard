@@ -27,6 +27,7 @@ import time
 from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass, field
 from datetime import datetime
+from typing import Any
 
 from plainboard_protocol import CompletionSpec, JobSpec, JobState, ResultEvent, RunEvent, RunSpec, ToolBridgeSpec, ToolCallResult, WorkspaceSpec
 from sqlalchemy import delete as sql_delete
@@ -44,6 +45,8 @@ from ..models import (
     Comment,
     Conversation,
     Decision,
+    DocProposal,
+    DocSite,
     Job,
     JobStatus,
     Message,
@@ -62,9 +65,13 @@ from ..schemas import AssignmentOut, MessageOut, RunOut, TaskUpdate
 from ..services import agents as agent_service
 from ..services import board as board_service
 from ..services import decisions as decision_service
+from ..services import docs as docs_service
+from ..services import docs_proposals
+from ..services import ideas as idea_service
 from ..services import ticket_state
 from ..services import flow_log
 from ..services import jobs as job_service
+from ..services import landings as landing_service
 from ..services import mcp as mcp_service
 from ..services import skills as skill_service
 from ..services import mentions as mention_service
@@ -94,7 +101,8 @@ from .tunnel import Tunnel
 log = logging.getLogger(__name__)
 
 MAX_ASK_DEPTH = 3
-SIGN_INS_SECONDS = 60  # how often the runners are asked for people's own sign-ins that were refreshed (check_sign_ins)
+SIGN_INS_SECONDS = 60  # how often the runners are asked for kept sign-ins that were refreshed (check_sign_ins)
+FRESH_SECONDS = 1800  # how often the built-in runner looks whether a kept sign-in is due for a refresh ahead
 ASK_TIMEOUT_SECONDS = 900
 ASK_BUSY_TIMEOUT_SECONDS = 120  # the teammate is in a turn of unknown length, so don't block the asker for long
 CANCEL_GRACE_SECONDS = 15
@@ -126,6 +134,7 @@ class RunContext:
     assignment_id: int | None = None  # the piece of work this turn belongs to
     task_id: int | None = None
     tools: frozenset[str] | None = None  # the only tools it may call (a question, orchestration/questions.py); None: its role's
+    doc_chat: Any = None  # a visitor's question to a doc site's assistant (orchestration/docs_assistant.Chat): its tools only
 
 
 def _count_and_age(stats: tuple[int, datetime | None] | None) -> tuple[int, int]:
@@ -202,6 +211,12 @@ class RunManager:
         from .questions import Questions  # it builds on this module
 
         self.questions = Questions(self)  # people's questions beside the chat: no queue, read only
+        from .docs_assistant import DocsAssistant
+
+        self.docs_assistant = DocsAssistant(self)  # visitors' questions on doc sites: no queue, no built-in tools
+        from .ideas import Ideas
+
+        self.ideas = Ideas(self)  # sorting ideas and planning tickets from them: no queue, no tools
         self._uploads: dict[int, set[str]] = {}  # external runner -> attachment files it has
         self._copying: dict[tuple[int, int], asyncio.Task[None]] = {}  # (runner, project) -> attachments being copied in the background
         self._seen: dict[int, float] = {}  # runner id -> when its last_seen_at was last written (monotonic)
@@ -228,12 +243,17 @@ class RunManager:
         self._limits_asked = 0.0
         self._limits_task: asyncio.Task[None] | None = None
         self._sign_ins_asked = 0.0
+        self._fresh_asked = 0.0
         self._sign_in_tasks: set[asyncio.Task[None]] = set()
         self._state_tasks: dict[int, asyncio.Task[None]] = {}  # tickets whose state is being rewritten
         self._resting: set[asyncio.Task[None]] = set()  # paused projects whose turns and jobs are being stopped
         self._run_tasks: set[asyncio.Task[None]] = set()  # every turn's task until it is done
         self._state_tried: dict[int, float] = {}  # closed tickets whose last rewrite was started then (see refresh_closed_tickets)
         self._unread: dict[int, set[int]] = {}  # running turn -> waiting chat messages (runs) it was told about and has not read yet
+        # Running turn -> questions and chat messages (runs) it was told to end its turn for (#150): an assignment
+        # turn that ends while one of them still waits stays open, and goes on after it (_settle).
+        self._interrupts: dict[int, set[int]] = {}
+        self._resumed: set[int] = set()  # assignments whose next turn goes on after such an interruption
         # agent -> what changes its waiting chat run (a message joining, one withdrawn): read and write back
         # the parts one after the other, so no message overwrites another. The app runs as one process.
         self._chat_locks: dict[int, asyncio.Lock] = {}
@@ -310,25 +330,62 @@ class RunManager:
         self._seen.update(dict.fromkeys(due, now))
 
     async def check_sign_ins(self, force: bool = False) -> None:
-        """Keep what the runners hold of people's own sign-ins (a limit check or a completion may have
-        refreshed one), at most every ``SIGN_INS_SECONDS`` (the job watcher's look), and only while there are any."""
+        """Kept sign-ins, at most every ``SIGN_INS_SECONDS`` (the job watcher's look): the installation's still in the
+        built-in runner's home are taken over (``accounts.take_over``), what the runners refreshed is kept and
+        handed on (``keep_sign_ins``), and every ``FRESH_SECONDS`` those due soon are refreshed ahead on the
+        built-in runner, so the other runners always get them fresh and none refreshes one itself."""
         if not force and time.monotonic() - self._sign_ins_asked < SIGN_INS_SECONDS:
             return
         self._sign_ins_asked = time.monotonic()
         async with self._sm() as s:
-            if not await account_service.any_own_login(s):
+            if await account_service.any_home_login(s):
+                await account_service.take_over(s, self.runner)
+            if not await account_service.any_kept_login(s):
                 return
             for runner_id in self.runners.in_use():
                 if self.runners.connected(runner_id):
-                    await account_service.take_sign_ins(s, self.runners.client(runner_id))
+                    await self.keep_sign_ins(s, runner_id)
+            if force or time.monotonic() - self._fresh_asked >= FRESH_SECONDS:
+                self._fresh_asked = time.monotonic()
+                await self._refresh_sign_ins(s)
+
+    async def keep_sign_ins(self, s: AsyncSession, runner_id: int | None) -> None:
+        """Keep what a runner refreshed of kept sign-ins, and give it to the other runners where a turn of the
+        account is going on: the CLI there reads its file again before it refreshes, and finds the new token."""
+        kept = await account_service.take_sign_ins(s, self.runners.client(runner_id))
+        if not kept:
+            return
+        busy: dict[int | None, set[str]] = {}
+        for ctx in self._tokens.values():
+            if ctx.account_key:
+                busy.setdefault(self.runners.runner_id(ctx.project_id), set()).add(ctx.account_key)
+        for other, keys in busy.items():
+            entries = [e for e in kept if e.account in keys]
+            if other == runner_id or not entries or not self.runners.connected(other) or not self.runners.signins(other):
+                continue
+            try:
+                await self.runners.client(other).update_sign_ins(entries)
+            except Exception as exc:
+                log.info("Runner %s did not take the refreshed sign-ins: %s", other, exc)
+
+    async def _refresh_sign_ins(self, s: AsyncSession) -> None:
+        values = await settings_service.get_all(s)
+        accounts = [a for a in await account_service.kept_logins(s) if a.enabled and a.secret_enc]
+        for account in accounts:
+            try:
+                await self.runner.refresh_sign_in(account.provider, settings_service.credentials(values, account=account_service.fields(account)))
+            except Exception as exc:
+                log.info("Could not refresh the sign-in of account %s ahead: %s", account.key, str(exc)[:200])
+        if accounts:
+            await self.keep_sign_ins(s, None)
 
     def _take_sign_ins_soon(self, project_id: int) -> None:
-        """A turn on an own sign-in ended: what it refreshed is kept at once, not only at the next look."""
+        """A turn on a kept sign-in ended: what it refreshed is kept at once, not only at the next look."""
 
         async def take() -> None:
             try:
                 async with self._sm() as s:
-                    await account_service.take_sign_ins(s, self.runners.of(project_id))
+                    await self.keep_sign_ins(s, self.runners.runner_id(project_id))
             except Exception:
                 log.exception("Could not keep the sign-ins of project %s's runner", project_id)
 
@@ -370,7 +427,7 @@ class RunManager:
         if runner_id is None:
             return
         async with self._sm() as s:
-            names = list(await s.scalars(select(Attachment.storage_name).where(Attachment.project_id == project_id).order_by(Attachment.id.desc())))
+            names = list(await s.scalars(select(Attachment.storage_name).where(Attachment.project_id == project_id, Attachment.purged_at.is_(None)).order_by(Attachment.id.desc())))
         have = self._uploads.setdefault(runner_id, set())
         if not (wanted := [n for n in names if n not in have]):
             return
@@ -600,6 +657,8 @@ class RunManager:
             raise ServiceError("Unknown attachment")
         part = {"id": 1, "author": author, "text": text, "named": bool(author and several and text.strip()), "attachment_ids": list(attachment_ids or []), "at": _iso(utcnow())}
         text = _part_input(part)
+        if part["text"].strip() or attachment_ids:
+            await self.hold_for_message(s, agent, author or "the user", part["text"])  # before its turn can start: that turn reads it
         async with self._chat_locks.setdefault(agent.id, asyncio.Lock()):
             await s.commit()  # what is read next is the latest state, not that of a transaction begun before the wait
             run = await self._join_waiting_chat(s, agent, part) or await self.enqueue(
@@ -615,6 +674,7 @@ class RunManager:
         if busy_run and (text.strip() or attachment_ids):
             if await self.runners.of(agent.project_id).notify_run(busy_run, prompts.chat_notice(text, len(attachment_ids or []))):
                 self._unread.setdefault(busy_run, set()).add(run.id)  # it reads it after the step it is in
+                self._interrupts.setdefault(busy_run, set()).add(run.id)
             if ended := self._end_waits(busy_run, "the user wrote to you"):  # no wait is worth more than the user
                 await flow_log.record(s, agent.project_id, "wait.ended", agent_id=agent.id, run_id=busy_run, waits=ended, by="user")
         return run
@@ -773,7 +833,9 @@ class RunManager:
         effort: str | None = None,
         landing_id: int | None = None,
         train_id: int | None = None,
+        source: str | None = None,
     ) -> Assignment:
+        """``source``: who ordered it when no agent did (e.g. "PlainBoard"); else the user or PlainBoard's landing."""
         if task is not None and task.project_id != target.project_id:
             raise ServiceError("Ticket belongs to another project")
         if task is not None and task.status in (TaskStatus.BACKLOG, TaskStatus.TODO, TaskStatus.REVIEW):
@@ -791,7 +853,7 @@ class RunManager:
         )
         s.add(assignment)
         await s.commit()
-        from_name = caller.name if caller else "PlainBoard" if landing_id or train_id else "the user"
+        from_name = caller.name if caller else source or ("PlainBoard" if landing_id or train_id else "the user")
         run = await self.enqueue(
             s,
             target,
@@ -818,7 +880,21 @@ class RunManager:
         if not target.enabled:
             raise ServiceError(f"Agent '{target.name}' is disabled")
         await inbox.push(s, target.id, prompts.message_update(caller, text))
+        await self.hold_for_message(s, target, caller.name, text)
         await self.request_wake(s, target.id)
+
+    async def hold_for_message(self, s: AsyncSession, target: Agent, sender: str, text: str) -> list[str]:
+        """A member got a message (a teammate's, a question, the user's) while branches it handed over have
+        not landed: they are held until it has read the message and hands them over again or confirms
+        them (#96). Its next turn says so, right after the message."""
+        if target.is_manager:
+            return []
+        held = await landing_service.hold_for_message(s, target.id, text, f"message from {sender}", utcnow())
+        if held:
+            branches = [landing.branch for landing in held]
+            await inbox.push(s, target.id, prompts.held_for_message(branches))
+            await flow_log.record(s, target.project_id, "landing.held_for_message", agent_id=target.id, branches=branches, by=sender)
+        return [landing.branch for landing in held]
 
     async def cancel_assignment(self, s: AsyncSession, assignment: Assignment) -> bool:
         """Cancel an assignment, also one that has no turn right now because it waits for its job."""
@@ -869,11 +945,13 @@ class RunManager:
             raise ServiceError(f"{target.name} is waiting on you (directly or indirectly). Use message_agent instead.")
         async with self._sm() as s:
             busy_run = await s.scalar(select(Run.id).where(Run.agent_id == target.id, Run.status == RunStatus.RUNNING).limit(1))
+            await self.hold_for_message(s, target, caller.name, question)  # before its turn can start: that turn reads it
             run = await self.enqueue(
                 s, target, RunTrigger.ASK, prompts.ask_prompt(caller, question), source_agent_id=caller.id, parent_run_id=ctx.run_id
             )
         if busy_run:
-            await self.runners.of(target.project_id).notify_run(busy_run, prompts.ask_notice(caller, question))
+            if await self.runners.of(target.project_id).notify_run(busy_run, prompts.ask_notice(caller, question)):
+                self._interrupts.setdefault(busy_run, set()).add(run.id)
             if ended := self._end_waits(busy_run, f"{caller.name} is waiting for your answer", asks=False):  # a job's result comes by itself
                 async with self._sm() as s:
                     await flow_log.record(s, target.project_id, "wait.ended", agent_id=target.id, run_id=busy_run, waits=ended, by=caller.name)
@@ -945,7 +1023,7 @@ class RunManager:
                 if not task or not (reports or closed):
                     return
                 manager = await agent_service.get_manager(s, task.project_id)
-                account = await account_service.pick(s, manager.provider, manager, model=manager.summary_model)
+                account = await account_service.pick(s, manager.provider, manager, model=manager.summary_model, where=self.runners.where(task.project_id))
                 if account is None and (why := await account_service.shut_out(s, manager.provider, manager)):
                     log.info("Skipping ticket state for %s: %s", task_id, why)
                     return
@@ -1009,7 +1087,7 @@ class RunManager:
                     await limits_service.record(s, account.key, report.windows, complete=report.complete)
                 if report.plan or report.plan_size:
                     await limits_service.record_plan(s, account.key, report.plan, report.plan_size)
-                if account_service.own_login(account):
+                if account_service.kept_login(account):
                     await account_service.take_sign_ins(s, self.runner)
         except Exception:
             log.warning("Could not refresh limits for account %s", account_id, exc_info=True)
@@ -1019,16 +1097,27 @@ class RunManager:
             values = await settings_service.get_all(s)
             # An account in use reports its limits with every turn, but not its plan.
             reported, planned = await limits_service.fresh(s), await limits_service.plan_checked(s)
-            accounts = [a for a in await account_service.list_accounts(s) if a.enabled and account_service.has_plan(a) and not (a.key in reported and a.key in planned)]
+            # One that lists its models (account_service.LISTED) is asked every hour even while in use: new models.
+            listed = await limits_service.plan_checked(s, account_service.MODELS_CHECK_SECONDS)
+            accounts = [
+                a
+                for a in await account_service.list_accounts(s)
+                if a.enabled
+                and account_service.has_plan(a)
+                and not (a.key in reported and a.key in (listed if a.provider in account_service.LISTED else planned) and (a.provider not in account_service.LISTED or a.models))
+            ]
             found = await asyncio.gather(
                 *(self.runner.limits(a.provider, settings_service.credentials(values, account=account_service.fields(a))) for a in accounts)
             )
             for account, report in zip(accounts, found):
-                if report.windows:
-                    await limits_service.record(s, account.key, report.windows, complete=report.complete)
+                # The plan first: a changed one forgets the old plan's limits, not the ones just read.
                 await limits_service.record_plan(s, account.key, report.plan, report.plan_size)
-            if any(account_service.own_login(a) for a in accounts):
-                await account_service.take_sign_ins(s, self.runner)
+                if report.windows:
+                    await limits_service.record(s, account.key, report.windows, complete=report.complete, covers=report.covers)
+                if account_service.record_models(account, report.models):
+                    await s.commit()
+            if any(account_service.kept_login(a) for a in accounts):
+                await self.keep_sign_ins(s, None)
 
     async def wind_down(self, s: AsyncSession, agent: Agent, reason: str = "", *, jobs_end: bool = False) -> bool:
         """Let an agent finish safely: drop what it has not started and tell its running turn to wrap up.
@@ -1122,6 +1211,45 @@ class RunManager:
         await s.commit()
         await flow_log.record(s, project.id, "project.resumed")
         bus.publish(project.id, "project.updated", project_service.to_out(project))
+        self._wake.set()
+
+    async def pause_for_limits(self, s: AsyncSession, project: Project, until: datetime | None) -> None:
+        """Every subscription of the project is nearly used up (services/limit_pause.py): no new turn of
+        it starts but a chat with the user, its running turns wrap up, its jobs go on. Its manager is told."""
+        project.limit_paused_at, project.limit_resumes_at = utcnow(), until
+        await s.commit()
+        await flow_log.record(s, project.id, "project.limit_paused", resumes_at=until.isoformat() if until else None)
+        bus.publish(project.id, "project.updated", project_service.to_out(project))
+        if manager_id := await s.scalar(select(Agent.id).where(Agent.project_id == project.id, Agent.is_manager).limit(1)):
+            await inbox.push(s, manager_id, prompts.limit_paused(until.strftime("%Y-%m-%d %H:%M") if until else ""))
+        turns = select(Run).where(
+            Run.project_id == project.id, Run.status == RunStatus.RUNNING, Run.stop_requested_at.is_(None), Run.trigger != RunTrigger.CHAT, Run.parent_run_id.is_(None)
+        )
+        for run in list(await s.scalars(turns)):
+            try:
+                told = await self.runners.of(run.project_id).notify_run(run.id, prompts.wind_down_notice(prompts.LIMIT_PAUSE_REASON, jobs_keep=True), urgent=True)
+            except Exception:
+                log.exception("Limit pause: turn %s was not told to wrap up", run.id)
+                continue
+            if told:
+                run.stop_requested_at = utcnow()
+                await s.commit()
+                bus.publish(run.project_id, "run.upserted", RunOut.model_validate(run))
+
+    async def limit_resumes_at(self, s: AsyncSession, project: Project, until: datetime | None) -> None:
+        """A new reading moved the time the project's limit pause is expected to end."""
+        project.limit_resumes_at = until
+        await s.commit()
+        bus.publish(project.id, "project.updated", project_service.to_out(project))
+
+    async def resume_after_limits(self, s: AsyncSession, project: Project) -> None:
+        """A subscription of the project has room again: what waited starts, and its manager is told."""
+        project.limit_paused_at, project.limit_resumes_at = None, None
+        await s.commit()
+        await flow_log.record(s, project.id, "project.limit_resumed")
+        bus.publish(project.id, "project.updated", project_service.to_out(project))
+        if manager_id := await s.scalar(select(Agent.id).where(Agent.project_id == project.id, Agent.is_manager).limit(1)):
+            await inbox.push(s, manager_id, prompts.LIMIT_RESUMED)
         self._wake.set()
 
     async def _rest_jobs(self, s: AsyncSession, agent_id: int | None = None, project_id: int | None = None) -> int:
@@ -1289,6 +1417,8 @@ class RunManager:
             # Projects a person paused for good. Read from the database with every look: whoever queued
             # a turn for one of them (a chat, a schedule, a report), it does not start.
             resting = set(await s.scalars(select(Project.id).where(Project.paused_at.is_not(None)))) if queued else set()
+            # Projects whose subscriptions are all nearly used up (services/limit_pause.py): a chat with the user still starts.
+            limited = set(await s.scalars(select(Project.id).where(Project.limit_paused_at.is_not(None), Project.limit_pause))) if queued else set()
             # A paused agent keeps its assignments in the queue; only its turn to wrap up still runs.
             paused = set(await s.scalars(select(Agent.id).where(~Agent.enabled))) if queued else set()
             # An agent finishes its open assignment before it starts another one.
@@ -1315,6 +1445,7 @@ class RunManager:
                 if not (r.trigger == RunTrigger.ASSIGNMENT and r.agent_id in occupied and r.assignment_id not in fixes) and not (r.agent_id in paused and r.assignment_id and not r.stop_requested_at)
                 # Everything is paused: only what wraps up still starts, and the answer a turn that wraps up waits for.
                 and not ((self.paused or r.project_id in resting) and not r.stop_requested_at and r.parent_run_id is None)
+                and not (r.project_id in limited and r.trigger != RunTrigger.CHAT and not r.stop_requested_at and r.parent_run_id is None)
                 # An external runner that is away: its turns wait for it in the queue. One that runs idle to
                 # update itself still starts what a running turn waits for (an answer) and what wraps up.
                 and (self.runners.ready(r.project_id) if r.parent_run_id is not None or r.stop_requested_at else self.runners.accepts(r.project_id))
@@ -1434,6 +1565,7 @@ class RunManager:
             self._lost.discard(run_id)
             self._job_waits.pop(run_id, None)
             self._unread.pop(run_id, None)
+            self._interrupts.pop(run_id, None)
             self._busy_agents.discard(agent_id)
             self._wake.set()
             try:
@@ -1484,9 +1616,11 @@ class RunManager:
             if run.input_text or files:
                 text = run.input_text
             elif held is not None and not await job_service.running_for_assignment(s, held.id):
-                text = prompts.continue_prompt(held, (await timing_service.ledger(s, held)).text())
+                text = prompts.continue_prompt(held, (await timing_service.ledger(s, held)).text(), interrupted=held.id in self._resumed)
             else:
                 text = prompts.wake_prompt(agent.is_manager)
+            if held is not None:
+                self._resumed.discard(held.id)
             meta: dict = {"trigger": run.trigger}
             if run.task_id:
                 meta["task_id"] = run.task_id
@@ -1526,7 +1660,7 @@ class RunManager:
                 capacity = await board_service.capacity(
                     s, project.id, limit, except_run_id=run.id, waiting=self.waiting_for_job(), backlog=project.continue_with_backlog
                 )
-                team = [a for a in await agent_service.list_for_project(s, project.id) if a.enabled and not a.is_manager]
+                team = [a for a in await agent_service.list_for_project(s, project.id, doc_agents=False) if a.enabled and not a.is_manager]
                 open_todos = await todo_service.open_stats(s, [a.id for a in team])
                 todo_counts = [(a.name, *_count_and_age(open_todos.get(a.id))) for a in team[:12]]
                 checks = (
@@ -1536,6 +1670,7 @@ class RunManager:
                     prompts.review_line(await board_service.unmarked_in_review(s, project.id)),
                     prompts.capacity_line(capacity),
                     prompts.team_todos_line(todo_counts),
+                    prompts.ideas_line(await idea_service.count_open(s, project.id)),
                     timing_service.waiting_line(await timing_service.cached_overview(s, project.id, 24)),
                     prompts.language_note(project.language),
                 )
@@ -1570,8 +1705,9 @@ class RunManager:
                 message.meta = {**message.meta, "briefing_update": turn.briefing_changes}
                 await s.commit()
                 bus.publish(project.id, "message.updated", MessageOut.model_validate(message))
-            account = await account_service.pick(s, agent.provider, agent, conv, fresh=turn.resume_session_id is None)
-            if account is None and (why := await account_service.shut_out(s, agent.provider, agent)):
+            where = self.runners.where(project.id)
+            account = await account_service.pick(s, agent.provider, agent, conv, fresh=turn.resume_session_id is None, where=where)
+            if account is None and (why := await account_service.shut_out(s, agent.provider, agent) or await account_service.not_signed_in(s, agent.provider, agent, where)):
                 raise RuntimeError(why)  # the turn fails with the reason, instead of at the provider for a missing key
             if account:
                 conv.account_key, run.account_key = account.key, account.key
@@ -1668,7 +1804,7 @@ class RunManager:
                     await s.commit()
                     bus.publish(ctx.project_id, "conversation.updated", {"agent_id": ctx.agent_id, "context_tokens": event.context_tokens})
                 elif event.type == "limits" and ctx.account_key:
-                    await limits_service.record(s, ctx.account_key, event.windows, complete=event.complete)
+                    await limits_service.record(s, ctx.account_key, event.windows, complete=event.complete, covers=event.covers)
                     outcome.limited = outcome.limited or any(w.status == "rejected" for w in event.windows)
                 elif event.type == "compaction":
                     marker = self.context.provider_compacted(conv, event.tokens_before)
@@ -1699,7 +1835,7 @@ class RunManager:
             if run is None or agent is None or run.status != RunStatus.RUNNING:
                 return None
             conv = await agent_service.conversation_for(s, agent.id)
-            account = await account_service.other_with_room(s, agent.provider, agent, conv, ctx.account_key)
+            account = await account_service.other_with_room(s, agent.provider, agent, conv, ctx.account_key, where=self.runners.where(agent.project_id))
             if account is None:
                 return None
             log.info("Run %s: account %s is used up, the turn runs again on %s", run.id, ctx.account_key, account.key)
@@ -1821,12 +1957,25 @@ class RunManager:
         unread = assignment.agent_id in self._job_news or assignment.id in self._comment_news.get(assignment.agent_id, ())
         return unread and bool(await inbox.pending_count(s, assignment.agent_id))
 
+    async def _interrupted(self, s: AsyncSession, run: Run) -> bool:
+        """Whether the turn was told to end for a question or chat message that still waits for its turn."""
+        told = self._interrupts.get(run.id)
+        if not told:
+            return False
+        return bool(await s.scalar(select(Run.id).where(Run.id.in_(told), Run.status == RunStatus.QUEUED).limit(1)))
+
     async def _assignment_turn_ended(self, s: AsyncSession, run: Run, assignment: Assignment, agent: Agent, project: Project, outcome_text: str) -> None:
         """Close the assignment and send its one report, unless it still waits for a job of its own:
         then it stays open, and the turn that the job's result starts continues it."""
         ok = run.status == RunStatus.SUCCEEDED
         text = run.result_text or ""
         if ok and project.auto_wake_manager and await self._waits_for_job(s, assignment):
+            bus.publish(project.id, "assignment.upserted", AssignmentOut.model_validate(assignment))
+            return
+        if ok and await self._interrupted(s, run):
+            # It ended its turn for a question or chat message that waits as its next turn (#150): not finished.
+            # Its text is no report; the turn after that answer goes on with the assignment (_settle).
+            self._resumed.add(assignment.id)
             bus.publish(project.id, "assignment.upserted", AssignmentOut.model_validate(assignment))
             return
         if ok and run.stop_requested_at and not agent.enabled:
@@ -1871,6 +2020,8 @@ class RunManager:
                     f"and the fix lands like any branch: {truncate(text, 500)}",
                 )
             return
+        if ok and agent.doc_site_id is not None and assignment.created_by_agent_id is None:
+            return  # a doc agent's update that PlainBoard ordered after landings (docs_watcher): it costs the manager no turn
         ref = f", ticket #{ticket.number}" if ticket else ""
         recipient = assignment.created_by_agent_id or (await agent_service.get_manager(s, project.id)).id
         if recipient != agent.id:
@@ -1892,9 +2043,23 @@ class RunManager:
         task = await s.get(Task, decision.task_id)
         if project is None or task is None:
             return
+        if (proposal := await docs_proposals.of_decision(s, decision.id)) is not None:
+            await self._restructure(s, proposal, decision, task)
+            return
         recipient = decision.requested_by_agent_id or (await agent_service.get_manager(s, project.id)).id
         await inbox.push(s, recipient, f'{prompts.person(author)} decided on ticket #{task.number} ("{decision.question}"): {decision_service.answer_summary(decision)}')
         await self._maybe_wake(s, project, recipient)
+
+    async def _restructure(self, s: AsyncSession, proposal: DocProposal, decision: Decision, task: Task) -> None:
+        """A doc agent's proposal answered (#156): approved, it gets the restructuring as an assignment on its ticket;
+        declined, the ticket is done and the same proposal is refused from now on."""
+        order = await docs_proposals.settle(s, proposal, decision, task)
+        site = await s.get(DocSite, proposal.site_id)
+        if order is None or site is None:
+            await board_service.update_task(s, task, TaskUpdate(status="done"))
+            return
+        agent = await docs_service.ensure_agent(s, site)
+        await self.delegate(s, None, agent, f"Restructure the doc site {site.name}", order, task, source="PlainBoard")
 
     async def comment_added(self, s: AsyncSession, task: Task, comment: Comment) -> None:
         """A comment reaches the agents with an open assignment on its ticket (not its author), and the manager
@@ -2039,7 +2204,12 @@ def _session_lost(error: str | None) -> bool:
 
 async def _features(s: AsyncSession, project: Project) -> frozenset[str]:
     """What the project has of the tools that depend on something (``registry.tool(feature=...)``)."""
-    return frozenset({registry.SEARCH}) if await search_service.enabled(s, project) else frozenset()
+    from ..models import DocSite
+
+    found = {registry.SEARCH} if await search_service.enabled(s, project) else set()
+    if await s.scalar(select(DocSite.id).where(DocSite.project_id == project.id).limit(1)) is not None:
+        found.add(registry.DOCS)
+    return frozenset(found)
 
 
 async def _related_hint(s: AsyncSession, project: Project, assignment: Assignment) -> str:

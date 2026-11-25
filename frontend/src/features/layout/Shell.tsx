@@ -4,14 +4,15 @@ import {
   AppWindow,
   ArrowUpCircle,
   BarChart3,
+  BookOpen,
   CalendarClock,
   FolderKanban,
   GitMerge,
-  Menu,
+  Lightbulb,
   MessageSquare,
   NotebookPen,
   Palette,
-  Plug,
+  Search,
   Settings,
   SlidersHorizontal,
   Users,
@@ -38,6 +39,7 @@ import {
 import type { Agent, Project } from "../../api/types";
 import { Button, EmptyState, IconButton, Spinner } from "../../components/ui";
 import { useIsDesktop, useMediaQuery, useStored } from "../../lib/hooks";
+import { updateHow } from "../../lib/version";
 import { Logo } from "../auth/Login";
 import { Board } from "../board/Board";
 import type { BrowserRequest } from "../browser/BrowserView";
@@ -56,6 +58,7 @@ import { ProjectSwitcher } from "../projects/ProjectSwitcher";
 import { ProjectPauseBanner } from "../projects/ProjectPause";
 import { PauseBanner } from "../settings/PauseEditor";
 import { RunningNow } from "./RunningNow";
+import { CommandPalette, NavButton, PaletteButton, ProjectMenu, type NavEntry } from "./Palette";
 import { ShellContext, type ShellApi } from "./shell-context";
 
 // Rarely used views and dialogs load on first use (own chunks), keeping the first load small.
@@ -67,36 +70,43 @@ const SchedulesView = lazy(() => import("../schedules/SchedulesView").then((m) =
 const SettingsDialog = lazy(() => import("../settings/SettingsDialog").then((m) => ({ default: m.SettingsDialog })));
 const FlowView = lazy(() => import("../flow/FlowView").then((m) => ({ default: m.FlowView })));
 const StatsView = lazy(() => import("../stats/StatsView").then((m) => ({ default: m.StatsView })));
+const IdeasView = lazy(() => import("../ideas/IdeasView").then((m) => ({ default: m.IdeasView })));
+const DocsView = lazy(() => import("../docs/DocsView").then((m) => ({ default: m.DocsView })));
 const TeamView = lazy(() => import("../team/TeamView").then((m) => ({ default: m.TeamView })));
-const ToolsView = lazy(() => import("../tools/ToolsView").then((m) => ({ default: m.ToolsView })));
 
 export type View =
   | "board"
+  | "ideas"
   | "chat"
   | "team"
   | "notes"
+  | "docs"
   | "schedules"
   | "browser"
-  | "tools"
   | "stats"
   | "flow"
   | "project";
 
 const VIEWS: { id: View; icon: (cls: string) => ReactNode }[] = [
   { id: "board", icon: (c) => <FolderKanban className={c} /> },
-  { id: "flow", icon: (c) => <GitMerge className={c} /> },
   { id: "chat", icon: (c) => <MessageSquare className={c} /> },
+  { id: "ideas", icon: (c) => <Lightbulb className={c} /> },
+  { id: "flow", icon: (c) => <GitMerge className={c} /> },
   { id: "team", icon: (c) => <Users className={c} /> },
-  // The project's own settings: for its owners. Fixed entry after the core views; on the phone the 4th tab.
-  { id: "project", icon: (c) => <SlidersHorizontal className={c} /> },
   { id: "notes", icon: (c) => <NotebookPen className={c} /> },
+  { id: "docs", icon: (c) => <BookOpen className={c} /> },
   { id: "schedules", icon: (c) => <CalendarClock className={c} /> },
   { id: "browser", icon: (c) => <AppWindow className={c} /> },
-  { id: "tools", icon: (c) => <Plug className={c} /> },
   { id: "stats", icon: (c) => <BarChart3 className={c} /> },
+  // The project's own settings, with its tools (MCP servers): for its owners; a member sees its own part.
+  { id: "project", icon: (c) => <SlidersHorizontal className={c} /> },
 ];
-/** The phone's bottom bar holds this many views; the rest sit behind "More". */
-const PHONE_TABS = 4;
+/** The main navigation: daily work, in the sidebar and as the phone's tabs. */
+const MAIN: View[] = ["board", "chat", "ideas", "flow", "team"];
+/** On phones the tabs have room for four views and the search: the team moves to the "…" menu. */
+const PHONE_MAIN: View[] = ["board", "chat", "ideas", "flow"];
+/** The rest: in the "…" menu at the project name and in the palette (Ctrl+K). */
+const RARE: View[] = ["notes", "docs", "schedules", "browser", "stats", "project"];
 
 export function Shell() {
   const { t } = useTranslation();
@@ -281,7 +291,7 @@ function UpdateNotice({ wide }: { wide: boolean }) {
   const { t } = useTranslation();
   const version = useMeta().data?.version;
   if (!version?.behind) return null;
-  const how = t("update.how", { count: version.behind });
+  const how = updateHow(t, version);
   const cls = clsx(
     "flex shrink-0 items-center gap-2.5 rounded-sm text-fg-2 hover:bg-sunk hover:text-fg",
     wide ? "mx-2 h-8 px-2" : "mx-auto size-8 justify-center",
@@ -340,8 +350,14 @@ function ProjectWorkspace({
   const roomy = useMediaQuery("(min-width: 1440px)");
   const [storedView, setView] = useStored<View>("plainboard.view", "board");
   const owner = project.role === "owner";
-  const views = VIEWS.filter((v) => v.id !== "project" || owner);
+  const settings = owner || project.role === "member"; // a member's part: giving the project an own subscription
+  const views = VIEWS.filter((v) => v.id !== "project" || settings);
   const view = views.some((v) => v.id === storedView) ? storedView : "board";
+  const [paletteOpen, setPaletteOpen] = useState(false);
+  const [lookOpen, setLookOpen] = useState(false);
+  const [noteRequest, setNoteRequest] = useState<{ id?: number; n: number }>({ n: 0 });
+  const [ideaRequest, setIdeaRequest] = useState<{ id: number; n: number }>();
+  const [docRequest, setDocRequest] = useState<{ pageId: number; n: number }>();
   const [panelOpen, setPanelOpen] = useStored<boolean>(
     "plainboard.chatOpen",
     true,
@@ -362,6 +378,8 @@ function ProjectWorkspace({
   });
   useProjectEvents(project.id);
 
+  // A doc site's own agent (#118) is set up in the site's settings: not in the team, the board or the agent choices.
+  const visibleAgents = useMemo(() => agents.data?.filter((a) => !a.doc_site_id) ?? NO_AGENTS, [agents.data]);
   const manager = agents.data?.find((a) => a.is_manager);
   const chatAgent = agents.data?.find((a) => a.id === chatAgentId) ?? manager;
   const activeChatId = chatAgent?.id ?? null;
@@ -376,7 +394,7 @@ function ProjectWorkspace({
       project,
       canWrite: project.role !== "viewer",
       isOwner: project.role === "owner",
-      agents: agents.data ?? NO_AGENTS,
+      agents: visibleAgents,
       agentById,
       previews,
       openChat: (id) => {
@@ -390,6 +408,10 @@ function ProjectWorkspace({
         toggle: () => setPanelOpen(!panelOpen),
       },
       openTask: setOpenTaskId,
+      openIdea: (id) => {
+        setIdeaRequest((last) => ({ id, n: (last?.n ?? 0) + 1 }));
+        setView("ideas");
+      },
       openSettings,
       openBrowser: (address) => {
         setBrowserRequest((last) => ({ url: address, n: last.n + 1 }));
@@ -398,7 +420,7 @@ function ProjectWorkspace({
     }),
     [
       project,
-      agents.data,
+      visibleAgents,
       agentById,
       previews,
       openSettings,
@@ -420,12 +442,44 @@ function ProjectWorkspace({
     else if (m.task_id !== null) api.openTask(m.task_id);
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, []);
-  /** A view that has something running behind it gets a mark: the browser while previews run. */
+  /** A view that has something running behind it: the browser while previews run. Its label stays short; the
+   * sidebar lists the previews, the rail marks its icon and the phone the "…". */
   const marked = (id: View) => id === "browser" && previews.length > 0;
-  const viewLabel = (id: View) =>
-    marked(id)
-      ? `${t(`nav.${id}`)} · ${t("previews.count", { count: previews.length })}`
-      : t(`nav.${id}`);
+  const entry = (id: View): NavEntry => ({
+    id,
+    label: t(`nav.${id}`),
+    icon: VIEWS.find((v) => v.id === id)!.icon,
+    marked: marked(id),
+  });
+  const reachable = views.map((v) => v.id);
+  const rare = [...(isDesktop ? [] : MAIN.filter((id) => !PHONE_MAIN.includes(id))), ...RARE].filter((id) => reachable.includes(id));
+  // The browser joins the main navigation while a preview runs, the open rare view while it is open.
+  const mainIds = [...MAIN, ...rare.filter((id) => (id === "browser" && marked(id)) || id === view)];
+  useEffect(() => {
+    const onKey = (e: KeyboardEvent) => {
+      if ((e.ctrlKey || e.metaKey) && !e.altKey && e.key.toLowerCase() === "k") {
+        e.preventDefault();
+        setPaletteOpen((o) => !o);
+      }
+    };
+    window.addEventListener("keydown", onKey);
+    return () => window.removeEventListener("keydown", onKey);
+  }, []);
+  const areas = [
+    ...reachable.map((id) => ({ ...entry(id), run: () => setView(id) })),
+    { id: "settings", label: t("nav.settings"), icon: (c: string) => <Settings className={c} />, run: onSettings },
+    { id: "theme", label: t("nav.theme"), icon: (c: string) => <Palette className={c} />, run: () => setLookOpen(true) },
+  ];
+  const projectMenu = (align: "left" | "right") => (
+    <ProjectMenu
+      align={align}
+      entries={rare.map(entry)}
+      marked={!isDesktop && rare.some(marked)}
+      onSelect={(id) => setView(id as View)}
+      onSettings={isDesktop ? undefined : onSettings}
+      onLook={isDesktop ? undefined : () => setLookOpen(true)}
+    />
+  );
 
   const startResize = (e: ReactPointerEvent) => {
     e.preventDefault();
@@ -461,7 +515,7 @@ function ProjectWorkspace({
       current={project}
       onSelect={onSelectProject}
       onNew={onNewProject}
-      onEdit={owner ? () => setView("project") : undefined}
+      onEdit={settings ? () => setView("project") : undefined}
     />
   );
 
@@ -490,8 +544,12 @@ function ProjectWorkspace({
             >
               <Brand wide={wide} />
             </div>
+            <div className={clsx("flex shrink-0 gap-1 px-2 pb-2.5", wide ? "items-center" : "flex-col items-center")}>
+              <div className={clsx(wide && "min-w-0 flex-1")}>{switcher(wide ? "side" : "rail")}</div>
+              {projectMenu("left")}
+            </div>
             <div className="shrink-0 px-2 pb-2.5">
-              {switcher(wide ? "side" : "rail")}
+              <PaletteButton wide={wide} onClick={() => setPaletteOpen(true)} />
             </div>
             <div className="shrink-0 px-2 pb-2.5 empty:hidden">
               <ForYou variant={wide ? "side" : "rail"} />
@@ -501,31 +559,8 @@ function ProjectWorkspace({
               aria-label={t("nav.views")}
               className="flex shrink-0 flex-col gap-px px-2"
             >
-              {views.map((v) => (
-                <button
-                  key={v.id}
-                  type="button"
-                  onClick={() => setView(v.id)}
-                  title={wide ? undefined : viewLabel(v.id)}
-                  aria-label={viewLabel(v.id)}
-                  aria-current={view === v.id ? "page" : undefined}
-                  className={clsx(
-                    "relative flex h-8 items-center gap-2.5 rounded-sm transition-colors",
-                    wide ? "px-2" : "justify-center",
-                    view === v.id
-                      ? "plate"
-                      : "text-fg-2 hover:bg-sunk hover:text-fg",
-                  )}
-                >
-                  {v.icon("size-4 shrink-0")}
-                  {wide && (
-                    <span className="label-line">{t(`nav.${v.id}`)}</span>
-                  )}
-                  {/* The wide sidebar lists the previews themselves, below. */}
-                  {!wide && marked(v.id) && (
-                    <span className="mk mk-run absolute top-1 right-1 scale-75 bg-current" />
-                  )}
-                </button>
+              {mainIds.map((id) => (
+                <NavButton key={id} entry={entry(id)} active={view === id} wide={wide} onClick={() => setView(id)} />
               ))}
             </nav>
             {wide ? (
@@ -563,6 +598,7 @@ function ProjectWorkspace({
             >
               <div className="flex h-13 items-center gap-2">
                 {switcher("bar")}
+                {projectMenu("left")}
                 <div className="flex-1" />
                 <StatusHints onOpenSettings={onSettings} wide={false} />
                 <UpdateNotice wide={false} />
@@ -603,10 +639,11 @@ function ProjectWorkspace({
                 }
               >
                 {view === "team" && <TeamView />}
-                {view === "notes" && <NotesView />}
+                {view === "ideas" && <IdeasView focus={ideaRequest} />}
+                {view === "notes" && <NotesView key={noteRequest.n} initial={noteRequest.id} />}
+                {view === "docs" && <DocsView focus={docRequest} />}
                 {view === "schedules" && <SchedulesView />}
                 {view === "browser" && <BrowserView request={browserRequest} />}
-                {view === "tools" && <ToolsView />}
                 {view === "stats" && <StatsView />}
                 {view === "flow" && <FlowView />}
                 {view === "project" && (
@@ -645,15 +682,34 @@ function ProjectWorkspace({
 
           {!isDesktop && (
             <PhoneTabs
-              views={views}
+              entries={PHONE_MAIN.map(entry)}
               view={view}
               setView={setView}
-              onSettings={onSettings}
-              previews={previews.length}
+              search={paletteOpen}
+              onSearch={() => setPaletteOpen(true)}
             />
           )}
         </div>
       </div>
+      <CommandPalette
+        open={paletteOpen}
+        onClose={() => setPaletteOpen(false)}
+        areas={areas}
+        projects={projects}
+        current={project}
+        onSelectProject={onSelectProject}
+        onOpenTask={api.openTask}
+        onOpenNote={(id) => {
+          setNoteRequest((last) => ({ id, n: last.n + 1 }));
+          setView("notes");
+        }}
+        onOpenIdea={api.openIdea}
+        onOpenDocPage={(pageId) => {
+          setDocRequest((last) => ({ pageId, n: (last?.n ?? 0) + 1 }));
+          setView("docs");
+        }}
+      />
+      <LookDialog open={lookOpen} onClose={() => setLookOpen(false)} />
       {openTaskId !== null && (
         <TaskModal taskId={openTaskId} onClose={() => setOpenTaskId(null)} />
       )}
@@ -661,26 +717,21 @@ function ProjectWorkspace({
   );
 }
 
-/** Bottom navigation on phones: the main views, and a sheet with the rest. */
+/** Bottom navigation on phones: the main views and the search; the rest is in the "…" at the project name. */
 function PhoneTabs({
-  views,
+  entries,
   view,
   setView,
-  onSettings,
-  previews,
+  search,
+  onSearch,
 }: {
-  views: typeof VIEWS;
+  entries: NavEntry[];
   view: View;
   setView: (v: View) => void;
-  onSettings: () => void;
-  previews: number;
+  search: boolean;
+  onSearch: () => void;
 }) {
   const { t } = useTranslation();
-  const [more, setMore] = useState(false);
-  const [lookOpen, setLookOpen] = useState(false);
-  const tabs = views.slice(0, PHONE_TABS);
-  const rest = views.slice(PHONE_TABS);
-  const marked = (id: View) => id === "browser" && previews > 0;
   const tab = (active: boolean) =>
     clsx(
       "relative flex min-h-[58px] min-w-0 flex-1 flex-col items-center justify-center gap-0.5",
@@ -688,111 +739,29 @@ function PhoneTabs({
         ? "font-semibold text-fg before:absolute before:inset-x-[22%] before:-top-px before:h-0.5 before:bg-fg"
         : "text-fg-3",
     );
-  const item = "flex h-12 w-full items-center gap-3 rounded-sm px-3 text-left";
-  const go = (v: View) => {
-    setView(v);
-    setMore(false);
-  };
-
   return (
-    <>
-      {more && (
-        <div
-          className="fixed inset-0 z-40 bg-black/40"
-          onClick={() => setMore(false)}
-        >
-          <div
-            role="menu"
-            className="absolute inset-x-0 bottom-[calc(58px+env(safe-area-inset-bottom))] rule-t bg-bg p-2"
-            onClick={(e) => e.stopPropagation()}
-          >
-            {rest.map((v) => (
-              <button
-                key={v.id}
-                type="button"
-                role="menuitem"
-                onClick={() => go(v.id)}
-                className={clsx(item, view === v.id ? "plate" : "text-fg")}
-              >
-                {v.icon("size-5 shrink-0")}
-                {t(`nav.${v.id}`)}
-                {marked(v.id) && (
-                  <span className="ml-auto opacity-80">
-                    {t("previews.count", { count: previews })}
-                  </span>
-                )}
-              </button>
-            ))}
-            <div className="my-2 border-t border-line" />
-            <button
-              type="button"
-              role="menuitem"
-              className={item}
-              onClick={() => {
-                setMore(false);
-                onSettings();
-              }}
-            >
-              <Settings className="size-5 shrink-0" />
-              {t("nav.settings")}
-            </button>
-            <button
-              type="button"
-              role="menuitem"
-              className={item}
-              onClick={() => {
-                setMore(false);
-                setLookOpen(true);
-              }}
-            >
-              <Palette className="size-5 shrink-0" />
-              {t("nav.theme")}
-            </button>
-          </div>
-        </div>
-      )}
-      <LookDialog open={lookOpen} onClose={() => setLookOpen(false)} />
-      <nav
-        data-part="tabs"
-        aria-label={t("nav.views")}
-        className="relative z-40 flex shrink-0 border-t border-line-2 bg-bg pb-[env(safe-area-inset-bottom)]"
-      >
-        {tabs.map((v) => (
-          <button
-            key={v.id}
-            type="button"
-            onClick={() => go(v.id)}
-            aria-label={t(`nav.${v.id}`)}
-            aria-current={view === v.id && !more ? "page" : undefined}
-            className={tab(view === v.id && !more)}
-          >
-            <span className="relative">
-              {v.icon("size-5")}
-              {marked(v.id) && (
-                <span className="mk mk-run absolute -top-0.5 -right-2 scale-75 bg-current" />
-              )}
-            </span>
-            <span className="max-w-full truncate">
-              {v.id === "project" ? t("nav.projectShort") : t(`nav.${v.id}`)}
-            </span>
-          </button>
-        ))}
+    <nav
+      data-part="tabs"
+      aria-label={t("nav.views")}
+      className="relative z-40 flex shrink-0 border-t border-line-2 bg-bg pb-[env(safe-area-inset-bottom)]"
+    >
+      {entries.map((v) => (
         <button
+          key={v.id}
           type="button"
-          aria-haspopup="menu"
-          aria-expanded={more}
-          onClick={() => setMore(!more)}
-          className={tab(more || rest.some((v) => v.id === view))}
+          onClick={() => setView(v.id as View)}
+          aria-label={v.label}
+          aria-current={view === v.id && !search ? "page" : undefined}
+          className={tab(view === v.id && !search)}
         >
-          <span className="relative">
-            <Menu className="size-5" />
-            {rest.some((v) => marked(v.id)) && (
-              <span className="mk mk-run absolute -top-0.5 -right-2 scale-75 bg-current" />
-            )}
-          </span>
-          <span className="max-w-full truncate">{t("nav.more")}</span>
+          {v.icon("size-5")}
+          <span className="max-w-full truncate">{v.label}</span>
         </button>
-      </nav>
-    </>
+      ))}
+      <button type="button" onClick={onSearch} aria-haspopup="dialog" className={tab(search)}>
+        <Search className="size-5" />
+        <span className="max-w-full truncate">{t("palette.short")}</span>
+      </button>
+    </nav>
   );
 }

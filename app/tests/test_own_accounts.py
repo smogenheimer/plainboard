@@ -179,3 +179,38 @@ def test_own_browser_sign_ins_are_kept_per_subscription_and_only_reach_its_runs(
     assert client.delete(url).json()["signed_in"] is False
     assert not next(a for a in client.get("/api/accounts").json() if a["id"] == claude["id"])["secret_set"]
     assert client.post(f"/api/accounts/{codex.json()['id']}/signin").status_code == 200
+
+
+def test_an_admin_turns_off_own_subscriptions_new_ones_first_then_those_there_are_reversibly(client, project):
+    """#138: off, people add none; those they have keep working until the admin switches them off too:
+    what was pinned to one chooses again and the manager hears it. On again, they work as before."""
+    friend(client)
+    as_friend(client)
+    own = client.post("/api/accounts", json={**TOKEN, "label": "Olga's", "secret": "tok-olga", "auth_mode": "api_key"}).json()
+    client.patch(f"/api/accounts/{own['id']}", json={"share": "everyone"})
+    assert client.put("/api/settings", json={"values": {"own_accounts": False}}).status_code == 403  # admins only
+
+    sign_in(client, "admin", ADMIN_PASSWORD)
+    assert client.patch(f"/api/projects/{project['id']}", json={"account_id": own["id"]}).status_code == 200
+    assert client.put("/api/settings", json={"values": {"own_accounts": False}}).status_code == 200
+    assert client.post("/api/accounts", json={**TOKEN, "label": "Admin's", "secret": "tok"}).status_code == 201  # the installation's
+    as_friend(client)
+    refused = client.post("/api/accounts", json={**TOKEN, "label": "Another", "secret": "tok"})
+    assert refused.status_code == 403 and "turned off" in refused.text
+    assert client.get("/api/settings").json()["values"]["own_accounts"] is False  # the UI reads it
+    sign_in(client, "admin", ADMIN_PASSWORD)
+    assert own["id"] in ids(client, project["id"]) and client.get(f"/api/projects/{project['id']}").json()["account_id"] == own["id"]
+
+    assert client.put("/api/settings", json={"values": {"own_accounts_off": True}}).status_code == 200
+    assert own["id"] not in ids(client, project["id"])
+    assert client.get(f"/api/projects/{project['id']}").json()["account_id"] is None
+    assert sum("'Olga's' was switched off by an admin" in text for text in inbox(client, project["id"])) == 1
+    assert client.patch(f"/api/projects/{project['id']}", json={"account_id": own["id"]}).status_code == 400
+    as_friend(client)
+    assert own["id"] in {a["id"] for a in client.get("/api/accounts").json()}  # still there, not deleted
+
+    sign_in(client, "admin", ADMIN_PASSWORD)
+    assert client.put("/api/settings", json={"values": {"own_accounts": True}}).status_code == 200
+    assert own["id"] in ids(client, project["id"])
+    as_friend(client)
+    assert client.post("/api/accounts", json={**TOKEN, "label": "Another", "secret": "tok"}).status_code == 201

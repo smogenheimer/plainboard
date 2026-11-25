@@ -109,6 +109,7 @@ class FakeRunner:
         self.limit_windows: list[LimitWindow] = []
         self.limit_calls: list = []
         self.limit_plans: dict[str, tuple[str, float | None]] = {}  # by token: the plan the provider names
+        self.limit_models: dict[str, list[ModelInfo]] = {}  # Codex, by codex_auth_mode: what the subscription may use
         self.unavailable = 0  # how many starts of a turn fail because the runner is not up yet
         self.active: set[int] = set()  # turns streaming right now
         self.forgotten: set[int] = set()  # turns the runner lost although the app still waits for them
@@ -134,6 +135,10 @@ class FakeRunner:
         self.check_specs: list = []
         self.land_specs: list = []
         self.land_error = ""
+        self.promote_plan = None  # Promotion (#129): what the runner reads (PromotePlan), what a push answers (PromoteResult)
+        self.promote_result = None
+        self.promotion_plans: list = []
+        self.promotion_pushes: list = []
         self.pulls: dict[tuple[str, int], PullRequestState] = {}  # GitHub: the trains' pull requests
         self.merged: list[tuple[str, int, dict]] = []
         self.closed: list[int] = []
@@ -234,7 +239,8 @@ class FakeRunner:
             windows = [w for w in self.limit_windows if w.name.startswith("antigravity_")]
         else:
             windows = [w for w in self.limit_windows if not w.name.startswith(("codex_", "antigravity_"))]
-        return LimitsEvent(windows=windows, complete=provider in ("codex", "antigravity"), plan=plan, plan_size=size)
+        models = self.limit_models.get(credentials.codex_auth_mode) if provider == "codex" else None
+        return LimitsEvent(windows=windows, complete=provider in ("codex", "antigravity"), plan=plan, plan_size=size, models=models)
 
     async def notify_run(self, run_id: int, text: str, urgent: bool = False) -> bool:
         self.notices.append((run_id, text))
@@ -313,6 +319,20 @@ class FakeRunner:
         self.jobs[spec.id] = JobState(running=True, log_path=f"/jobs/{spec.id}.log")
         return self.jobs[spec.id]
 
+    async def promotion_plan(self, spec):
+        from plainboard_protocol import PromotePlan
+
+        self.promotion_plans.append(spec)
+        plan = self.promote_plan or PromotePlan(base=spec.base or "main", release=spec.release, sha="0" * 40)
+        return plan.model_copy(update={"sha": spec.sha or plan.sha})
+
+    async def promotion_push(self, spec):
+        from plainboard_protocol import PromoteResult
+
+        self.database_free("promotion_push")
+        self.promotion_pushes.append(spec)
+        return self.promote_result or PromoteResult(ok=True, how="fast-forward", sha=spec.sha)
+
     async def land_train(self, spec) -> CheckResult:
         self.land_specs.append(spec)
         return CheckResult(ok=not self.land_error, detail=self.land_error or "pushed")
@@ -332,7 +352,7 @@ class FakeRunner:
     async def close_pull_request(self, credentials, repo: str, number: int) -> None:
         self.closed.append(number)
 
-    async def upstream(self, credentials, repository: str, branch: str, commit: str):
+    async def upstream(self, credentials, repository: str, branch: str, commit: str, version: str = ""):
         self.upstream_calls.append((repository, branch, commit))
         if self.upstream_error:
             raise RunnerError(self.upstream_error)
@@ -361,6 +381,7 @@ class FakeRunner:
                 ],
                 efforts=["minimal", "low", "medium", "high", "xhigh", "max"],
             ),
+            ProviderInfo(name="gemini_cli", label="Gemini", models=[ModelInfo(id="gemini-2.5-pro", label="Gemini 2.5 Pro", tier="large"), ModelInfo(id="gemini-2.5-flash", label="Gemini 2.5 Flash", tier="medium")]),
             # Providers that are an address. Agents can be given them once an account names a model.
             ProviderInfo(name="ollama", label="Ollama", models=[], endpoint=EndpointInfo(url="http://host.docker.internal:11434", key=False, hint="A model server of your own.")),
             ProviderInfo(name="gemini", label="Gemini (Google)", models=[], endpoint=EndpointInfo(url="https://generativelanguage.googleapis.com/v1beta/openai")),
@@ -456,8 +477,11 @@ class FakeRunner:
         """Every commit asked is on the base branch and every path there, except ``self.gone`` (shas whose files went too)."""
         from plainboard_protocol import GitPresentResult
 
+        self.present_specs = getattr(self, "present_specs", []) + [spec]
         gone = getattr(self, "gone", set())
-        return GitPresentResult(on_base=[sha for sha in spec.shas if sha not in gone], missing=list(spec.paths) if gone else [])
+        dead = getattr(self, "dead_patterns", set())  # patterns that match no file
+        unmatched = [p for p in spec.patterns if p in dead] if spec.patterns else None
+        return GitPresentResult(on_base=[sha for sha in spec.shas if sha not in gone], missing=list(spec.paths) if gone else [], unmatched=unmatched)
 
     async def tidy_branches(self, spec):
         self.tidy_specs = getattr(self, "tidy_specs", []) + [spec]
@@ -673,6 +697,8 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("PLAINBOARD_LANDING_INTERVAL_SECONDS", "3600")
     monkeypatch.setenv("PLAINBOARD_LANDING_LINGER_SECONDS", "0")
     monkeypatch.setenv("PLAINBOARD_SEARCH_INTERVAL_SECONDS", "3600")  # tests index with app.state.search.tick
+    monkeypatch.setenv("PLAINBOARD_DOCS_INTERVAL_SECONDS", "3600")  # tests look with app.state.docs_watcher.tick
+    monkeypatch.setenv("PLAINBOARD_LIMIT_PAUSE_INTERVAL_SECONDS", "3600")  # tests look with app.state.limit_pause.tick
     for var in ("CLAUDE_CODE_OAUTH_TOKEN", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", "GITHUB_TOKEN", "PLAINBOARD_PASSWORD"):
         monkeypatch.delenv(var, raising=False)
     from plainboard import config, main

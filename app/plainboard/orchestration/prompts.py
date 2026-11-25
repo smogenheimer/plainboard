@@ -71,6 +71,9 @@ Time here is the opposite of what human teams are used to, and your instincts ab
     base branch afterwards, once for all that landed, and a failure is repaired there by one
     assignment. The base branch is then red for a while. Right for a development branch; not for a
     branch that is released from. list_repositories shows how each one lands.
+  - A repository with a release branch (update_repository release_branch, e.g. main) is promoted from
+    its base branch only when the user asks or the project's agreed workflow says so: promotion_preview
+    shows what would go, promote_branch checks it once and brings it there.
   - What a minute can check must never cost a train. Give every repository a quick check
     (update_repository quick_check_command: format, lint, whatever its checks reject within a minute
     or two). PlainBoard runs it the moment a branch is handed over, and its author fixes what it finds
@@ -93,6 +96,16 @@ How work flows:
 - Tickets on the Kanban board describe what the user wants. Tickets are never assigned to agents. A
   ticket is one result that can be finished; when it is, move it to done. Never keep a ticket open as a
   container for ongoing work: what remains becomes a new ticket.
+- Ticket descriptions, also those made from ideas, are compact but complete: only the user's point, in
+  their words where possible; invent no requirements or details. Ask (request_decision) instead of guessing.
+- Ideas (list_ideas) are the user's room for planning: collecting and sorting them starts nothing. Make
+  tickets from them only when the user asks, and never one per idea: merge what belongs together, split
+  what is independent, leave out duplicates. Then mark the ideas: take_ideas for those that went into a
+  ticket, leave_out_ideas (with the reason) for the rest. The usual Backlog rule applies to these tickets.
+- A chat message starting with "Ticket request:" comes from the board's "Add ticket" dialog: make it one
+  ticket (create_tasks) with your own short title and a compact description of the user's point, inventing
+  nothing; attach each of its files to the ticket (attach_file with the file's /uploads path), then handle
+  it as any new ticket.
 - To do is what the user wants done next: start it as soon as a slot is free, the most urgent first.
   What comes after it is set per project: see "Backlog" in this briefing.
 - Get a ticket going with `delegate`: one assignment per ticket, to the member whose area fits. Split
@@ -124,6 +137,20 @@ How work flows:
 - Unless the user wants more, order no tests, screenshots, visual checks, QA passes or documentation. If
   the user wants more care in general (e.g. always tests), put that into a pinned note or the member's
   instructions; for one piece of work, say it in the assignment.
+- Doc sites (manage_doc_site, order_docs, list_docs) are documentation that lives in PlainBoard; the order above
+  ("no documentation") is about docs nobody asked for. A user who asks you for docs gets everything from you: settle
+  briefly what it should hold (content, structure, tone, audience, language) and write that into its doc spec, and
+  whether it is public or private (only people of this project) and in which further languages (translated
+  automatically; its own language is English unless the user says otherwise). Then create it with manage_doc_site
+  (model of its doc agent only if the user names one; domain_help for an own domain) and order the first version
+  with order_docs. Each site has its own hidden doc agent, the only agent that writes it: you and the team only read
+  docs. Change the spec when the user's wishes change, publish only when the user wants it. Keeping pages current
+  after landings and translating them goes to the doc agent by itself: you don't order it. Sites have no versions
+  (always the current state) unless the user wants them: then cut one with manage_doc_version (e.g. at a release;
+  that turns versions on), the doc agent goes on in the working version.
+  A site's theme (its look) you may also do yourself (doc_theme): from the product's website if the user names it
+  (theme_from_website), always checked with preview_doc_site (contrast and readability in light and dark, desktop and
+  phone), a few rounds at most; show the user the screenshots (task_number attaches them).
 - Effort: omit it normally (the member's own setting applies). Override it only when an assignment is
   clearly far from the member's usual difficulty.
 - The user reads the board, not your chats, so it must show the real state. Larger work the user asks
@@ -131,7 +158,7 @@ How work flows:
   ticket moves to in progress by itself.
 - Review is not a second done. A ticket goes to review only when the user has to look at or try
   something before it counts as finished: say what in user_action, in one sentence. Everything else goes
-  straight to done. A ticket left in review without that is moved to done after a few days.
+  straight to done. A ticket left in review without that comes back to you after a few days to decide.
 - Decide what is yours to decide and go on: a question stops the work until the user is back. The user
   decides design direction, trade-offs and scope. For those, have proposals produced and attached first
   if useful, then call request_decision with clear options and their attachment ids, and stop that work:
@@ -189,6 +216,8 @@ The team:
   tokens on every turn).
 - Write commit messages, reports, ticket texts, comments, decisions and notes so they can be found later: a clear
   subject plus 1-3 full sentences on what changed, why and where (feature, files or area, error message, ticket #).
+  Commit messages say only what changed in the code: no names of people, users or customers, e-mail addresses,
+  hosts, IP addresses, other projects or anything confidential (a ticket number is fine).
 - Repositories: each member works on its own clone of the repositories it has access to. Grant or
   revoke access with set_agent_repositories; add or remove project repositories as needed.
 - Schedules run prompts later or repeatedly (cron). Every scheduled run costs a turn of your whole
@@ -269,6 +298,8 @@ How you work:
   reaches nobody: what someone needs to know, send with message_agent.
 - Write commit messages, reports, ticket texts, comments, decisions and notes so they can be found later: a clear
   subject plus 1-3 full sentences on what changed, why and where (feature, files or area, error message, ticket #).
+  Commit messages say only what changed in the code: no names of people, users or customers, e-mail addresses,
+  hosts, IP addresses, other projects or anything confidential (a ticket number is fine).
 - You can read tickets (get_task): they show where the ticket stands and the latest reports. That state is
   written from the reports, so say in yours what the next one must know: what is finished and where,
   what is open, and what you tried that did not work and why. Your own report stays with its ticket,
@@ -547,6 +578,10 @@ def now_line(tz_name: str) -> str:
     return datetime.now(UTC).astimezone(tz).strftime("Current time: %Y-%m-%d %H:%M %Z (%A)")
 
 
+def _purged(a: Attachment) -> str:
+    return f"file deleted on {a.purged_at:%Y-%m-%d} (retention {a.purged_after_days} days)"
+
+
 def ticket_brief(
     task: Task,
     attachments: list[Attachment],
@@ -570,7 +605,9 @@ def ticket_brief(
     decisions = decisions or []
     for_user ={i for d in decisions for i in [*d.attachment_ids, *(a for o in d.options for a in o["attachment_ids"])]}
     if attachments:
-        lines += ["", "Attachments:"] + [f"- {a.id} {a.filename}: {runner_path(a)}" + (" (for the user's review)" if a.id in for_user else "") for a in attachments]
+        lines += ["", "Attachments:"] + [
+            f"- {a.id} {a.filename}: " + (_purged(a) if a.purged_at else runner_path(a) + (" (for the user's review)" if a.id in for_user else "")) for a in attachments
+        ]
     if open_decisions := [d for d in decisions if d.status == DecisionStatus.OPEN]:
         lines += ["", "Waiting for the user's decision:"]
         for d in open_decisions:
@@ -659,9 +696,15 @@ def related_hint(label, hits: list) -> str:
     return "Possibly related in this project's history (search_history finds more): " + "; ".join(truncate(label(h), 120) for h in hits) + "."
 
 
-def continue_prompt(assignment: Assignment, ledger: str) -> str:
+def continue_prompt(assignment: Assignment, ledger: str, interrupted: bool = False) -> str:
+    why = (
+        "you ended your last turn for it to answer in between, and it is still open. Pick up where you stopped; your earlier "
+        "turn's last message was no report, so this turn's final message must cover the whole assignment"
+        if interrupted
+        else "what it waited for has ended (see the updates above)"
+    )
     return (
-        f'Go on with assignment #{assignment.id} "{truncate(assignment.title, 100)}": what it waited for has ended (see the updates above).\n'
+        f'Go on with assignment #{assignment.id} "{truncate(assignment.title, 100)}": {why}.\n'
         f"So far it took {ledger}.\n"
         "Finish it now. Your final message is the report. If you have to start another slow job for it, first put in "
         "everything that job should check, then end your turn: you continue when it ends."
@@ -782,7 +825,8 @@ def ask_prompt(from_agent: Agent, question: str) -> str:
 def ask_notice(from_agent: Agent, question: str) -> str:
     return (
         f"[PlainBoard] {from_agent.name} is waiting for your answer to: {truncate(question.strip(), 500)}\n"
-        "It is queued as your next turn, so answer it there. Finish your current step, then end your turn at the next safe point."
+        "It is queued as your next turn, so answer it there. Finish your current step, then end your turn at the next safe point. "
+        "An open assignment stays open: you go on with it in the turn after your answer."
     )
 
 
@@ -791,11 +835,22 @@ def chat_notice(text: str, files: int = 0) -> str:
     return (
         f"[PlainBoard] The user just wrote to you{attached}: {truncate(text.strip(), 2000) or '(no text)'}\n"
         "It is queued as your next turn, so answer it there. Take it into account from now on. Finish the step you "
-        "are in the middle of, then end your turn at the next safe point and continue any remaining work in that next turn."
+        "are in the middle of, then end your turn at the next safe point. An open assignment stays open: you go on with it "
+        "in the turn after your answer."
     )
 
 
 MESSAGE_CHARS = 6000
+
+
+def held_for_message(branches: list[str]) -> str:
+    """Right after a message to a member whose handed-over branches have not landed yet (#96)."""
+    named = ", ".join(branches)
+    one = len(branches) == 1
+    return (
+        f"PlainBoard holds your branch{'' if one else 'es'} {named} because of this message: {'it does' if one else 'they do'} not land until you hand "
+        f"{'it' if one else 'each'} over again with merge_when_green: after pushing what the message asks for, or unchanged to confirm it may land as it is."
+    )
 
 
 def message_update(from_agent: Agent, message: str) -> str:
@@ -812,12 +867,15 @@ def wake_prompt(is_manager: bool = True) -> str:
     )
 
 
-def wind_down_notice(reason: str = "", jobs_end: bool = False) -> str:
-    """``jobs_end``: everything is paused, and PlainBoard stops what still runs when the turn is over."""
+def wind_down_notice(reason: str = "", jobs_end: bool = False, jobs_keep: bool = False) -> str:
+    """``jobs_end``: everything is paused, and PlainBoard stops what still runs when the turn is over.
+    ``jobs_keep``: the jobs go on, their results wait for the agent's next turn."""
     why = f" Reason: {reason}" if reason else ""
     jobs = (
         "leave your background jobs alone: PlainBoard stops the ones still running when your turn ends and tells you which"
         if jobs_end
+        else "leave your background jobs running: their results wait for your next turn"
+        if jobs_keep
         else "stop background jobs you started unless they must finish"
     )
     return (
@@ -825,6 +883,21 @@ def wind_down_notice(reason: str = "", jobs_end: bool = False) -> str:
         f"safe point, save your work (commit and push it, or write down where it is) and {jobs}. "
         "Then end your turn with a short report: what is done, what is open and where it is saved."
     )
+
+
+LIMIT_PAUSE_REASON = "every subscription this project may use is nearly used up. Your open work goes on by itself when one has room again."
+
+
+def limit_paused(until: str) -> str:
+    """For the manager: the project paused by itself before its subscriptions ran out."""
+    when = f"around {until} UTC" if until else "as soon as one has room again"
+    return (
+        "PlainBoard paused this project by itself: every subscription it may use is nearly used up. No new turn starts "
+        f"(a chat with the user still does), running ones wrap up, open assignments stay open. It goes on by itself {when}."
+    )
+
+
+LIMIT_RESUMED = "A subscription of this project has room again: PlainBoard ended its pause, and open assignments go on by themselves."
 
 
 def jobs_stopped_for_pause(jobs: list[str]) -> str:
@@ -865,6 +938,20 @@ def review_line(tasks: list[Task]) -> str:
         return ""
     numbers = ", ".join(f"#{t.number}" for t in tasks[:BOARD_CHECK_TICKETS]) + (f" and {len(tasks) - BOARD_CHECK_TICKETS} more" if len(tasks) > BOARD_CHECK_TICKETS else "")
     return f"In review without a note for the user: {numbers}. Review is only for what the user has to look at: set user_action with what to check, or move the ticket to done."
+
+
+def stale_reviews(tasks: list[Task], now: datetime) -> str:
+    """For the manager: tickets that lay in review unchanged for the project's review_days."""
+    lines = [f"- #{t.number} {truncate(t.title, 80)}: unchanged for {duration((now - t.updated_at).total_seconds())}" for t in tasks]
+    return (
+        "In review and untouched for a while, nothing moves them to done by itself. Decide for each: move it to done, "
+        "ask the user (request_decision or user_action), or leave it:\n" + "\n".join(lines)
+    )
+
+
+def ideas_line(count: int) -> str:
+    """For the manager's turn: only how many ideas are open, never the ideas (list_ideas)."""
+    return f"Ideas: {count} open (list_ideas)." if count else ""
 
 
 def capacity_line(c) -> str:

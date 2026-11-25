@@ -2,15 +2,15 @@ import { useEffect, useSyncExternalStore } from "react";
 
 /** A design is a look: its type, corners, surfaces and how the parts are drawn. Fahrplan lives in
  * index.css, every other design is one stylesheet in src/designs. The first one listed is what a
- * browser gets that has not chosen: Classic, whose colour makes the parts easier to tell apart.
+ * browser gets that has not chosen: slop2gether, the look of the project's website.
  * Each design has a dark and a
  * light theme (a block of colour tokens); `color` is the browser's toolbar colour for it and
  * `accent` the colour of its strong element, for the preview in the picker.
  * To add a design: write its stylesheet, import it in main.tsx, list it here and name it in
  * i18n (`look.design.<id>`). */
 export const DESIGNS = [
-  { id: "classic", dark: { theme: "classic-dark", color: "#18181b", accent: "#5b54ea" }, light: { theme: "classic-light", color: "#ffffff", accent: "#4f46e5" } },
   { id: "slop2gether", dark: { theme: "slop2gether-dark", color: "#000000", accent: "#ff6d3d" }, light: { theme: "slop2gether-light", color: "#fbfbfd", accent: "#e8590c" } },
+  { id: "classic", dark: { theme: "classic-dark", color: "#18181b", accent: "#5b54ea" }, light: { theme: "classic-light", color: "#ffffff", accent: "#4f46e5" } },
   { id: "fahrplan", dark: { theme: "carbon", color: "#161614", accent: "#ecebe3" }, light: { theme: "stone", color: "#f1f0ea", accent: "#1b1a17" } },
 ] as const;
 export type DesignId = (typeof DESIGNS)[number]["id"];
@@ -32,7 +32,8 @@ const listeners = new Set<() => void>();
 const systemDark = () => window.matchMedia("(prefers-color-scheme: dark)");
 
 function storedDesign(): DesignId {
-  const value = localStorage.getItem(DESIGN_KEY);
+  // A page with a design of its own (a doc site: slop2gether) keeps it, whatever was picked in the app.
+  const value = document.documentElement.dataset.fixedDesign ?? localStorage.getItem(DESIGN_KEY);
   return DESIGNS.some((d) => d.id === value) ? (value as DesignId) : DESIGNS[0].id;
 }
 

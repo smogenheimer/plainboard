@@ -6,14 +6,14 @@ import { qk } from "../../api/queries";
 import type { ProviderAccount } from "../../api/types";
 import { Button, Input } from "../../components/ui";
 
-/** The sign-in of a subscription in the browser: ChatGPT with a device code (Codex), or Claude, whose page
- *  shows a code after signing in that is typed in here. A person's own is kept for this subscription only. */
+/** The sign-in of a subscription in the browser: ChatGPT with a device code (Codex), or Claude and Google (Gemini),
+ *  whose page shows a code after signing in that is typed in here. A person's own is kept for this subscription only. */
 export function SignIn({ accountId, provider }: { accountId: number; provider: string }) {
   const { t } = useTranslation();
   const qc = useQueryClient();
   const KEY = ["accountSignIn", accountId];
   const url = `/accounts/${accountId}/signin`;
-  const texts = provider === "codex" ? "codex" : provider === "antigravity" ? "antigravity" : "claude";
+  const texts = provider === "codex" ? "codex" : provider === "antigravity" ? "antigravity" : provider === "gemini_cli" ? "gemini" : "claude";
   const [busy, setBusy] = useState(false);
   const [code, setCode] = useState("");
   const [error, setError] = useState<string | null>(null);
@@ -51,7 +51,7 @@ export function SignIn({ accountId, provider }: { accountId: number; provider: s
 
   const data = account.data;
   const problem = error ?? data?.login_error ?? (account.error ? errorMessage(account.error) : null);
-  const openPageText = provider === "antigravity" ? "settings.antigravityPasteCode" : "settings.claudeOpenPage";
+  const openPageText = provider === "antigravity" ? "settings.antigravityPasteCode" : `settings.${texts}OpenPage`;
   const codePlaceholder = provider === "antigravity" ? "settings.antigravityCodePlaceholder" : "settings.claudeCode";
   const sendCodeText = provider === "antigravity" ? "settings.antigravitySubmitCode" : "settings.claudeSendCode";
   return (

@@ -7,6 +7,7 @@ import { qk, useOwnNotes } from "../../api/queries";
 import type { Agent, OwnNote } from "../../api/types";
 import { Button, EmptyState, Modal, Spinner, Textarea } from "../../components/ui";
 import { timeAgo } from "../../lib/format";
+import { useDraft } from "../../lib/drafts";
 import { useShell } from "../layout/shell-context";
 
 const MAX_NOTE = 500;
@@ -26,7 +27,7 @@ export function OwnNotesDialog({ agent, onClose }: { agent: Agent; onClose: () =
   const { canWrite } = useShell();
   const notes = useOwnNotes(agent.id);
   const refresh = useRefresh(agent.id);
-  const [text, setText] = useState("");
+  const [text, setText] = useDraft(`own-note:${agent.id}`);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const items = notes.data ?? [];

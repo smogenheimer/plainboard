@@ -22,24 +22,24 @@ const fromLines = (text: string) =>
       .map((line) => [line.slice(0, line.indexOf("=")).trim(), line.slice(line.indexOf("=") + 1).trim()]),
   );
 
-export function ToolsView() {
+/** `embedded`: as a section of the project settings, without a page head of its own. */
+export function ToolsView({ embedded }: { embedded?: boolean } = {}) {
   const { t } = useTranslation();
   const { project, agentById, isOwner } = useShell();
   const servers = useMcpServers(project.id);
   const [editing, setEditing] = useState<McpServer | "new" | null>(null);
 
+  const add = isOwner && (
+    <Button variant="primary" icon={<Plus className="size-4" />} onClick={() => setEditing("new")}>
+      {t("tools.add")}
+    </Button>
+  );
   return (
-    <div className="flex h-full flex-col">
-      <PageHead title={t("tools.title")}>
-        {isOwner && (
-          <Button variant="primary" icon={<Plus className="size-4" />} onClick={() => setEditing("new")}>
-            {t("tools.add")}
-          </Button>
-        )}
-      </PageHead>
-      <div className="scroll-thin min-h-0 flex-1 overflow-y-auto">
-      <div className="max-w-5xl px-4 pt-3 pb-6">
-        <p className="mb-4 text-fg-2">{t("tools.subtitle")}</p>
+    <div className={embedded ? "space-y-4" : "flex h-full flex-col"}>
+      {embedded ? add : <PageHead title={t("tools.title")}>{add}</PageHead>}
+      <div className={embedded ? "" : "scroll-thin min-h-0 flex-1 overflow-y-auto"}>
+      <div className={embedded ? "" : "max-w-5xl px-4 pt-3 pb-6"}>
+        {!embedded && <p className="mb-4 text-fg-2">{t("tools.subtitle")}</p>}
         {servers.data?.length === 0 ? (
           <EmptyState icon={<Plug className="size-10" />} title={t("tools.empty")}>
             {t("tools.emptyHint")}
@@ -57,7 +57,7 @@ export function ToolsView() {
                       {s.project_id === null && <Badge tone="sky">{t("tools.global")}</Badge>}
                       {!s.enabled && <Badge tone="red">{t("tools.disabled")}</Badge>}
                     </div>
-                    <div className="truncate font-mono text-fg-3">{s.transport === "stdio" ? [s.command, ...s.args].join("") : s.url}</div>
+                    <div className="truncate font-mono text-fg-3">{s.transport === "stdio" ? [s.command, ...s.args].join(" ") : s.url}</div>
                   </div>
                   <div className="hidden text-fg-3 sm:block">
                     {s.all_agents ? t("tools.allAgents") : s.agent_ids.map((id) => agentById(id)?.name ?? id).join(", ") || t("tools.noAgents")}

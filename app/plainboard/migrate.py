@@ -119,8 +119,9 @@ def _first_rows(engine) -> None:
 
     claude = "api_key" if os.environ.get("ANTHROPIC_API_KEY") else "oauth_token" if os.environ.get("CLAUDE_CODE_OAUTH_TOKEN") else "runner_login"
     with Session(engine) as session:
-        session.add(Account(provider="claude_code", label="Claude", key="claude", auth_mode=claude, enabled=True))
-        session.add(Account(provider="codex", label="Codex", key="default", auth_mode="chatgpt", enabled=True))
+        # A sign-in in the runner's home is taken over from there (accounts.take_over), as the migrations do (0078).
+        session.add(Account(provider="claude_code", label="Claude", key="claude", auth_mode=claude, enabled=True, home_login=claude == "runner_login"))
+        session.add(Account(provider="codex", label="Codex", key="default", auth_mode="chatgpt", enabled=True, home_login=True))
         session.commit()
 
 

@@ -75,6 +75,8 @@ def _populate(sqlite_file) -> None:
                         row[column.name] = start + n * 10  # gaps: the sequence continues after the largest
                     elif n == 3 and column.nullable and not column.primary_key:
                         row[column.name] = JSON.NULL if isinstance(column.type, JSON) and column.name.endswith("s") else None
+                    elif any(fk.column.table is table for fk in column.foreign_keys):
+                        row[column.name] = start + (3 - n) * 10  # its own table: the first row points at a later one
                     else:
                         row[column.name] = _value(table, column, n, ids)
                 conn.execute(table.insert(), row)

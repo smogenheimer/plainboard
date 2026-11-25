@@ -17,6 +17,7 @@ SQLite as before and says why (`plainboard.db.move-failed`).
 
 from __future__ import annotations
 
+import json
 import logging
 import sqlite3
 import time
@@ -28,9 +29,10 @@ from alembic import command
 from alembic.config import Config as AlembicConfig
 from alembic.runtime.migration import MigrationContext
 from alembic.script import ScriptDirectory
-from sqlalchemy import JSON, Integer, String, Table, Text, bindparam, cast, create_engine, func, insert, inspect, select, text
+from sqlalchemy import JSON, Integer, String, Table, Text, bindparam, cast, create_engine, func, insert, inspect, select, text, update
 from sqlalchemy.engine import Connection
 
+from .db import without_nul
 from .models import Base
 
 log = logging.getLogger("plainboard.db_move")
@@ -166,6 +168,8 @@ def _writing(table: Table):
 def _value(column, value: Any) -> Any:
     if value is None:
         return None
+    if isinstance(column.type, JSON) and "\\u0000" in value:
+        return json.dumps(without_nul(json.loads(value)))  # PostgreSQL stores it, but every ->/->> on the row fails then (#120)
     if isinstance(column.type, String):
         # SQLite keeps what it was given (a number in a text column); PostgreSQL text takes no NUL character.
         return (value if isinstance(value, str) else str(value)).replace("\x00", "")
@@ -192,10 +196,27 @@ def _copy(src: Connection, dst: Connection) -> dict[str, int]:
     counts: dict[str, int] = {}
     for table in tables:
         write, columns, copied = _writing(table), list(table.columns), 0
+        # a row may point at a later row of its own table (an idea merged into a newer one): written empty first,
+        # set once every row is there
+        own = {c.name for c in columns if any(fk.column.table is table for fk in c.foreign_keys)}
+        kept = own | {c.name for c in columns if c.onupdate is not None}  # updated_at stays as it was
+        later: list[dict] = []
         try:
             for chunk in src.execution_options(yield_per=BATCH).execute(reading(table)).partitions():
-                dst.execute(write, [{f"p_{c.name}": _value(c, row[i]) for i, c in enumerate(columns)} for row in chunk])
+                rows = [{f"p_{c.name}": _value(c, row[i]) for i, c in enumerate(columns)} for row in chunk]
+                for row in rows:
+                    if any(row[f"p_{name}"] is not None for name in own):
+                        later.append({k: row[k] for k in row if k[2:] in kept or table.c[k[2:]].primary_key})
+                        row.update({f"p_{name}": None for name in own})
+                dst.execute(write, rows)
                 copied += len(chunk)
+            if later:
+                dst.execute(
+                    update(table)
+                    .where(*(c == bindparam(f"p_{c.name}", type_=c.type) for c in table.primary_key.columns))
+                    .values({name: bindparam(f"p_{name}", type_=table.c[name].type) for name in kept}),
+                    later,
+                )
         except Exception as exc:
             reason = str(getattr(exc, "orig", None) or exc).strip()  # the database's words, not the rows sent
             raise MoveError(f"table {table.name}: {reason}") from exc

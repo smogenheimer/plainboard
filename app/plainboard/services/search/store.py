@@ -12,7 +12,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from ...models import SearchDocument, SearchVector
 from .documents import Doc, prepare
 
-LINKS = ("task_id", "assignment_id", "decision_id", "comment_id", "note_id", "repository_id")  # SearchDocument's sources
+LINKS = ("task_id", "assignment_id", "decision_id", "comment_id", "note_id", "repository_id", "doc_page_id", "attachment_id")  # SearchDocument's sources
 
 # Reciprocal rank fusion: a hit's score is the sum of 1 / (K + its rank) in each list. K = 60 is the usual
 # value: the top places count, but a hit that both lists rank fairly high beats one that only one ranks first.
@@ -72,10 +72,16 @@ def _without(model: str):
     return ~exists().where(SearchVector.document_id == SearchDocument.id, SearchVector.model == model)
 
 
-async def pending(s: AsyncSession, model: str, project_ids: list[int], limit: int) -> list[tuple[int, int, str, str]]:
-    """Chunks without a vector of this model, the newest first: they are the likeliest to be searched for."""
+async def pending(s: AsyncSession, model: str, project_ids: list[int], limit: int, *, kind: str | None = None, source_ids: list[str] | None = None) -> list[tuple[int, int, str, str]]:
+    """Chunks without a vector of this model, the newest first: they are the likeliest to be searched for
+    (``kind``/``source_ids``: only of these items)."""
     query = select(SearchDocument.id, SearchDocument.project_id, SearchDocument.header, SearchDocument.body, SearchDocument.content_hash)
-    query = query.where(SearchDocument.project_id.in_(project_ids), _without(model)).order_by(SearchDocument.changed_at.desc()).limit(limit)
+    query = query.where(SearchDocument.project_id.in_(project_ids), _without(model))
+    if kind is not None:
+        query = query.where(SearchDocument.kind == kind)
+    if source_ids is not None:
+        query = query.where(SearchDocument.source_id.in_(source_ids))
+    query = query.order_by(SearchDocument.changed_at.desc()).limit(limit)
     return [(r.id, r.project_id, f"{r.header}\n{r.body}", r.content_hash) for r in await s.execute(query)]
 
 
@@ -148,7 +154,7 @@ class Hit:
     word_rank: int | None = None
 
 
-def _vector(vector: list[float]) -> str:
+def vector_literal(vector: list[float]) -> str:
     return "[" + ",".join(f"{x:.6g}" for x in vector) + "]"
 
 
@@ -173,6 +179,7 @@ async def search(
     since: datetime | None = None,
     until: datetime | None = None,
     repo: str | None = None,
+    source_ids: list[str] | None = None,
     limit: int = 8,
 ) -> list[Hit]:
     """Hybrid: the nearest chunks by meaning (cosine, exact within the project) and the best by words
@@ -199,9 +206,12 @@ async def search(
     if repo:
         where.append("d.repo = :repo")
         params["repo"] = repo
+    if source_ids is not None:
+        where.append("d.source_id = ANY(:sources)")
+        params["sources"] = list(source_ids)
     scope = " AND ".join(where)
     if vector is not None:
-        params["vector"] = _vector(vector)
+        params["vector"] = vector_literal(vector)
         by_meaning = f"""SELECT d.id, row_number() OVER (ORDER BY v.embedding <=> CAST(:vector AS vector)) AS r, 1 - (v.embedding <=> CAST(:vector AS vector)) AS sim
             FROM search_documents d JOIN search_vectors v ON v.document_id = d.id AND v.model = :model WHERE {scope}
             ORDER BY v.embedding <=> CAST(:vector AS vector) LIMIT :n"""
@@ -231,7 +241,7 @@ async def search(
 
 async def nearest(s: AsyncSession, project_id: int, vector: list[float], model: str, *, exclude_ticket: int | None, limit: int) -> list[Hit]:
     """By meaning only, for the hint at the start of an assignment."""
-    params = {"project": project_id, "model": model, "vector": _vector(vector), "limit": limit * 3, "ticket": exclude_ticket or -1}
+    params = {"project": project_id, "model": model, "vector": vector_literal(vector), "limit": limit * 3, "ticket": exclude_ticket or -1}
     sql = f"""SELECT {_HIT}, 1 - (v.embedding <=> CAST(:vector AS vector)) AS sim
         FROM search_documents d JOIN search_vectors v ON v.document_id = d.id AND v.model = :model
         WHERE d.project_id = :project AND (d.ticket_number IS NULL OR d.ticket_number <> :ticket)
@@ -242,5 +252,21 @@ async def nearest(s: AsyncSession, project_id: int, vector: list[float], model: 
         if key in seen:
             continue
         seen.add(key)
+        hits.append(_hit(row, float(row.sim)))
+    return hits[:limit]
+
+
+async def nearest_of_kind(s: AsyncSession, project_id: int, vector: list[float], model: str, kind: str, limit: int) -> list[Hit]:
+    """By meaning only, among one kind (the doc pages a landed change may concern): one hit per item, its best chunk."""
+    params = {"project": project_id, "model": model, "vector": vector_literal(vector), "limit": limit * 4, "kind": kind}
+    sql = f"""SELECT {_HIT}, 1 - (v.embedding <=> CAST(:vector AS vector)) AS sim
+        FROM search_documents d JOIN search_vectors v ON v.document_id = d.id AND v.model = :model
+        WHERE d.project_id = :project AND d.kind = :kind
+        ORDER BY v.embedding <=> CAST(:vector AS vector) LIMIT :limit"""
+    hits, seen = [], set()
+    for row in await s.execute(text(sql), params):
+        if row.source_id in seen:
+            continue
+        seen.add(row.source_id)
         hits.append(_hit(row, float(row.sim)))
     return hits[:limit]

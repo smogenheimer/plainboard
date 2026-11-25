@@ -1,4 +1,4 @@
-"""Semantic search over a project's history (tickets, reports, decisions, comments, notes, commits).
+"""Semantic search over a project's history (tickets, reports, decisions, comments, notes, commits, text files of tickets) and its open ideas.
 
 Only with PostgreSQL and pgvector (``schema``), and while the setting ``semantic_search`` and the
 project's own switch are on. ``indexers`` read the sources, ``documents`` prepares their texts, the
@@ -21,16 +21,16 @@ from plainboard_protocol import GitPresentSpec
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
-from ...models import Decision, Project, Repository, SearchCursor, Task, utcnow
+from ...models import Attachment, Decision, Project, Repository, SearchCursor, Task, utcnow
 from .. import flow_log
 from .. import settings as settings_service
 from ..errors import ServiceError
 from . import embedding, store
-from .indexers import COMMIT, INDEXERS, KINDS
+from .indexers import COMMIT, FILE, INDEXERS, KINDS
 from .schema import available
 from .store import Hit
 
-__all__ = ["KINDS", "PROGRESS", "Hit", "active_projects", "available", "choose_model", "embedder", "enabled", "find", "format_hits", "related", "states", "status"]
+__all__ = ["KINDS", "PROGRESS", "Hit", "active_projects", "available", "choose_model", "embedder", "enabled", "find", "for_user", "format_hits", "related", "states", "status"]
 
 log = logging.getLogger(__name__)
 
@@ -172,6 +172,71 @@ async def related(s: AsyncSession, project: Project, text: str, ticket_number: i
     return shown
 
 
+def _commit_url(repo_url: str, sha: str) -> str | None:
+    """The commit's page on GitHub or GitLab; other hosts get no link."""
+    url = repo_url.strip().removesuffix("/").removesuffix(".git")
+    if url.startswith("git@"):  # git@github.com:owner/name
+        url = "https://" + url[4:].replace(":", "/", 1)
+    if url.startswith("https://github.com/"):
+        return f"{url}/commit/{sha}"
+    if url.startswith("https://gitlab.com/"):
+        return f"{url}/-/commit/{sha}"
+    return None
+
+
+CLOSEST_WINDOW = 10  # where a filter looks for the drop in similarity
+
+
+def closest(hits: list[Hit]) -> list[Hit]:
+    """For a filter (the board's, #133): what matches by words, and by meaning only what stands out, the nearest
+    down to the largest drop in similarity among the first few. Search by meaning always has a nearest, even for
+    nonsense, and a model's scale is its own: no fixed threshold."""
+    sims = sorted((h.similarity for h in hits if h.similarity is not None), reverse=True)[:CLOSEST_WINDOW]
+    if len(sims) < 2:
+        return hits
+    drop = max(range(len(sims) - 1), key=lambda i: sims[i] - sims[i + 1])
+    return [h for h in hits if h.word_rank is not None or (h.similarity is not None and h.similarity >= sims[drop])]
+
+
+async def for_user(s: AsyncSession, project: Project, query: str, limit: int = 8, kinds: list[str] | None = None, only_close: bool = False) -> dict:
+    """A person's search in the web UI (the command palette; the board's filter with ``kinds`` and ``only_close``): the state of search and the hits, each with what
+    opens it (its ticket's id, a note's id, a commit's page). Off or not there: no hits and why, never an error."""
+    if not await available(s):
+        return {"state": "unavailable", "hits": []}
+    if not await enabled(s, project):
+        return {"state": "off", "hits": []}
+    ready = (await embedder(s)).state == "ready"
+    hits = await find(s, project, query, kinds=kinds or None, limit=limit)
+    if only_close:
+        hits = closest(hits)
+    numbers = {h.ticket_number for h in hits if h.ticket_number}
+    ids = dict((await s.execute(select(Task.number, Task.id).where(Task.project_id == project.id, Task.number.in_(numbers)))).all()) if numbers else {}
+    repos = {r.id: r for r in await s.scalars(select(Repository).where(Repository.project_id == project.id))} if any(h.kind == COMMIT for h in hits) else {}
+    out = []
+    for h in hits:
+        item = {
+            "kind": h.kind, "ref": h.ref, "title": h.title, "snippet": snippet(h.body, query, 160), "at": h.at, "changed_at": h.changed_at,
+            "ticket_number": h.ticket_number, "task_id": ids.get(h.ticket_number) if h.ticket_number else None, "repo": h.repo,
+        }  # fmt: skip
+        if h.kind == "note" and h.source_id.isdigit():
+            item["note_id"] = int(h.source_id)
+        if h.kind == "idea" and h.source_id.isdigit():
+            item["idea_id"] = int(h.source_id)
+        if h.kind == "doc" and h.source_id.isdigit():
+            item["doc_page_id"] = int(h.source_id)
+        if h.kind == FILE and h.source_id.isdigit():
+            item |= {"attachment_id": int(h.source_id), "filename": h.ref}
+            if h.ticket_number is None:
+                idea_id = await s.scalar(select(Attachment.idea_id).where(Attachment.id == int(h.source_id), Attachment.project_id == project.id))
+                item["idea_id"] = idea_id
+        if h.kind == COMMIT:
+            repo_id, _, sha = h.source_id.partition(":")
+            repo = repos.get(int(repo_id)) if repo_id.isdigit() else None
+            item |= {"sha": sha, "url": _commit_url(repo.url, sha) if repo else None}
+        out.append(item)
+    return {"state": "ok" if ready else "preparing", "hits": out}
+
+
 # --- where a hit's item stands now ---------------------------------------------------------------------
 
 
@@ -283,7 +348,9 @@ def snippet(body: str, query: str, size: int = 240) -> str:
 def label(hit: Hit, now: datetime | None = None, state: str = "") -> str:
     """A hit in one line: its reference and kind, when it was made and last changed (with its age), where it stands now, its title."""
     now = now or utcnow()
-    where = f" on #{hit.ticket_number}" if hit.ticket_number and hit.kind == "report" else ""
+    where = f" on #{hit.ticket_number}" if hit.ticket_number and hit.kind in ("report", FILE) else ""
+    if hit.kind == FILE and hit.paths:  # the file to read
+        where += f" ({hit.paths[0]})"
     repo = f" in {hit.repo}" if hit.repo else ""
     kind = "" if hit.kind in ("decision", "comment") else f" {hit.kind}"  # their reference names it
     when = f"{hit.at:%Y-%m-%d} ({ago(hit.at, now)})"

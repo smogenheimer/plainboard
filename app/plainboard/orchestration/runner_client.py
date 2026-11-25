@@ -8,7 +8,7 @@ import time
 from collections.abc import AsyncIterator
 
 import httpx
-from plainboard_protocol import GitLogResult, GitLogSpec, GitPresentResult, GitPresentSpec, ProjectFiles, TidyResult, TidySpec, CandidatesSpec, CheckResult, CleanupCandidate, CleanupResult, CleanupSpec, CompletionResult, CompletionSpec, Credentials, DeleteSpec, JobPort, JobSpec, JobState, JobTiming, LimitsEvent, MachineUsage, ProviderAccount, ProviderInfo, SignInAck, SignInFiles, PullRequestCheck, PullRequestState, RepoSpec, RunEvent, RunSpec, SkillFetch, TrainCheckSpec, TrainLandSpec, TrainResult, TrainSpec, TrimSpec, UnpushedSpec, UnpushedWork, UpstreamState, parse_event
+from plainboard_protocol import GitLogResult, GitLogSpec, GitPresentResult, GitPresentSpec, PromotePlan, PromotePushSpec, PromoteResult, PromoteSpec, ProjectFiles, TidyResult, TidySpec, CandidatesSpec, CheckResult, CleanupCandidate, CleanupResult, CleanupSpec, CompletionResult, CompletionSpec, Credentials, DeleteSpec, JobPort, JobSpec, JobState, JobTiming, LimitsEvent, MachineUsage, ProviderAccount, ProviderInfo, SignInAck, SignInFiles, SignInRefresh, PullRequestCheck, PullRequestState, RepoSpec, RunEvent, RunSpec, SkillFetch, TrainCheckSpec, TrainLandSpec, TrainResult, TrainSpec, TrimSpec, UnpushedSpec, UnpushedWork, UpstreamState, parse_event
 
 from ..services.errors import ServiceError
 
@@ -249,6 +249,32 @@ class RunnerClient:
             return []
         return [SignInFiles.model_validate(entry) for entry in self._answer(resp)]
 
+    async def take_over(self, provider: str, key: str) -> SignInFiles:
+        """The installation's sign-in of account ``key`` from the runner's home, which it no longer uses then."""
+        try:
+            resp = await self._client.post(f"/providers/{provider}/takeover", params={"key": key}, timeout=30)
+        except httpx.HTTPError as exc:
+            raise RunnerError(unreachable(exc)) from exc
+        return SignInFiles.model_validate(self._answer(resp))
+
+    async def refresh_sign_in(self, provider: str, credentials: Credentials) -> None:
+        """A kept sign-in refreshed ahead of time if it is due soon; what changed comes with ``sign_ins``."""
+        try:
+            resp = await self._client.post("/signins/refresh", json=SignInRefresh(provider=provider, credentials=credentials).model_dump(), timeout=90)
+        except httpx.HTTPError as exc:
+            raise RunnerError(unreachable(exc)) from exc
+        if resp.status_code >= 400:
+            raise RunnerError(resp.text[:300])
+
+    async def update_sign_ins(self, entries: list[SignInFiles]) -> None:
+        """What another runner refreshed, for the accounts in use here."""
+        try:
+            resp = await self._client.post("/signins/update", json=[e.model_dump() for e in entries], timeout=20)
+        except httpx.HTTPError as exc:
+            raise RunnerError(unreachable(exc)) from exc
+        if resp.status_code >= 400 and resp.status_code != 404:
+            raise RunnerError(resp.text[:300])
+
     async def ack_sign_ins(self, acks: list[SignInAck]) -> None:
         try:
             resp = await self._client.post("/signins/ack", json=[a.model_dump() for a in acks], timeout=20)
@@ -337,6 +363,10 @@ class RunnerClient:
     async def missing_uploads(self, names: list[str]) -> list[str]:
         """Which of these attachment files an external runner does not have (yet)."""
         return [str(n) for n in (await self._post_job("/uploads/missing", names)).json()]
+
+    async def delete_uploads(self, names: list[str]) -> int:
+        """Remove these attachment files from an external runner's copies (their retention ended). How many it had."""
+        return int((await self._post_job("/uploads/delete", names)).json())
 
     async def put_upload(self, name: str, content: bytes) -> None:
         try:
@@ -503,14 +533,28 @@ class RunnerClient:
         except (httpx.HTTPError, ValueError) as exc:
             return CheckResult(ok=False, detail=unreachable(exc))
 
+    async def promotion_plan(self, spec: PromoteSpec) -> PromotePlan:
+        """What would go from the base branch to the release branch; with ``checkout``, prepared for its check."""
+        return PromotePlan.model_validate((await self._github("/promotions/plan", spec.model_dump(mode="json"), 600)).json())
+
+    async def promotion_push(self, spec: PromotePushSpec) -> PromoteResult:
+        """A checked commit of the base branch to the release branch (or a pull request, if the push is refused)."""
+        try:
+            resp = await self._client.post("/promotions/push", json=spec.model_dump(mode="json"), timeout=600)
+            resp.raise_for_status()
+            return PromoteResult.model_validate(resp.json())
+        except (httpx.HTTPError, ValueError) as exc:
+            return PromoteResult(ok=False, detail=unreachable(exc))
+
     async def branch_head(self, credentials: Credentials, remote: RepoSpec, branch: str) -> str | None:
         """The commit a branch points to on its remote; None if the branch is not there."""
         body = {"credentials": credentials.model_dump(mode="json"), "remote": remote.model_dump(mode="json"), "branch": branch}
         return (await self._github("/git/branch", body, 150)).json().get("sha")
 
-    async def upstream(self, credentials: Credentials, repository: str, branch: str, commit: str) -> UpstreamState | None:
-        """How far ``commit`` is behind PlainBoard's own upstream branch; None if GitHub does not know it there."""
-        body = {"credentials": credentials.model_dump(mode="json"), "repository": repository, "branch": branch, "commit": commit}
+    async def upstream(self, credentials: Credentials, repository: str, branch: str, commit: str, version: str = "") -> UpstreamState | None:
+        """How far ``commit`` is behind PlainBoard's own upstream branch, or the release ``version`` behind
+        newer releases; None if GitHub does not know it there."""
+        body = {"credentials": credentials.model_dump(mode="json"), "repository": repository, "branch": branch, "commit": commit, "version": version}
         data = (await self._github("/github/upstream", body, 60)).json()
         return UpstreamState.model_validate(data) if data else None
 

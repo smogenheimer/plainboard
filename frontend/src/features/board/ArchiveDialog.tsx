@@ -1,10 +1,11 @@
 import { Search } from "lucide-react";
-import { useMemo, useState } from "react";
+import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useArchivedTasks } from "../../api/queries";
 import { ErrorText, Input, Modal, Spinner } from "../../components/ui";
 import { timeAgo } from "../../lib/format";
 import { useShell } from "../layout/shell-context";
+import { useTicketFilter } from "./ticketFilter";
 
 const SHOWN = 200;
 
@@ -15,12 +16,7 @@ export function ArchiveDialog({ onClose }: { onClose: () => void }) {
   const tasks = useArchivedTasks(project.id);
   const [filter, setFilter] = useState("");
 
-  const matches = useMemo(() => {
-    const needle = filter.trim().toLowerCase();
-    return (tasks.data ?? []).filter(
-      (task) => !needle || task.title.toLowerCase().includes(needle) || `#${task.number}` === needle || task.labels.some((l) => l.toLowerCase().includes(needle)),
-    );
-  }, [tasks.data, filter]);
+  const { matches } = useTicketFilter(project.id, filter, tasks.data);
 
   return (
     <Modal open onClose={onClose} title={t("archive.title")}>

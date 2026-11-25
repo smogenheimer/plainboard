@@ -116,7 +116,10 @@ def _port_without_referer(request: Request) -> int | None:
         if parts.netloc != headers.get("host") or parts.path not in ("", "/"):
             return None
     path = request.url.path
-    if headers.get("sec-fetch-site") != "same-origin" or headers.get("sec-fetch-dest") in (None, "document") or path == "/" or path.startswith("/api/"):
+    # A page is opened (mode navigate), also when PlainBoard's service worker fetches it again (destination "empty").
+    if headers.get("sec-fetch-site") != "same-origin" or headers.get("sec-fetch-dest") in (None, "document") or headers.get("sec-fetch-mode") == "navigate":
+        return None
+    if path == "/" or path.startswith("/api/"):
         return None
     static_dir = get_config().static_dir.resolve()
     candidate = (static_dir / path.lstrip("/")).resolve()

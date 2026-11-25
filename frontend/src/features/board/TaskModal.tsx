@@ -1,24 +1,24 @@
 import { useQueryClient } from "@tanstack/react-query";
-import clsx from "clsx";
-import { Archive, ArchiveRestore, Bot, Check, ChevronDown, ChevronRight, CircleDashed, FileText, Play, Send, Trash2, Upload, UserRound, X } from "lucide-react";
-import { useEffect, useRef, useState, type ClipboardEvent, type DragEvent, type ReactNode } from "react";
+import { Archive, ArchiveRestore, Bot, Check, ChevronDown, ChevronRight, CircleDashed, Play, Send, Trash2, UserRound, X } from "lucide-react";
+import { useEffect, useRef, useState, type ClipboardEvent, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { api, errorMessage } from "../../api/client";
 import { qk, useTask } from "../../api/queries";
 import type { Assignment, Attachment, Comment, Priority, TaskDetail, TaskStatus } from "../../api/types";
-import { AttachmentLink } from "../../components/AttachmentLink";
+import { AttachmentGrid } from "../../components/AttachmentGrid";
 import { Lightbox } from "../../components/Lightbox";
-import { VideoThumb } from "../../components/VideoThumb";
 import { isVideoFile } from "../../lib/media";
 import { Markdown, TicketText } from "../../components/Markdown";
 import { useMentionPicker, useReadMentionsOf } from "../../components/Mentions";
 import { AgentSquare, AgentDot, Badge, Button, ErrorText, IconButton, Input, Modal, Segmented, Select, Spinner, Textarea } from "../../components/ui";
-import { chatTime, formatBytes, formatDateTime, timeAgo } from "../../lib/format";
+import { formatDateTime, timeAgo } from "../../lib/format";
+import { useDraft } from "../../lib/drafts";
 import { useShell } from "../layout/shell-context";
 import { STATUSES } from "./Board";
 import { Decisions, isMedia, reviewAttachmentIds } from "./Decisions";
 import { FlowTicket } from "../flow/Integrations";
 import { Label } from "./TaskCard";
+import { languageName } from "../projects/CustomerLanguages";
 
 const PRIORITIES: Priority[] = ["low", "medium", "high", "urgent"];
 
@@ -53,6 +53,15 @@ export function TaskModal({ taskId, onClose }: { taskId: number; onClose: () => 
     }
   };
 
+  const removeAttachment = async (a: Attachment) => {
+    try {
+      await api.del(`/attachments/${a.id}`);
+      qc.invalidateQueries({ queryKey: qk.task(taskId) });
+    } catch (err) {
+      setError(err);
+    }
+  };
+
   const onPaste = (e: ClipboardEvent) => {
     const files = Array.from(e.clipboardData.files);
     if (files.length) {
@@ -69,7 +78,7 @@ export function TaskModal({ taskId, onClose }: { taskId: number; onClose: () => 
     );
   }
   const data = task.data;
-  const images = data.attachments.filter(isMedia);
+  const images = data.attachments.filter((a) => isMedia(a) && !a.purged_at);
 
   const handToManager = async () => {
     setError(null);
@@ -118,9 +127,16 @@ export function TaskModal({ taskId, onClose }: { taskId: number; onClose: () => 
       <div className="grid gap-6 md:grid-cols-[1fr_220px]" onPaste={canWrite ? onPaste : undefined}>
         <div className="min-w-0 space-y-6">
           <FlowTicket taskId={taskId} />
-          <DescriptionEditor value={data.description} onSave={(description) => patch({ description })} canWrite={canWrite} />
+          <DescriptionEditor draftKey={`description:${taskId}`} value={data.description} onSave={(description) => patch({ description })} canWrite={canWrite} />
           <CustomerTexts task={data} languages={project.customer_languages?.length ? project.customer_languages : ["en"]} onSave={patch} canWrite={canWrite} />
-          <Attachments attachments={data.attachments} reviewIds={reviewAttachmentIds(data.decisions)} onUpload={upload} onView={setViewing} canWrite={canWrite} />
+          <AttachmentGrid
+            attachments={data.attachments}
+            reviewIds={reviewAttachmentIds(data.decisions)}
+            onUpload={upload}
+            onView={setViewing}
+            onRemove={removeAttachment}
+            canWrite={canWrite}
+          />
           {data.state && (
             <section>
               <SectionTitle right={data.state_updated_at && <span className="text-fg-3">{timeAgo(data.state_updated_at)}</span>}>{t("ticket.state")}</SectionTitle>
@@ -200,7 +216,7 @@ function UserAction({ taskId, action }: { taskId: number; action: string }) {
   const { t } = useTranslation();
   const { project } = useShell();
   const qc = useQueryClient();
-  const [note, setNote] = useState("");
+  const [note, setNote, clearNote] = useDraft(`user-action:${taskId}`);
   const [error, setError] = useState<unknown>(null);
 
   const [busy, setBusy] = useState(false);
@@ -211,6 +227,7 @@ function UserAction({ taskId, action }: { taskId: number; action: string }) {
     setBusy(true);
     try {
       await api.post(`/tasks/${taskId}/user-action/done`, { note });
+      clearNote();
       // The ticket no longer waits: shown at once, not after the ticket has been loaded again.
       qc.setQueryData<TaskDetail>(qk.task(taskId), (old) => (old ? { ...old, user_action: "" } : old));
       qc.invalidateQueries({ queryKey: qk.task(taskId) });
@@ -277,7 +294,8 @@ type CustomerBody = { customer_title?: string; customer_description?: string; cu
 /** The ticket's public texts, one tab per customer language of the project (the default first). With one
  * language there are no tabs. Tabs without a title are marked: customers get the default language there. */
 function CustomerTexts({ task, languages, onSave, canWrite }: { task: TaskDetail; languages: string[]; onSave: (body: CustomerBody) => void; canWrite: boolean }) {
-  const { t } = useTranslation();
+  const { t, i18n } = useTranslation();
+  const name = (code: string) => languageName(code, i18n.language);
   const [lang, setLang] = useState(languages[0]);
   const active = languages.includes(lang) ? lang : languages[0];
   const textsOf = (code: string) => (code === languages[0] ? { title: task.customer_title, description: task.customer_description } : { title: task.customer_texts?.[code]?.title ?? "", description: task.customer_texts?.[code]?.description ?? "" });
@@ -285,11 +303,29 @@ function CustomerTexts({ task, languages, onSave, canWrite }: { task: TaskDetail
   const save = (field: "title" | "description", value: string) =>
     onSave(active === languages[0] ? { [`customer_${field}`]: value } : { customer_texts: { [active]: { [field]: value } } });
   const { title, description } = textsOf(active);
-  if (!canWrite && !languages.some((code) => textsOf(code).title || textsOf(code).description)) return null;
+  const written = languages.some((code) => textsOf(code).title || textsOf(code).description);
+  const [expanded, setExpanded] = useState(written);
+  const open = expanded || written;
+  if (!canWrite && !written) return null;
   return (
     <section className="space-y-2" data-part="customer-texts">
-      <SectionTitle>{t("ticket.customerSection")}</SectionTitle>
-      {languages.length > 1 && (
+      <SectionTitle
+        right={
+          (languages.length === 1 || !open) && (
+            <span className="flex min-w-0 flex-wrap justify-end gap-1">
+              {languages.map((code) => (
+                <Badge key={code}>{name(code)}</Badge>
+              ))}
+            </span>
+          )
+        }
+      >
+        <button type="button" aria-expanded={open} disabled={written} onClick={() => setExpanded(!expanded)} className="caps inline-flex items-center gap-1 text-fg-2 hover:text-fg disabled:hover:text-fg-2">
+          {!written && (open ? <ChevronDown className="size-3.5 text-fg-3" /> : <ChevronRight className="size-3.5 text-fg-3" />)}
+          {t("ticket.customerSection")}
+        </button>
+      </SectionTitle>
+      {open && languages.length > 1 && (
         <div className="scroll-thin -mx-1 overflow-x-auto px-1">
           <Segmented
             aria-label={t("ticket.customerLanguage")}
@@ -298,8 +334,9 @@ function CustomerTexts({ task, languages, onSave, canWrite }: { task: TaskDetail
             options={languages.map((code) => ({
               value: code,
               label: (
-                <span className="inline-flex items-center gap-1" title={missing.includes(code) ? t("ticket.customerMissingTab") : undefined}>
-                  {code.toUpperCase()}
+                <span className="inline-flex items-center gap-1 whitespace-nowrap" title={missing.includes(code) ? t("ticket.customerMissingTab") : undefined}>
+                  {name(code)}
+                  {code === languages[0] && <span className="opacity-70">· {t("customerLanguages.default")}</span>}
                   {missing.includes(code) && <CircleDashed className="size-3" aria-label={t("ticket.customerMissingTab")} />}
                 </span>
               ),
@@ -307,14 +344,14 @@ function CustomerTexts({ task, languages, onSave, canWrite }: { task: TaskDetail
           />
         </div>
       )}
-      <CustomerFields key={active} title={title} description={description} onSave={save} canWrite={canWrite} />
-      {missing.length > 0 && languages.length > 1 && <p className="text-fg-3">{t("ticket.customerMissing", { languages: missing.map((code) => code.toUpperCase()).join(", ") })}</p>}
-      {canWrite && <p className="text-fg-3">{t(languages.length > 1 && active === languages[0] ? "ticket.customerDefaultHint" : "ticket.customerHint")}</p>}
+      {open && <CustomerFields key={active} language={name(active)} title={title} description={description} onSave={save} canWrite={canWrite} />}
+      {open && missing.length > 0 && languages.length > 1 && <p className="text-fg-3">{t("ticket.customerMissing", { languages: missing.map(name).join(", ") })}</p>}
+      {open && canWrite && <p className="text-fg-3">{t(languages.length > 1 && active === languages[0] ? "ticket.customerDefaultHint" : "ticket.customerHint")}</p>}
     </section>
   );
 }
 
-function CustomerFields({ title, description, onSave, canWrite }: { title: string; description: string; onSave: (field: "title" | "description", value: string) => void; canWrite: boolean }) {
+function CustomerFields({ language, title, description, onSave, canWrite }: { language: string; title: string; description: string; onSave: (field: "title" | "description", value: string) => void; canWrite: boolean }) {
   const { t } = useTranslation();
   const [draftTitle, setDraftTitle] = useState(title);
   const [draftDescription, setDraftDescription] = useState(description);
@@ -332,7 +369,7 @@ function CustomerFields({ title, description, onSave, canWrite }: { title: strin
     <>
       <Input
         aria-label={t("ticket.customerTitle")}
-        placeholder={t("ticket.customerTitle")}
+        placeholder={t("ticket.customerTitleIn", { language })}
         maxLength={150}
         value={draftTitle}
         onChange={(e) => setDraftTitle(e.target.value)}
@@ -340,7 +377,7 @@ function CustomerFields({ title, description, onSave, canWrite }: { title: strin
       />
       <Textarea
         aria-label={t("ticket.customerDescription")}
-        placeholder={t("ticket.customerDescription")}
+        placeholder={t("ticket.customerDescriptionIn", { language })}
         rows={2}
         maxLength={400}
         value={draftDescription}
@@ -351,11 +388,14 @@ function CustomerFields({ title, description, onSave, canWrite }: { title: strin
   );
 }
 
-function DescriptionEditor({ value, onSave, canWrite }: { value: string; onSave: (v: string) => void; canWrite: boolean }) {
+function DescriptionEditor({ draftKey, value, onSave, canWrite }: { draftKey: string; value: string; onSave: (v: string) => void; canWrite: boolean }) {
   const { t } = useTranslation();
-  const [editing, setEditing] = useState(!value);
-  const [draft, setDraft] = useState(value);
-  useEffect(() => setDraft(value), [value]);
+  const [draft, setDraft] = useDraft(canWrite ? draftKey : null, value);
+  // A draft left from before opens the editor again.
+  const [editing, setEditing] = useState(!value || draft !== value);
+  useEffect(() => {
+    if (!editing) setDraft(value);
+  }, [value, editing, setDraft]);
 
   return (
     <section>
@@ -432,100 +472,6 @@ function LabelsEditor({ value, onSave, canWrite }: { value: string[]; onSave: (v
       )}
       {canWrite && <Input value={draft} placeholder={t("ticket.addLabel")} onChange={(e) => setDraft(e.target.value)} onKeyDown={(e) => e.key === "Enter" && add()} onBlur={add} />}
     </div>
-  );
-}
-
-function Attachments({
-  attachments,
-  reviewIds,
-  onUpload,
-  onView,
-  canWrite,
-}: {
-  attachments: Attachment[];
-  reviewIds: Set<number>;
-  onUpload: (files: FileList) => void;
-  onView: (id: number) => void;
-  canWrite: boolean;
-}) {
-  const { t } = useTranslation();
-  const qc = useQueryClient();
-  const input = useRef<HTMLInputElement>(null);
-  const [over, setOver] = useState(false);
-
-  const onDrop = (e: DragEvent) => {
-    e.preventDefault();
-    setOver(false);
-    onUpload(e.dataTransfer.files);
-  };
-  const remove = async (a: Attachment) => {
-    await api.del(`/attachments/${a.id}`);
-    qc.invalidateQueries({ queryKey: ["task"] });
-  };
-
-  return (
-    <section>
-      <SectionTitle
-        right={
-          canWrite && (
-            <Button size="sm" variant="ghost" icon={<Upload className="size-3.5" />} onClick={() => input.current?.click()}>
-              {t("ticket.upload")}
-            </Button>
-          )
-        }
-      >
-        {t("ticket.attachments")}
-      </SectionTitle>
-      <input ref={input} type="file" multiple hidden onChange={(e) => e.target.files && onUpload(e.target.files)} />
-      <div
-        onDragOver={
-          canWrite
-            ? (e) => {
-                e.preventDefault();
-                setOver(true);
-              }
-            : undefined
-        }
-        onDragLeave={canWrite ? () => setOver(false) : undefined}
-        onDrop={canWrite ? onDrop : undefined}
-        className={clsx("rounded-sm p-2 transition-colors", canWrite && "border border-dashed", over ? "border-fg bg-sunk" : "border-line")}
-      >
-        {attachments.length === 0 ? (
-          <p className="py-3 text-center text-fg-3">{t(canWrite ? "ticket.dropFiles" : "ticket.noFiles")}</p>
-        ) : (
-          <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-            {attachments.map((a) => (
-              <div key={a.id} className="group relative overflow-hidden rounded-sm ring-1 ring-line">
-                {isMedia(a) ? (
-                  <button type="button" onClick={() => onView(a.id)} className="block h-24 w-full cursor-zoom-in">
-                    {isVideoFile(a) ? <VideoThumb src={`/api/attachments/${a.id}`} /> : <img src={`/api/attachments/${a.id}`} alt={a.filename} className="h-24 w-full object-cover" />}
-                  </button>
-                ) : (
-                  <AttachmentLink file={a} className="flex h-24 w-full items-center justify-center bg-sunk">
-                    <FileText className="size-8 text-line-2" />
-                  </AttachmentLink>
-                )}
-                <AttachmentLink file={a} className="block w-full truncate px-2 py-1">
-                  {a.filename} <span className="text-fg-3" title={formatDateTime(a.created_at)}>
-                    · {formatBytes(a.size)} · {chatTime(a.created_at)}
-                  </span>
-                </AttachmentLink>
-                {reviewIds.has(a.id) && (
-                  <Badge tone="amber" className="absolute top-1 left-1">
-                    {t("ticket.forReview")}
-                  </Badge>
-                )}
-                {canWrite && (
-                  <IconButton label={t("common.delete")} onClick={() => remove(a)} className="absolute top-1 right-1 bg-bg opacity-0 group-hover:opacity-100">
-                    <Trash2 className="size-3.5" />
-                  </IconButton>
-                )}
-              </div>
-            ))}
-          </div>
-        )}
-      </div>
-    </section>
   );
 }
 
@@ -612,7 +558,7 @@ function Comments({ taskId, comments, total, canWrite }: { taskId: number; comme
   const { t } = useTranslation();
   const { agentById, project } = useShell();
   const qc = useQueryClient();
-  const [body, setBody] = useState("");
+  const [body, setBody, clearBody] = useDraft(`comment:${taskId}`);
   const field = useRef<HTMLTextAreaElement>(null);
   const picker = useMentionPicker(project.id, body, setBody, field);
   useReadMentionsOf({ taskId });
@@ -642,7 +588,7 @@ function Comments({ taskId, comments, total, canWrite }: { taskId: number; comme
     if (!body.trim()) return;
     try {
       await api.post(`/tasks/${taskId}/comments`, { body });
-      setBody("");
+      clearBody();
       qc.invalidateQueries({ queryKey: qk.task(taskId) });
     } catch (err) {
       setError(errorMessage(err));
