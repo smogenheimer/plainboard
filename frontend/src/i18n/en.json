@@ -446,6 +446,12 @@
     "zoomOut": "Zoom out (-)",
     "zoomReset": "Show the whole image (0)"
   },
+  "health": {
+    "runner_away": "This project's runner is not connected: nothing starts until it is back.",
+    "runner_updating": "This project's runner is updating itself: new work starts when it is back.",
+    "manager_off": "The manager {{agent}} is switched off: nothing is planned or handed out ({{count}} open tickets).",
+    "parallel_zero": "Parallel agents is 0: no team member starts work (see the project settings)."
+  },
   "chat": {
     "selectAgent": "Select agent",
     "toolTrimmed": "Details removed after {{days}} days.",
@@ -474,6 +480,14 @@
     "queued": "Sent after this turn…",
     "limitWait": "Waiting for a usage limit: {{account}} · {{window}}, goes on by itself around {{time}}.",
     "limitWaitUnknown": "Waiting for a usage limit, goes on by itself around {{time}}.",
+    "hold": {
+      "paused_everything": "Waiting: everything is paused (Settings, Pause everything). It starts when an admin resumes.",
+      "project_paused": "Waiting: this project is paused. It starts when someone resumes it.",
+      "runner_away": "Waiting: the project's runner is not connected. It starts when the runner is back.",
+      "runner_updating": "Waiting: the project's runner is updating itself. It starts when the runner is back.",
+      "agent_off": "Waiting: {{agent}} is switched off. It starts when the agent is switched on.",
+      "other": "Waiting: something holds this turn."
+    },
     "openQuestions": "Tickets waiting for you",
     "stopping": {
       "active_one": "Stopping {{count}} agent",

@@ -35,10 +35,11 @@ from starlette.types import Receive, Scope, Send
 
 from ..db import sessionmaker
 from ..models import Attachment, Decision, DecisionStatus, Project, Run, RunStatus, Task
-from ..schemas import CustomerTextIn
+from ..schemas import CustomerTextIn, HealthOut
 from ..services import access
 from ..services import agents as agent_service
 from ..services import board as board_service
+from ..services import health as health_service
 from ..services import landings as landing_service
 from ..services import personal_tokens as token_service
 from ..services import search as search_service
@@ -181,7 +182,18 @@ def tool(description: str, read: bool = True):  # noqa: ANN201
 @tool("Your projects: id, slug, name, your role.")
 async def list_projects() -> str:
     rows = await api("GET", "/api/projects")
-    return "\n".join(f"{p['id']} {p['slug']} | {p['name']} | {p.get('role') or 'admin'}" + (" (paused)" if p.get("paused_at") or p.get("limit_paused_at") else "") for p in rows) or "No projects."
+    everything = (await api("GET", "/api/pause")).get("paused")
+    listed = "\n".join(f"{p['id']} {p['slug']} | {p['name']} | {p.get('role') or 'admin'}" + (" (paused)" if p.get("paused_at") or p.get("limit_paused_at") else "") for p in rows) or "No projects."
+    return ("Everything is paused: no turn starts anywhere (see system_status).\n" if everything else "") + listed
+
+
+@tool("Why nothing runs: pauses (everything, project, limits), runners, managers switched off, auto-wake, subscriptions. Look here first when an agent does not start.")
+async def system_status(project: ProjectRef | None = None) -> str:
+    params = None
+    if project is not None:
+        async with sessionmaker()() as session:
+            params = {"project_id": [(await project_of(session, project)).id]}
+    return health_service.lines(HealthOut.model_validate(await api("GET", "/api/status", params=params)))
 
 
 @tool("Ticket counts per status plus all open tickets.")

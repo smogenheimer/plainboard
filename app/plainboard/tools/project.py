@@ -4,7 +4,9 @@ from typing import Literal
 
 from pydantic import BaseModel, Field
 
-from ..schemas import ProjectUpdate
+from ..models import utcnow
+from ..schemas import HealthOut, ProjectUpdate
+from ..services import health as health_service
 from ..services import preview as preview_service
 from ..services import projects as project_service
 from ..services import repositories as repo_service
@@ -35,6 +37,13 @@ async def get_project(ctx: ToolContext, _args) -> str:
         f"Name: {p.name}\nLanguage: {p.language or 'each person their own'}\nRepositories: {repos}\nWorkspace: {workspace}\nParallel agents: {parallel}\nShared previews: {shared}\n"
         f"Auto-wake manager: {p.auto_wake_manager}\nBacklog when To do cannot start: {'worked on' if p.continue_with_backlog else 'left until the user moves it'}\nDescription:\n{p.description or '-'}\nSetup script:\n{p.setup_script or '-'}"
     )
+
+
+@tool("get_system_status", "Why something does not run: pauses (everything, this project, limits), runner, manager, auto-wake, members paused.", roles=(MANAGER,))
+async def get_system_status(ctx: ToolContext, _args) -> str:
+    issues = [found] if (found := await health_service.everything(ctx.session)) else []
+    issues += await health_service.of_project(ctx.session, ctx.runs.runners, ctx.project)
+    return health_service.lines(HealthOut(ok=not any(i.blocking for i in issues), issues=issues, checked_at=utcnow()))
 
 
 @tool("update_project", "Update project name, description, language, shared workspace folder, setup script, auto-wake or whether the Backlog is worked on.", UpdateProjectArgs, roles=(MANAGER,))

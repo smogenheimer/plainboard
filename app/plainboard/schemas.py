@@ -1080,6 +1080,28 @@ class ChatPartOut(BaseModel):
     key: str | None = None  # the sender's own id of it (``ChatMessageIn.client_key``): its outbox lets go of it
 
 
+class HealthIssue(BaseModel):
+    """One thing that keeps PlainBoard from working (services/health.py). ``code`` names it; the rest are its values."""
+
+    code: str
+    blocking: bool  # nothing (of the project) starts while it holds; else it only works differently than one may think
+    project_id: int | None = None  # None: the installation's
+    project: str = ""
+    agent: str = ""
+    account: str = ""
+    by: str = ""
+    since: UTCDateTime | None = None
+    until: UTCDateTime | None = None
+    count: int = 0
+    detail: str = ""
+
+
+class HealthOut(BaseModel):
+    ok: bool  # nothing blocks
+    issues: list[HealthIssue] = Field(default_factory=list)
+    checked_at: UTCDateTime
+
+
 class RunOut(ORM):
     id: int
     project_id: int
@@ -1113,6 +1135,8 @@ class RunOut(ORM):
     # A queued turn that waits because every subscription of its agent is used up: the subscription that is
     # free first (label), the limit window that holds it, and when it resets (unix seconds).
     limit_wait: dict | None = None
+    # A queued turn that something holds (services/health.hold): everything or its project paused, its runner away, its agent off.
+    hold: HealthIssue | None = None
 
 
 # --- notes / schedules / mcp ----------------------------------------------------------------

@@ -73,6 +73,8 @@ export function ChatPanel({
   const queued = activeRuns.filter((r) => r.status === "queued" && r.trigger === "chat");
   // A turn held until a used-up limit resets: say so, else the agent only looks stuck (#5).
   const limitWait = activeRuns.find((r) => r.limit_wait)?.limit_wait ?? null;
+  // A turn that a pause, an absent runner or a switched-off agent holds: say what, else it only looks stuck (#22).
+  const hold = activeRuns.find((r) => r.hold)?.hold ?? null;
   const messages = conversation.data?.messages ?? [];
   // Sent messages the server has (by the sender's key): the outbox lets go of them, also before or
   // without the answer to their request (#179).
@@ -292,7 +294,12 @@ export function ChatPanel({
         {timeline.map(({ message, run: r }) =>
           message ? <MessageItem key={message.id} message={message} agent={agent} details={details} follows={follows.has(message.id)} /> : r && waitingRow(r),
         )}
-        {limitWait && !running && (
+        {hold && !running && (
+          <div data-part="hold" role="status" className={clsx(CHAT_ROW, "bg-sunk text-muted")}>
+            {t(`chat.hold.${hold.code}`, { defaultValue: t("chat.hold.other"), by: hold.by, agent: hold.agent })}
+          </div>
+        )}
+        {limitWait && !running && !hold && (
           <div data-part="limit-wait" role="status" className={clsx(CHAT_ROW, "bg-sunk text-muted")}>
             {(() => {
               const time = new Date(limitWait.until * 1000).toLocaleString(undefined, { weekday: "short", hour: "2-digit", minute: "2-digit" });

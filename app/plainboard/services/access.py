@@ -102,6 +102,7 @@ RULES: tuple[Rule, ...] = (
     Rule("/api/auth/me", Need.USER),
     Rule("/api/meta", Need.USER),
     Rule("/api/limits", Need.USER),
+    Rule("/api/status", Need.USER),  # why nothing runs: filtered to the user's projects and subscriptions (services/health.py)
     Rule("/api/pause", Need.USER, Need.ADMIN),  # everyone sees that everything is paused; an admin does it
     Rule("/api/settings", Need.USER, Need.ADMIN),  # reading shows no secret, and the UI needs the defaults
     Rule("/api/settings/check/github", Need.CREATOR),

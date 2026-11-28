@@ -55,6 +55,7 @@ import { ChatView } from "../chat/ChatView";
 import { FlowSide } from "../flow/Integrations";
 import { LookDialog } from "./LookDialog";
 import { ProjectSwitcher } from "../projects/ProjectSwitcher";
+import { HealthBanner } from "../projects/HealthBanner";
 import { ProjectPauseBanner } from "../projects/ProjectPause";
 import { PauseBanner } from "../settings/PauseEditor";
 import { RunningNow } from "./RunningNow";
@@ -617,6 +618,7 @@ function ProjectWorkspace({
             project={project}
             isOwner={project.role === "owner"}
           />
+          <HealthBanner project={project} />
           {!isDesktop && view === "board" && <RunningNow variant="strip" />}
           {!isDesktop && view === "board" && <FlowSide variant="strip" onOpen={() => setView("flow")} />}
           {project.role === "viewer" && (
