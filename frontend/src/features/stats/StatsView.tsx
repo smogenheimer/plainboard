@@ -69,7 +69,7 @@ export function StatsView() {
               <Tile label={t("stats.ticketsCreated")} value={count(sum(data.days, (d) => d.tickets_created))} />
               <Tile label={t("stats.openTickets")} value={count(data.open_tickets)} />
               <Tile label={t("stats.cycleTime")} value={data.median_cycle_seconds === null ? "–" : duration(data.median_cycle_seconds)} hint={t("stats.cycleHint")} />
-              <Tile label={t("stats.runs")} value={count(sum(data.days, (d) => d.runs))} hint={t("stats.failedRuns", { count: sum(data.days, (d) => d.failed_runs) })} />
+              <Tile label={t("stats.runs")} value={count(sum(data.days, (d) => d.runs))} hint={[t("stats.failedRuns", { count: sum(data.days, (d) => d.failed_runs) }), sum(data.days, (d) => d.limited_runs) ? t("stats.limitedRuns", { count: sum(data.days, (d) => d.limited_runs) }) : null].filter(Boolean).join(" · ")} />
               <Tile label={t("stats.tokens")} value={count(sum(data.days, (d) => d.tokens))} />
               <Tile label={t("stats.cost")} value={money(sum(data.days, (d) => d.cost_usd))} />
             </div>

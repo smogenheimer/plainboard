@@ -1152,6 +1152,7 @@ class Run(Base):
     num_turns: Mapped[int] = mapped_column(Integer, default=0)
     context_tokens: Mapped[int] = mapped_column(Integer, default=0)
     job_wait_seconds: Mapped[int] = mapped_column(Integer, default=0)  # part of the turn spent waiting for jobs
+    limited: Mapped[bool] = mapped_column(Boolean, default=False)  # failed because a usage limit or an overload ended it: waiting, not a failure
     account_key: Mapped[str | None] = mapped_column(String(40))  # the provider account it ran on (the prompt cache is per account)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
     started_at: Mapped[datetime | None] = mapped_column(DateTime)

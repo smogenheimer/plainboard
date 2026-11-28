@@ -332,6 +332,7 @@
     "cycleHint": "Median, from starting work to done",
     "runs": "Agent turns",
     "failedRuns": "{{count}} failed",
+    "limitedRuns": "{{count}} waited for a limit",
     "tokens": "Tokens",
     "cost": "Cost",
     "slowdowns": "What slows the team down",

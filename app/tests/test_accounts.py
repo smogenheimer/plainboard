@@ -765,6 +765,9 @@ def test_an_assignment_cut_off_by_a_limit_goes_on_after_the_reset(client, projec
     wait_for(lambda: client.get(f"/api/projects/{pid}/assignments").json()[0]["status"] == "done")
     resumed = runner(client).specs[-1]
     assert f"Go on with assignment #{assignment['id']}" in resumed.prompt and "usage limit" in resumed.prompt
+    # The cut-off turn waited, it did not fail the work: statistics count it apart.
+    days = client.get(f"/api/projects/{pid}/stats?days=7").json()["days"]
+    assert sum(d["limited_runs"] for d in days) == 1 and sum(d["failed_runs"] for d in days) == 0
 
 
 def test_an_assignment_cut_off_by_limits_too_often_fails(client, project, monkeypatch):
