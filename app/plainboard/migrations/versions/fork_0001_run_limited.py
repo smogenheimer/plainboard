@@ -1,6 +1,6 @@
 """a failed turn that a usage limit or an overload ended is marked (#5)
 
-Revision ID: 0105
+Revision ID: fork_0001
 Revises: 0104
 
 Such a turn is waiting, not a failure of the work: statistics count it apart from real failures, and an
@@ -9,7 +9,7 @@ assignment cut off this way goes on after the reset, also across a restart. Turn
 from alembic import op
 import sqlalchemy as sa
 
-revision = "0105"
+revision = "fork_0001"
 down_revision = "0104"
 branch_labels = None
 depends_on = None
