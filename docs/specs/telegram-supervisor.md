@@ -96,6 +96,16 @@ comparing file names by hand.
   (HMAC with the bot token) matched against the admin's user id; the rest of PlainBoard stays internal.
 - Deep links from every message into the web UI.
 
+### Setup (what the user guide will say: "Connect Telegram")
+1. Create a bot with @BotFather and copy its token.
+2. In PlainBoard, Settings → Telegram: paste the token. PlainBoard starts polling; nothing has to be reachable
+   from outside for the bot itself.
+3. Send `/start` to the bot. PlainBoard shows a one-time code in the settings; send it to the bot to link your
+   Telegram account to your admin user. Other Telegram users are ignored.
+4. Optional, for the Mini App: PlainBoard must be reachable over public HTTPS. Set the public base URL in the
+   settings and let your reverse proxy forward the Mini App page and `/api/telegram/*` (any proxy works; see
+   "Behind a reverse proxy" in docs/guide.md). PlainBoard registers the Mini App button with the bot.
+
 ## Phase 3: supervisor
 
 - A normal agent in a hidden system project (excluded from project lists and `transfer`), run through the runner
