@@ -2,12 +2,13 @@
 for a Claude subscription signed in with a token a handful (the runner asks with a minimal turn).
 
 Stored per account key. Window names: Claude's as it reports them (five_hour, seven_day, seven_day_opus ...),
-Codex's prefixed with codex_.
+Codex's prefixed with codex_. A window with a ``model`` limits that model's turns only (Claude's weekly Fable limit).
 """
 
 from __future__ import annotations
 
 import json
+import re
 import time
 from datetime import UTC, datetime
 from statistics import median
@@ -206,9 +207,16 @@ def _windows(stored: dict, now: float) -> list[LimitWindow]:
     return windows
 
 
-def fullest(windows: list[LimitWindow]) -> float:
-    """How full an account is: its fullest window, 1 if the provider turned it away."""
-    return max([1.0 if w.status == "rejected" else w.utilization for w in windows], default=0.0)
+def applies(window: LimitWindow, model: str | None) -> bool:
+    """Whether a turn on ``model`` counts against the window: one for certain models ("Fable", by the first
+    word of its name in the model's id) only for those. With no model known, every window counts."""
+    family = re.search(r"[a-z]+", (window.model or "").lower())
+    return model is None or family is None or family[0] in model.lower()
+
+
+def fullest(windows: list[LimitWindow], model: str | None = None) -> float:
+    """How full an account is for a turn on ``model``: its fullest window, 1 if the provider turned it away."""
+    return max([1.0 if w.status == "rejected" else w.utilization for w in windows if applies(w, model)], default=0.0)
 
 
 async def windows(session: AsyncSession) -> dict[str, list[LimitWindow]]:

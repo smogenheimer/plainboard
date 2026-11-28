@@ -8,7 +8,7 @@ import { AttachmentLink } from "../../components/AttachmentLink";
 import { Avatar } from "../../components/Avatar";
 import { Lightbox } from "../../components/Lightbox";
 import { VideoThumb } from "../../components/VideoThumb";
-import { isMediaFile, isVideoFile } from "../../lib/media";
+import { isMediaFile, isVideoFile, thumbSrc } from "../../lib/media";
 import { Markdown, TicketText } from "../../components/Markdown";
 import { chatTime, formatDateTime, formatTokens } from "../../lib/format";
 import { CodeLine, useShowCode } from "./ToolCode";
@@ -254,7 +254,7 @@ function MessageFiles({ files }: { files: { id: number; filename: string; conten
               <VideoThumb src={`/api/attachments/${f.id}`} />
             </span>
           ) : (
-            <img src={`/api/attachments/${f.id}`} alt={f.filename} loading="lazy" className="h-40 max-w-full object-cover" />
+            <img src={thumbSrc(f.id, 800)} alt={f.filename} loading="lazy" decoding="async" className="h-40 max-w-full object-cover" />
           )}
         </button>
       ))}

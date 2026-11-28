@@ -80,12 +80,39 @@ export function useIdeaChange(): IdeaChange | null {
   );
 }
 
-function upsertIdea(qc: QueryClient, pid: number, idea: Idea) {
+/** What rearranging the ideas answered when nothing came of it: it failed (`error`), or nothing had to move. */
+export interface IdeaNote {
+  project_id: number;
+  error: string;
+}
+let ideaNote: IdeaNote | null = null;
+const noteListeners = new Set<() => void>();
+
+export function showIdeaNote(note: IdeaNote | null) {
+  ideaNote = note;
+  noteListeners.forEach((l) => l());
+}
+
+export function useIdeaNote(): IdeaNote | null {
+  return useSyncExternalStore(
+    (l) => {
+      noteListeners.add(l);
+      return () => noteListeners.delete(l);
+    },
+    () => ideaNote,
+  );
+}
+
+// Inputs typed here: what the AI made of them is shown with an undo when it comes (#161).
+const ownInputs = new Set<number>();
+export const expectIdeaChange = (inputId: number) => ownInputs.add(inputId);
+
+export function upsertIdea(qc: QueryClient, pid: number, idea: Idea) {
   qc.setQueryData<IdeasData>(qk.ideas(pid), (old) => {
     if (!old) return old;
     const exists = old.ideas.some((i) => i.id === idea.id);
     // A closed idea stays a moment, to show where it went (the view lets it leave).
-    if (!exists && idea.status !== "open") return old;
+    if (!exists && idea.status !== "open" && idea.status !== "reading") return old;
     return { ...old, ideas: exists ? old.ideas.map((i) => (i.id === idea.id ? idea : i)) : [...old.ideas, idea] };
   });
 }
@@ -116,11 +143,20 @@ function handleIdeas(qc: QueryClient, pid: number, type: string, data: any) {
       const change = data as IdeaChange;
       if (change.undone_at) {
         if (ideaChange?.id === change.id) showIdeaChange(null);
+      } else if (ownInputs.delete(change.summary.input_id)) {
+        showIdeaChange(change);
       } else if ((change.kind === "reorder" || change.source === "auto") && ideaChange?.id !== change.id) showIdeaChange(change);
       break;
     }
     case "ideas.sorting":
       qc.setQueryData<IdeasData>(qk.ideas(pid), (old) => old && { ...old, sorting: !!data.sorting });
+      break;
+    case "ideas.sort_failed":
+      if (data.blocked) void qc.invalidateQueries({ queryKey: qk.ideas(pid) }); // the ideas view says which model can't be used
+      else showIdeaNote({ project_id: pid, error: String(data.error || "?") });
+      break;
+    case "ideas.rearranged":
+      if (!data.changed) showIdeaNote({ project_id: pid, error: "" });
       break;
   }
 }

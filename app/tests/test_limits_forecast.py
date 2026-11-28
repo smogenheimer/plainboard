@@ -53,3 +53,11 @@ def test_forecast_falls_back_to_this_weeks_pace():
     assert forecast(LimitWindow(name="seven_day", utilization=0.1), {}, NOW) is None  # no reset known
     full = forecast(weekly(1.0, 2), history(0.2, 0.2, 0.2), NOW)
     assert full.status == "over" and full.runs_out_at is None
+
+
+def test_a_window_for_certain_models_counts_for_those_only():
+    from plainboard.services.limits import fullest
+
+    windows = [LimitWindow(name="seven_day", utilization=0.3), LimitWindow(name="seven_day_fable", utilization=1.0, model="Fable", status="rejected")]
+    assert fullest(windows, "claude-fable-5-2") == 1.0 and fullest(windows) == 1.0  # no model known: every window counts
+    assert fullest(windows, "claude-opus-5-5") == 0.3 and fullest(windows, "opus") == 0.3

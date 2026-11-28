@@ -72,14 +72,15 @@ def test_repairs_that_wait_stuck_branches_and_full_notes_are_found_and_a_branch_
     async def age_everything() -> None:
         async with sessionmaker()() as s:
             await s.execute(update(Assignment).values(created_at=utcnow() - timedelta(hours=4)))
-            s.add(AgentNote(project_id=pid, agent_id=dev2["id"], text="x" * 2800))
+            s.add(AgentNote(project_id=pid, agent_id=dev2["id"], text="x" * 2800, created_by_agent_id=dev2["id"]))  # its own: pushed out when needed
+            s.add(AgentNote(project_id=pid, agent_id=manager["id"], text="y" * 1600))  # the user's: never
             await s.commit()
 
     client.portal.call(age_everything)
     findings = found(client, pid)
     assert findings["waiting_repairs"]["title"] == "1 repair for landing waits behind other work" and "(Dev2, 4 h)" in findings["waiting_repairs"]["detail"]
     assert findings["long_assignments"]["title"] == "1 assignment has been open for more than 3 h" and '"Long work"' in findings["long_assignments"]["detail"]
-    assert findings["full_notes"]["detail"].startswith("Dev2 (2800 of 3000) characters.")
+    assert findings["full_notes"]["detail"].startswith("Manager (1600 of 3000) characters.")
 
     # A branch PlainBoard stopped for: it is found, and the manager takes it off the list when its work landed another way.
     fake.branches["old-work"] = "sha-old"

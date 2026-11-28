@@ -17,7 +17,7 @@
   --radius-2xl: 28px;
   --font-weight-extrabold: 700;
   --shadow-lg: 0 24px 60px -16px rgb(0 0 0 / 0.5), 0 0 0 1px rgb(255 255 255 / 0.04);
-  --shadow-card: none;
+  --shadow-card: 0 0 #0000; /* not "none": it is one part of a box-shadow list */
   --del: var(--danger);
   --grad: linear-gradient(100deg, #ffb36b 0%, #ff6d3d 30%, #ff3d8b 62%, #8b5cff 100%);
 }

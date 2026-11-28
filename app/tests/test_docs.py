@@ -195,6 +195,53 @@ def test_a_site_at_its_own_domain_is_served_there_only_when_verified(client, pro
     sign_in(client, "admin", ADMIN_PASSWORD)
 
 
+def test_a_failed_domain_check_names_the_real_cause(client, project, monkeypatch):
+    from plainboard.services import docs_domains
+
+    pid = project["id"]
+    s = site(client, pid)
+    client.put(f"/api/projects/{pid}/docs/sites/{s['id']}/domain", json={"domain": "docs.example.com"})
+    answers: dict[str, httpx.Response | Exception] = {}
+
+    def answer(request: httpx.Request) -> httpx.Response:
+        got = answers.get(request.url.scheme, httpx.Response(404, text="nope"))
+        if isinstance(got, Exception):
+            raise got
+        return got
+
+    real = httpx.AsyncClient
+    monkeypatch.setattr(docs_domains.httpx, "AsyncClient", lambda **kw: real(transport=httpx.MockTransport(answer), **kw))
+    resolves = True
+
+    async def fake_resolves(domain: str) -> bool:
+        return resolves
+
+    monkeypatch.setattr(docs_domains, "_resolves", fake_resolves)
+
+    def check() -> dict:
+        out = client.post(f"/api/projects/{pid}/docs/sites/{s['id']}/domain/verify").json()
+        assert out["verified"] is False
+        return out
+
+    # http only redirects (308) to https, where Cloudflare can't do the TLS handshake with the server
+    cf = {"server": "cloudflare", "cf-ray": "8e0f-FRA"}
+    answers["http"] = httpx.Response(308, headers={"location": "https://docs.example.com/.well-known/plainboard-docs"})
+    answers["https"] = httpx.Response(525, text="error code: 525", headers=cf)
+    out = check()
+    assert "525" in out["detail"] and "TLS handshake" in out["detail"] and "308" not in out["detail"]
+    assert "docs.example.com" in out["hint"] and "CNAME to testserver" in out["hint"]
+    answers["https"] = httpx.Response(530, text="error code: 1033", headers=cf)
+    assert "tunnel" in check()["detail"]
+    answers["https"] = httpx.Response(522, text="<html>Connection timed out</html>", headers=cf)
+    assert "522" in check()["detail"]
+    answers["https"] = httpx.Response(404, text="Not Found", headers={"server": "nginx"})
+    out = check()
+    assert "404" in out["detail"] and "not reach this PlainBoard" in out["detail"] and "DNS record points to the PlainBoard server" in out["hint"]
+    answers["https"] = answers["http"] = httpx.ConnectError("[Errno -2] Name or service not known")
+    resolves = False
+    assert "does not resolve" in check()["detail"]
+
+
 def test_cloudflare_creates_the_cname_and_the_token_is_never_shown(client, project, monkeypatch):
     from plainboard.services import docs_domains
 
@@ -518,6 +565,42 @@ def test_an_llm_translates_on_the_projects_subscription(client, project, monkeyp
     assert client.get("/api/public/docs/handbook/page", params={"path": "", "lang": "fr"}).json()["markdown"] == "Bonjour."
     runs = db(client, lambda session: session.scalars(select(Run.agent_id).where(Run.project_id == pid, Run.trigger == "docs")))
     assert list(runs) == [s["agent"]["id"]] * 2  # title and text, each counted, on the doc agent
+
+
+def test_the_settings_show_what_llm_translations_run_on_and_nothing_switches(client, project, monkeypatch):
+    """#178: the provider and model come from the same function the watcher uses; one the project can't use is a
+    problem shown there, never a reason to take another provider."""
+    from plainboard.models import DocTranslation, Project, utcnow
+    from sqlalchemy import select
+
+    pid = project["id"]
+    monkeypatch.setattr(client.app_ref.state.docs_watcher, "translate_soon", lambda: None)
+    s = site(client, pid, published=True, public=True, languages=["fr"])
+    url = f"/api/projects/{pid}/docs/sites/{s['id']}"
+    client.patch(url, json={"translator": "llm", "translate_model": "claude-haiku-x"})
+    used = client.get(f"{url}/translation-model").json()
+    assert used == {"provider": s["agent"]["provider"], "model": "claude-haiku-x", "provider_from": "agent", "model_from": "site", "problem": ""}
+    client.patch(url, json={"translate_model": ""})
+    used = client.get(f"{url}/translation-model").json()
+    assert used["model_from"] == "small" and used["model"] and not used["problem"]
+
+    client.patch(url, json={"translate_provider": "nobody_has_this"})
+    used = client.get(f"{url}/translation-model").json()
+    assert used["provider"] == "nobody_has_this" and used["provider_from"] == "site" and "no subscription" in used["problem"]
+    page(client, pid, s["id"], title="Welcome", body="Hello.")
+    fake = runner(client)
+
+    async def complete(spec):
+        raise AssertionError(f"ran on {spec.provider}")
+
+    fake.complete = complete
+
+    async def look(session):
+        return await client.app_ref.state.docs_watcher.translate(session, await session.get(Project, pid), utcnow())
+
+    assert db(client, look) == 0
+    errors = list(db(client, lambda session: session.scalars(select(DocTranslation.error))))
+    assert errors and all("no subscription" in e for e in errors)
 
 
 def test_an_llm_translation_must_keep_the_markdown_skeleton(client, project, monkeypatch):
@@ -945,3 +1028,264 @@ def test_the_doc_agent_proposes_a_restructuring_once_the_site_grew_and_the_user_
         page(client, pid, s["id"], title=f"Late {i}", body="Text.")
     client.portal.call(watcher.tick, now + timedelta(days=30))
     assert len(checks()) == 1
+
+
+def test_a_page_written_by_people_only_is_read_but_never_changed_or_handed_to_the_doc_agent(client, project):
+    from plainboard.models import Assignment, DocPage, Landing, LandingStatus, utcnow
+    from sqlalchemy import select
+
+    pid = project["id"]
+    client.patch(f"/api/projects/{pid}", json={"auto_wake_manager": False})
+    repo = client.post(f"/api/projects/{pid}/repositories", json={"name": "api", "url": "https://github.com/acme/api.git"}).json()
+    s = site(client, pid)
+    writer = s["agent"]["id"]
+    guide = page(client, pid, s["id"], title="Guide", body="All about it.")
+    mine = page(client, pid, s["id"], title="Payments", body="My own words.", parent_id=guide["id"], paths=["app/pay"])
+    other = page(client, pid, s["id"], title="Orders", body="Orders.", paths=["app/orders"])
+    marked = client.patch(f"/api/projects/{pid}/docs/pages/{mine['id']}", json={"human_only": True}).json()
+    assert marked["human_only"] is True and marked["body"] == "My own words." and marked["versions"] == 1
+
+    # The doc agent reads and links it, but changes, moves and deletes nothing of it, nor plans to.
+    chat(client, writer, "\n".join([
+        "TOOL list_docs " + json.dumps({"site": "handbook", "parent": guide["id"]}),
+        "TOOL read_doc_page " + json.dumps({"page": mine["id"]}),
+        "TOOL write_doc_page " + json.dumps({"page": mine["id"], "body": "Better words.", "reason": "clearer"}),
+        "TOOL write_doc_page " + json.dumps({"page": mine["id"], "move": True, "parent": 0, "reason": "to the top"}),
+        "TOOL write_doc_page " + json.dumps({"page": guide["id"], "delete": True, "reason": "merged"}),
+        "TOOL propose_doc_restructure " + json.dumps({"title": "Merge", "reason": "Readers find it faster in one page.", "before": "- Guide\n  - Payments", "after": "- Guide", "pages": [guide["id"], mine["id"]]}),
+        "TOOL write_doc_page " + json.dumps({"site": "handbook", "title": "Refunds", "body": f"See [payments](doc-page:{mine['id']}).", "reason": "new page"}),
+    ]))  # fmt: skip
+    wait_for(lambda: idle(client, pid))
+    listed, read, edit, move, delete, proposed, linked = tool_results(client, writer)[-7:]
+    assert f'- {mine["id"]} /guide/payments "Payments" [written by people only: read and link only]' in listed
+    assert "written by people only: read and link only, never change it" in read and "My own words." in read
+    assert edit == move == f"Not changed: doc page {mine['id']} is written by people only. Read and link it, but leave it as it is."
+    assert delete.startswith(f"Not deleted: pages below it are written by people only ({mine['id']})")
+    assert f"Pages {mine['id']} are written by people only: plan no change to them" in proposed
+    assert linked.startswith("Created doc page ")
+    kept = client.get(f"/api/projects/{pid}/docs/pages/{mine['id']}").json()
+    assert kept["body"] == "My own words." and kept["parent_id"] == guide["id"] and kept["human_only"] is True
+
+    # The watcher hands no work on it to the doc agent: not after a landing, not as a stale page.
+    fake = runner(client)
+    fake.commits = [GitCommit(sha="a" * 40, message="Start", files=["README.md"])]
+    watcher = client.app_ref.state.docs_watcher
+    now = utcnow()
+    client.portal.call(watcher.tick, now)
+
+    async def land(s):
+        s.add(Landing(project_id=pid, repository_id=repo["id"], branch="be/pay", title="Pay and order", status=LandingStatus.MERGED, merged_at=now + timedelta(minutes=1)))
+        await s.commit()
+
+    db(client, land)
+    fake.commits = [GitCommit(sha="c" * 40, message="Pay and order", files=["app/pay/x.py", "app/orders/y.py"]), *fake.commits]
+    client.portal.call(watcher.tick, now + timedelta(minutes=20))
+    wait_for(lambda: idle(client, pid))
+
+    async def orders(s):
+        return [a.instructions for a in await s.scalars(select(Assignment).where(Assignment.agent_id == writer, Assignment.title != "").order_by(Assignment.id))]
+
+    texts = [t for t in db(client, orders) if t.startswith("Pages of your doc site")]
+    assert len(texts) == 1 and f'doc page {other["id"]} "Orders"' in texts[0] and "Payments" not in texts[0]
+    assert client.get(f"/api/projects/{pid}/docs/pages/{mine['id']}").json()["flagged_at"] is None
+
+    async def drift(s):
+        for key in (mine["id"], other["id"]):
+            (await s.get(DocPage, key)).drift = 12
+        await s.commit()
+
+    db(client, drift)
+    client.portal.call(watcher.tick, now + timedelta(days=2))
+    wait_for(lambda: idle(client, pid))
+    stale = [t for t in db(client, orders) if t.startswith("Pages of your doc site that are probably stale")]
+    assert len(stale) == 1 and f'doc page {other["id"]} "Orders"' in stale[0] and "Payments" not in stale[0]
+
+
+def _orders(client, agent_id: int) -> list[str]:
+    from plainboard.models import Assignment
+    from sqlalchemy import select
+
+    async def run(s):
+        return [a.instructions for a in await s.scalars(select(Assignment).where(Assignment.agent_id == agent_id).order_by(Assignment.id))]
+
+    return db(client, run)
+
+
+def _land(client, pid: int, repo_id: int, at, branch: str = "be/change") -> None:
+    from plainboard.models import Landing, LandingStatus
+
+    async def run(s):
+        s.add(Landing(project_id=pid, repository_id=repo_id, branch=branch, title="A change", status=LandingStatus.MERGED, merged_at=at))
+        await s.commit()
+
+    db(client, run)
+
+
+def test_old_values_of_a_change_and_of_a_new_release_are_found_on_every_page_with_their_lines(client, project):
+    from plainboard.models import utcnow
+    from plainboard_protocol import GitTag
+
+    pid = project["id"]
+    client.patch(f"/api/projects/{pid}", json={"auto_wake_manager": False})
+    repo = client.post(f"/api/projects/{pid}/repositories", json={"name": "api", "url": "https://github.com/acme/api.git"}).json()
+    s = site(client, pid)
+    writer = s["agent"]["id"]
+    install = page(client, pid, s["id"], title="Install", body="# Install\n\n## Download\n\nGet Vanillite 0.1.0-beta.2 from the releases.\n\nBeta 2 needs Java 21.")
+    config = page(client, pid, s["id"], title="Config", body="## Limits\n\nThe `timeout_seconds` default is 300.\n")
+    page(client, pid, s["id"], title="Changelog", body="Upgrade from beta 2 to beta 3: nothing to do.")  # names the new value too: right already
+    fake = runner(client)
+    fake.commits = [GitCommit(sha="a" * 40, message="Start", files=["README.md"])]
+    now = utcnow()
+    fake.tags = [GitTag(name="v0.1.0-beta.2+mc26.3", sha="a" * 40, date=(now - timedelta(days=9)).isoformat(), subject="Beta 2")]
+    watcher = client.app_ref.state.docs_watcher
+    client.portal.call(watcher.tick, now)  # where history and releases stand: nothing to tell
+    assert fake.tag_specs[-1].known == [] and not _orders(client, writer)
+
+    # A landing changes a default: the page that still names the old value is named with its line and section (no code paths needed).
+    _land(client, pid, repo["id"], now + timedelta(minutes=1))
+    diff = "diff --git a/app/config.py b/app/config.py\n--- a/app/config.py\n+++ b/app/config.py\n@@ -3 +3 @@\n-TIMEOUT = 300  # timeout_seconds\n+TIMEOUT = 600  # timeout_seconds\n"
+    fake.commits = [GitCommit(sha="c" * 40, message="Longer timeout", files=["app/config.py"], diff=diff), *fake.commits]
+    client.portal.call(watcher.tick, now + timedelta(minutes=20))
+    wait_for(lambda: idle(client, pid))
+    texts = _orders(client, writer)
+    assert len(texts) == 1 and fake.git_log_specs[-1].diffs == 50
+    assert f'doc page {config["id"]} "Config" (/config): mentions "300", now "600" (cccccccccc "Longer timeout" in api)' in texts[0]
+    assert '\n  - line 3 in "Limits": The `timeout_seconds` default is 300.' in texts[0] and "Install" not in texts[0] and "doc_grep" in texts[0]
+
+    # A new release: the previous tag -> the new one, also as docs write it ("0.1.0-beta.2", "Beta 2").
+    fake.tags = [GitTag(name="v0.1.0-beta.3+mc26.3", sha="d" * 40, date=(now + timedelta(hours=3)).isoformat(), subject="Beta 3", previous="v0.1.0-beta.2+mc26.3", subjects=["Fix the crash"]), *fake.tags]
+    client.portal.call(watcher.tick, now + timedelta(hours=4))
+    wait_for(lambda: idle(client, pid))
+    texts = _orders(client, writer)
+    assert len(texts) == 2 and fake.tag_specs[-1].known == ["v0.1.0-beta.2+mc26.3"]
+    assert "api: new tag v0.1.0-beta.3+mc26.3" in texts[1] and "- release v0.1.0-beta.3+mc26.3 of api (after v0.1.0-beta.2+mc26.3): Fix the crash" in texts[1]
+    assert f'doc page {install["id"]} "Install" (/install): mentions "0.1.0-beta.2", now "0.1.0-beta.3" (release v0.1.0-beta.3+mc26.3 of api)' in texts[1]
+    assert '\n  - line 5 in "Install › Download": Get Vanillite 0.1.0-beta.2 from the releases.\n  - line 7 in "Install › Download": Beta 2 needs Java 21.' in texts[1]
+    assert "Changelog" not in texts[1] and "Config" not in texts[1]
+    assert client.get(f"/api/projects/{pid}/docs/pages/{install['id']}").json()["flagged_at"]
+
+    # The doc agent's own tools.
+    for line in (
+        "TOOL doc_grep " + json.dumps({"pattern": "beta[ .]2", "regex": True}),
+        "TOOL releases {}",
+        "TOOL changes_since " + json.dumps({"page": install["id"], "since": f"{now:%Y-%m-%d}"}),
+    ):
+        chat(client, writer, line)
+        wait_for(lambda: idle(client, pid))
+    grep, tags, since = tool_results(client, writer)[-3:]
+    assert grep.startswith("3 line(s) in handbook:") and f'- {install["id"]} /install "Install" line 7 in "Install › Download": Beta 2 needs Java 21.' in grep, grep
+    assert tags.splitlines()[0] == "- api v0.1.0-beta.3+mc26.3 (" + f"{now + timedelta(hours=3):%Y-%m-%d}" + ", dddddddddd): Beta 3" and len(tags.splitlines()) == 2
+    assert "Releases (tags) since" in since and "v0.1.0-beta.3+mc26.3" in since, since
+    assert ("Commits since" in since) if POSTGRES else ("be/change" in since), since  # by path from the search index, else the landings
+
+
+def test_a_hunk_close_in_meaning_to_a_section_names_that_section(client, project, monkeypatch):
+    from types import SimpleNamespace
+
+    from plainboard.models import utcnow
+    from plainboard.services import search as search_service
+    from plainboard.services.search import store
+
+    pid = project["id"]
+    client.patch(f"/api/projects/{pid}", json={"auto_wake_manager": False})
+    repo = client.post(f"/api/projects/{pid}/repositories", json={"name": "api", "url": "https://github.com/acme/api.git"}).json()
+    s = site(client, pid)
+    writer = s["agent"]["id"]
+    hooks = page(client, pid, s["id"], title="Webhooks", body="## Retries\n\nStripe retries webhooks three times.")
+    queries: list[str] = []
+
+    class Model:
+        state, name, card = "ready", "fake", SimpleNamespace(hint_similarity=0.5)
+
+        async def query(self, text):
+            queries.append(text)
+            return [0.0]
+
+    async def enabled(session, project):
+        return True
+
+    async def embedder(session):
+        return Model()
+
+    async def nearest_chunks(session, project_id, vector, model, kind, limit):
+        hit = "webhooks.py" in queries[-1] or "webhooks" in queries[-1].lower()
+        return [store.Section(str(hooks["id"]), 0, "Retries\nStripe retries webhooks three times.", 0.9 if hit else 0.1)]
+
+    monkeypatch.setattr(search_service, "enabled", enabled)
+    monkeypatch.setattr(search_service, "embedder", embedder)
+    monkeypatch.setattr(store, "nearest_chunks", nearest_chunks)
+    fake = runner(client)
+    fake.commits = [GitCommit(sha="a" * 40, message="Start", files=["README.md"])]
+    watcher = client.app_ref.state.docs_watcher
+    now = utcnow()
+    client.portal.call(watcher.tick, now)
+    _land(client, pid, repo["id"], now + timedelta(minutes=1))
+    diff = "diff --git a/app/pay/webhooks.py b/app/pay/webhooks.py\n--- a/app/pay/webhooks.py\n+++ b/app/pay/webhooks.py\n@@ -1 +1 @@\n-RETRIES = 3\n+RETRIES = 5\n"
+    fake.commits = [GitCommit(sha="c" * 40, message="More retries", files=["app/pay/webhooks.py"], diff=diff), *fake.commits]
+    client.portal.call(watcher.tick, now + timedelta(minutes=20))
+    wait_for(lambda: idle(client, pid))
+    texts = _orders(client, writer)
+    assert len(texts) == 1
+    assert '\n  - section "Retries Stripe retries webhooks three times." is close in meaning to the change of app/pay/webhooks.py in cccccccccc "More retries" in api' in texts[0], texts[0]
+    assert any(q.startswith("app/pay/webhooks.py\n- RETRIES = 3\n+ RETRIES = 5") for q in queries)
+
+    chat(client, writer, "TOOL doc_search " + json.dumps({"query": "how often are webhooks retried"}))
+    wait_for(lambda: idle(client, pid))
+    assert tool_results(client, writer)[-1] == f'- {hooks["id"]} /webhooks "Webhooks" (0.90): Retries Stripe retries webhooks three times.'
+
+
+def test_each_day_the_riskiest_pages_within_the_sites_budget_go_to_the_doc_agent(client, project):
+    from plainboard.models import DocPage, utcnow
+
+    pid = project["id"]
+    client.patch(f"/api/projects/{pid}", json={"auto_wake_manager": False})
+    s = site(client, pid)
+    assert s["check_budget"] == 4000
+    writer = s["agent"]["id"]
+    churned = page(client, pid, s["id"], title="Churned", body="x" * 400)
+    old = page(client, pid, s["id"], title="Old", body="y" * 400)
+    huge = page(client, pid, s["id"], title="Huge", body="z" * 40000)  # older still, but beyond the budget
+    page(client, pid, s["id"], title="Fresh", body="checked lately")
+    now = utcnow()
+
+    async def age(s):
+        for pid_, days, drift in ((churned["id"], 30, 3), (old["id"], 60, 0), (huge["id"], 90, 0)):
+            row = await s.get(DocPage, pid_)
+            row.edited_at, row.drift = now - timedelta(days=days), drift
+        await s.commit()
+
+    db(client, age)
+    runner(client)
+    watcher = client.app_ref.state.docs_watcher
+    client.portal.call(watcher.tick, now)
+    wait_for(lambda: idle(client, pid))
+    texts = [t for t in _orders(client, writer) if t.startswith("Today's check of your doc site")]
+    assert len(texts) == 1, _orders(client, writer)
+    lines = [line for line in texts[0].splitlines() if line.startswith("- doc page")]
+    assert lines[0].startswith(f'- doc page {churned["id"]} "Churned"') and "3 commits changed its code since" in lines[0]
+    assert lines[1].startswith(f'- doc page {old["id"]} "Old"') and len(lines) == 2 and "changes_since" in texts[0]
+
+    assert client.patch(f"/api/projects/{pid}/docs/sites/{s['id']}", json={"check_budget": 0}).json()["check_budget"] == 0
+    client.portal.call(watcher.tick, now + timedelta(days=9))  # the pages are due again, but the site checks none
+    assert len([t for t in _orders(client, writer) if t.startswith("Today's check")]) == 1
+
+
+def test_changed_literals_are_paired_old_to_new_and_versions_searched_as_docs_write_them():
+    from plainboard.services import docs_changes as d
+
+    diff = (
+        "diff --git a/gradle.properties b/gradle.properties\n--- a/gradle.properties\n+++ b/gradle.properties\n@@ -3 +3 @@\n"
+        "-mod_version=0.1.0-beta.2+mc26.3\n+mod_version=0.1.0-beta.3+mc26.3\n@@ -10,2 +10,2 @@\n"
+        '-    parser.add_argument("--old-flag", default=self.max_items)\n+    parser.add_argument("--new-flag", default=self.max_items)\n'
+        "diff --git a/old.py b/old.py\ndeleted file mode 100644\n--- a/old.py\n+++ /dev/null\n@@ -1 +0,0 @@\n-REMOVED_SETTING = 1\n"
+    )
+    pairs = d.changed_tokens(d.hunks(diff))
+    assert pairs == [("0.1.0-beta.2+mc26.3", "0.1.0-beta.3+mc26.3"), ("--old-flag", "--new-flag")]
+    found = d.probes(pairs, "x")
+    hits = {line: [p.old for p in found if p.pattern.search(line) and not (p.new_pattern and p.new_pattern.search(line))][:1] for line in (
+        "Download v0.1.0-beta.2+mc26.3", "Beta 2 is out", "from beta 2 to beta 3", "see 0.1.0-beta.20", "run with --old-flag", "max_items",
+    )}  # fmt: skip
+    assert hits == {
+        "Download v0.1.0-beta.2+mc26.3": ["0.1.0-beta.2+mc26.3"], "Beta 2 is out": ["beta 2"], "from beta 2 to beta 3": [], "see 0.1.0-beta.20": [],
+        "run with --old-flag": ["--old-flag"], "max_items": [],
+    }  # fmt: skip

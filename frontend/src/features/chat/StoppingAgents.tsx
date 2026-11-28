@@ -1,31 +1,41 @@
 import { Check, Loader2 } from "lucide-react";
 import { useEffect, useReducer } from "react";
 import { useTranslation } from "react-i18next";
-import { useRuns } from "../../api/queries";
+import { usePause, useRuns } from "../../api/queries";
 import type { Agent, Run } from "../../api/types";
 import { useShell } from "../layout/shell-context";
 
 const LINGER_MS = 30_000;
 
-/** The runs of the current stop: all that were asked to stop since the earliest one still relevant. */
-function currentStop(runs: Run[], agents: Agent[], now: number): Run[] {
-  const latestRun = new Map([...runs].sort((a, b) => a.id - b.id).map((r) => [r.agent_id, r.id]));
-  // A job started in a later turn has nothing to do with this stop.
-  const leftJobs = (run: Run) => latestRun.get(run.agent_id) === run.id && (agents.find((a) => a.id === run.agent_id)?.running_jobs ?? 0) > 0;
-  const asked = runs.filter((r) => r.stop_requested_at);
-  const relevant = asked.filter((r) => !r.finished_at || leftJobs(r) || now - Date.parse(r.finished_at) < LINGER_MS);
-  if (!relevant.length) return [];
-  const start = Math.min(...relevant.map((r) => Date.parse(r.stop_requested_at!)));
-  return asked.filter((r) => !r.finished_at || Date.parse(r.finished_at) >= start).sort((a, b) => a.id - b.id);
+type Row = { key: string; agent: Agent | undefined; inTurn: boolean; busy: boolean };
+
+/** One row per agent: its latest turn that was asked to stop, while that stop still matters. A turn that
+ *  started after it means the agent works again. Its background jobs are stopped only while the project
+ *  rests (``resting``: a person's pause, "pause everything", the limit pause on this instance); otherwise they go on by design. */
+function currentStop(runs: Run[], agents: Agent[], now: number, resting: boolean): Row[] {
+  const sorted = [...runs].sort((a, b) => a.id - b.id);
+  const latestRun = new Map(sorted.map((r) => [r.agent_id, r.id]));
+  const asked = new Map(sorted.filter((r) => r.stop_requested_at).map((r) => [r.agent_id, r]));
+  return [...asked.values()].flatMap((run) => {
+    if (latestRun.get(run.agent_id) !== run.id) return [];
+    const agent = agents.find((a) => a.id === run.agent_id);
+    const inTurn = !run.finished_at;
+    const jobsStopping = resting && (agent?.running_jobs ?? 0) > 0;
+    if (!inTurn && !jobsStopping && now - Date.parse(run.finished_at!) >= LINGER_MS) return [];
+    return [{ key: `run-${run.id}`, agent, inTurn, busy: inTurn || jobsStopping }];
+  });
 }
 
 /** Live overview while agents wrap up after being asked to stop, including their background jobs. */
 export function StoppingAgents() {
   const { t } = useTranslation();
-  const { project, agents, agentById } = useShell();
-  const stop = currentStop(useRuns(project.id).data ?? [], agents, Date.now());
+  const { project, agents } = useShell();
+  const pausedAll = !!usePause().data?.paused;
+  // Before its limits, the jobs stop too where the project runs on this instance (#187).
+  const resting = !!project.paused_at || pausedAll || (!!project.limit_paused_at && !project.runner_id);
+  const stop = currentStop(useRuns(project.id).data ?? [], agents, Date.now(), resting);
   // Paused while idle: no turn was told to stop, but a job can still be running.
-  const pausedWithJobs = agents.filter((a) => !a.enabled && a.running_jobs > 0 && !stop.some((r) => r.agent_id === a.id));
+  const pausedWithJobs = agents.filter((a) => !a.enabled && a.running_jobs > 0 && !stop.some((r) => r.agent?.id === a.id));
   const [, tick] = useReducer((n: number) => n + 1, 0);
   const visible = stop.length + pausedWithJobs.length > 0;
 
@@ -36,13 +46,13 @@ export function StoppingAgents() {
   }, [visible]);
 
   if (!visible) return null;
-  const rows = [
-    ...stop.map((run) => ({ key: `run-${run.id}`, agent: agentById(run.agent_id), inTurn: !run.finished_at })),
-    ...pausedWithJobs.map((agent) => ({ key: `agent-${agent.id}`, agent, inTurn: false })),
-  ].map((row) => {
+  const rows = [...stop, ...pausedWithJobs.map((agent) => ({ key: `agent-${agent.id}`, agent, inTurn: false, busy: true }))].map((row) => {
     const jobs = row.agent?.running_jobs ?? 0;
-    const states = [...(row.inTurn ? [t("chat.stopping.working")] : []), ...(jobs > 0 ? [t("chat.jobsRunning", { count: jobs })] : [])];
-    return { ...row, busy: states.length > 0, state: states.join(" · ") || t(row.agent?.enabled ? "chat.stopping.stopped" : "chat.stopping.paused") };
+    const states = [
+      ...(row.inTurn ? [t("chat.stopping.working")] : row.busy ? [] : [t(row.agent?.enabled ? "chat.stopping.stopped" : "chat.stopping.paused")]),
+      ...(jobs > 0 ? [t("chat.jobsRunning", { count: jobs })] : []),
+    ];
+    return { ...row, state: states.join(" · ") };
   });
   const working = rows.filter((row) => row.busy).length;
 

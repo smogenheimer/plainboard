@@ -4,6 +4,7 @@ import os
 import subprocess
 import sys
 import time
+from pathlib import Path
 
 import pytest
 from plainboard_protocol import CleanupFolder, CleanupSpec, UnpushedSpec
@@ -211,7 +212,7 @@ def test_candidates_say_how_safe_each_is_and_delete_keeps_to_it(ws, tmp_path, mo
     assert [i.path for i in result.items] == [str(idle_agent / "repo" / "target")]
     assert busy_target.exists() and scratch.exists() and work.exists() and gone.exists() and (home / ".ssh").exists()
     assert f"{busy_target}: busy; force=true deletes it anyway" in result.skipped and f"{work}: kept, x has changes" in result.skipped
-    assert f"{home / '.ssh'}: not a cleanup candidate" in result.skipped
+    assert f"{home / '.ssh'}: not a cleanup candidate (list_cleanup shows what can go)" in result.skipped
 
     result = cleanup.delete(DeleteSpec(paths=asked, folders=folders, force=True))
     assert not busy_target.exists() and not scratch.exists()
@@ -286,3 +287,115 @@ def test_before_a_move_every_clone_says_what_of_its_work_is_on_no_remote(ws, tmp
     found = cleanup.unpushed_work(UnpushedSpec(folders=[str(clean.parent), str(folder), str(tmp_path / "outside"), str(ws)]))
     assert [(w.folder, w.repo) for w in found] == [(str(folder), "api")]
     assert found[0].problems == ["1 uncommitted change", "1 stash", "commits on no remote branch: feat/x (1)", "branches without upstream: spare"]
+
+
+def test_extra_work_folders_of_an_agent_are_offered_and_go_only_without_own_work(ws, tmp_path):
+    from plainboard_protocol import CandidatesSpec, DeleteSpec
+
+    folder = agent(ws, "dev")
+    repo = clone(tmp_path, folder)
+    git(repo, "worktree", "add", "-q", "-b", "feature", "../ws-b")  # a branch with unpushed commits: the main clone keeps it
+    (folder / "ws-b" / "f.rs").write_text("x")
+    git(folder / "ws-b", "add", ".")
+    git(folder / "ws-b", "commit", "-qm", "on a branch")
+    (folder / "ws-b" / "target").mkdir()
+    git(repo, "worktree", "add", "-q", "-b", "dirty", "../ws-c")
+    (folder / "ws-c" / "src.rs").write_text("changed")
+    git(repo, "worktree", "add", "-q", "--detach", "../ws-d")
+    (folder / "ws-d" / "g.rs").write_text("y")
+    git(folder / "ws-d", "add", ".")
+    git(folder / "ws-d", "commit", "-qm", "on no branch")
+    (folder / "notes").mkdir()
+    (folder / "notes" / "todo.txt").write_text("mine")
+    (folder / ".claude").mkdir()
+
+    folders = [CleanupFolder(path=str(folder), clones=["repo"])]
+    found = {os.path.relpath(c.path, folder): (c.what, c.safety, c.why) for c in cleanup.candidates(CandidatesSpec(folders=folders), sizes=False)}
+    assert found["ws-b"] == ("workdir", "safe", "")
+    assert found["ws-c"] == ("workdir", "keep", "ws-c has changes")
+    assert found["ws-d"] == ("workdir", "keep", "ws-d has commits on no branch")
+    assert found["notes"] == ("workdir", "unsure", "notes/todo.txt is not in a clone")
+    assert "repo" not in found and ".claude" not in found and found["repo/target"][0] == "build"
+    assert not any(c.what == "workdir" for c in cleanup.candidates(CandidatesSpec(folders=[CleanupFolder(path=str(folder))]), sizes=False))  # an app that sends no clones
+    busy = cleanup.candidates(CandidatesSpec(folders=[CleanupFolder(path=str(folder), clones=["repo"], busy=True)]), sizes=False)
+    assert next(c for c in busy if c.path == str(folder / "ws-b")).safety == "busy"
+
+    asked = [str(folder / n) for n in ("ws-b", "ws-c", "ws-d", "gone")]
+    result = cleanup.delete(DeleteSpec(paths=asked, folders=folders, force=True))
+    assert [(i.path, i.what) for i in result.items] == [(str(folder / "ws-b"), "workdir")]
+    assert f"{folder / 'ws-c'}: kept, ws-c has changes" in result.skipped and f"{folder / 'gone'}: gone already" in result.skipped
+    assert not (folder / "ws-b").exists() and (folder / "ws-c" / "src.rs").read_text() == "changed"
+    listed = subprocess.run(["git", "worktree", "list"], cwd=repo, capture_output=True, text=True).stdout
+    assert "ws-b" not in listed and "ws-c" in listed  # the main clone forgot the deleted worktree, and keeps its branch
+    assert subprocess.run(["git", "rev-parse", "--verify", "-q", "feature"], cwd=repo, capture_output=True).returncode == 0
+
+
+def test_temp_leftovers_go_only_when_nothing_in_them_changed_for_days_and_nobody_works_there(tmp_path, monkeypatch):
+    tmp = tmp_path / "tmp"
+    old = time.time() - 5 * DAY
+    for name in ("old-dir", "busy-dir", "fresh-dir", "plainboard-signins", ".X11-unix"):
+        (tmp / name).mkdir(parents=True)
+        (tmp / name / "f").write_text("x")
+    (tmp / "old-file.log").write_text("x")
+    (tmp / "fresh-dir" / "new").write_text("x")
+    for path in [*tmp.rglob("*"), tmp]:
+        if path.name != "new":
+            os.utime(path, (old, old))
+    monkeypatch.setattr(cleanup, "_cwds", lambda: {str(tmp / "busy-dir")})
+    assert [p.name for p in cleanup.tmp_leftovers(time.time() - 3 * DAY, tmp)] == ["old-dir", "old-file.log"]
+
+
+def test_sizes_kept_but_measured_again_where_a_cleanup_touched(monkeypatch):
+    measured = []
+    monkeypatch.setattr(cleanup, "_survey", lambda paths: measured.extend(paths) or {p: (1, 0.0) for p in paths})
+    cleanup.forget_sizes()
+    a, b, c = Path("/w/a"), Path("/w/a/target"), Path("/w/b")
+    cleanup._measure([a, b, c])
+    cleanup._measure([a, b, c])
+    assert measured == [a, c, b]  # kept (a folder and one in it in separate walks)
+    cleanup.forget_sizes(["/w/a/target/debug"])
+    cleanup._measure([a, b, c])
+    assert measured == [a, c, b, a, b]  # what holds the deleted path, not the rest
+    assert cleanup._measured[str(c)] <= cleanup._measured[str(a)]
+
+
+def test_folders_in_a_home_folder_are_offered_one_by_one_with_their_build_outputs(ws, tmp_path, monkeypatch):
+    from plainboard_protocol import SCRATCH, CandidatesSpec, DeleteSpec
+
+    home = tmp_path / "home"
+    scratch = home / "scratch"
+    (scratch / "k483").mkdir(parents=True)
+    (scratch / "k483" / "notes.md").write_text("findings")
+    clone(tmp_path, scratch / "k483", "rel")
+    for tagged in (scratch / "hil" / "target-pf7", scratch / "a88-fp-target"):  # cargo's target, whatever it is called
+        tagged.mkdir(parents=True)
+        (tagged / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n")
+        (tagged / "blob").write_bytes(os.urandom(5000))
+    (scratch / "hil" / "run.sh").write_text("cargo build\n")
+    dev = agent(ws, "dev")
+    clone(tmp_path, dev)
+    (dev / SCRATCH / "target-x").mkdir(parents=True)
+    (dev / SCRATCH / "target-x" / "CACHEDIR.TAG").write_text("Signature: 8a477f597d28d172789f06886806bc55\n")
+    monkeypatch.setattr(cleanup, "_sizes", {})
+    monkeypatch.setattr(cleanup, "_home_agents", lambda home: [(str(scratch / "k483" / "rel"), 7)])
+
+    folders = [CleanupFolder(path=str(dev), clones=["repo"])]
+    found = {os.path.relpath(c.path, tmp_path): c for c in cleanup.candidates(CandidatesSpec(folders=folders))}
+    safety = {p: (c.what, c.safety, c.why) for p, c in found.items()}
+    assert safety["home/scratch"][0] == "home" and not found["home/scratch"].parent
+    assert safety["home/scratch/k483"] == ("home", "unsure", "k483/notes.md is not in a clone")
+    assert found["home/scratch/k483"].parent == str(scratch) and found["home/scratch/k483"].agents == [7]
+    assert safety["home/scratch/k483/rel/target"] == ("build", "safe", "") and found["home/scratch/k483/rel/target"].parent == str(scratch)
+    assert safety["home/scratch/hil/target-pf7"] == ("build", "safe", "")
+    assert safety["home/scratch/a88-fp-target"] == ("home", "safe", "") and found["home/scratch/a88-fp-target"].bytes > 0
+    assert sum(1 for p in found if p == "home/scratch/a88-fp-target") == 1  # not as a build output too
+    assert safety[f"ws/p/dev/{SCRATCH}"][0] == "workdir" and safety[f"ws/p/dev/{SCRATCH}/target-x"] == ("build", "safe", "")
+
+    result = cleanup.delete(DeleteSpec(paths=[str(scratch / "hil" / "target-pf7"), str(scratch / "k483")], folders=folders))
+    assert [i.path for i in result.items] == [str(scratch / "hil" / "target-pf7")]
+    assert (scratch / "hil" / "run.sh").exists() and (scratch / "k483" / "notes.md").exists()
+
+
+def test_nested_paths_are_measured_in_separate_walks():
+    a, b, c, d = map(cleanup.Path, ("/h/s", "/h/s/k", "/h/s/k/t", "/h/w"))
+    assert cleanup._layers([c, a, b, d]) == [[a, d], [b], [c]]

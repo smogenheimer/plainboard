@@ -3,7 +3,7 @@ from __future__ import annotations
 import os
 import tempfile
 
-from fastapi import APIRouter, File, Form, Query, UploadFile
+from fastapi import APIRouter, File, Form, Query, Request, UploadFile
 from fastapi.responses import FileResponse
 from plainboard_protocol import ProviderInfo
 from sqlalchemy import select
@@ -151,6 +151,16 @@ async def pause_project(project_id: int, session: Session, runs: Runs, who: Who)
 async def resume_project(project_id: int, session: Session, runs: Runs, who: Who) -> ProjectOut:
     project = await project_service.get(session, project_id)
     await runs.resume_project(session, project)
+    return project_service.to_out(project, await user_service.role_in(session, who.user, project_id) if who.user else None)
+
+
+@router.post("/projects/{project_id}/limit-check", response_model=ProjectOut)
+async def check_limit_pause(project_id: int, request: Request, session: Session, who: Who) -> ProjectOut:
+    """Read the subscriptions' limits now: a project paused before its limits goes on at once if one has room again."""
+    await project_service.get(session, project_id)
+    await request.app.state.limit_pause.recheck()
+    session.expire_all()
+    project = await project_service.get(session, project_id)
     return project_service.to_out(project, await user_service.role_in(session, who.user, project_id) if who.user else None)
 
 

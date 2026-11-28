@@ -1,10 +1,12 @@
 import { useMutation, useQueryClient } from "@tanstack/react-query";
 import { PauseCircle } from "lucide-react";
+import { useEffect } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../api/client";
 import { qk } from "../../api/queries";
 import type { Project } from "../../api/types";
 import { ErrorText, Toggle } from "../../components/ui";
+import { whenAhead } from "../../lib/format";
 
 /** Pause or resume one project. Paused, nothing of it starts until a person resumes it here.
  *  The switch flips at once; if the request fails, it flips back and the error is shown. */
@@ -33,7 +35,16 @@ const since = (iso: string) => new Date(iso).toLocaleString([], { dateStyle: "me
 function useLimitPause(project: Project): string {
   const { t } = useTranslation();
   if (!project.limit_paused_at) return "";
-  return project.limit_resumes_at ? t("projects.limitPaused", { when: since(project.limit_resumes_at) }) : t("projects.limitPausedUnknown");
+  return project.limit_resumes_at ? t("projects.limitPaused", { when: whenAhead(project.limit_resumes_at) }) : t("projects.limitPausedUnknown");
+}
+
+/** Read the subscriptions' limits now: a plan topped up ends PlainBoard's pause at once, not with its next reading. */
+function useLimitCheck(project: Project) {
+  const qc = useQueryClient();
+  return useMutation({
+    mutationFn: () => api.post<Project>(`/projects/${project.id}/limit-check`),
+    onSuccess: (fresh) => qc.setQueryData<Project[]>(qk.projects, (list) => list?.map((p) => (p.id === fresh.id ? { ...p, ...fresh } : p))),
+  });
 }
 
 /** The switch in the project's settings, with what it means. */
@@ -59,11 +70,28 @@ export function ProjectPauseBanner({ project, isOwner }: { project: Project; isO
   const { t } = useTranslation();
   const turn = usePauseSwitch(project);
   const limited = useLimitPause(project);
+  const check = useLimitCheck(project);
+  const { mutate: checkNow } = check;
+  const mayCheck = project.role !== "viewer";
+  const limitPaused = !!project.limit_paused_at;
+  // Opened while paused for its limits: read them at once, the plan may have been topped up since.
+  useEffect(() => {
+    if (limitPaused && mayCheck) checkNow();
+  }, [project.id, limitPaused, mayCheck, checkNow]);
   if (!project.paused_at && limited) {
     return (
-      <div role="status" className="flex shrink-0 items-center gap-3 border-b border-line bg-you-bg px-4 py-1.5 text-you-fg">
+      <div role="status" className="flex shrink-0 flex-wrap items-center gap-x-3 gap-y-1 border-b border-line bg-you-bg px-4 py-1.5 text-you-fg">
         <PauseCircle className="size-4 shrink-0" />
-        <span className="min-w-0 flex-1">{limited}</span>
+        <span className="min-w-0 flex-1 basis-48">
+          {limited}
+          {check.isSuccess && !check.isPending && ` ${t("projects.limitStill")}`}
+        </span>
+        {mayCheck && (
+          <button type="button" disabled={check.isPending} onClick={() => checkNow()} className="shrink-0 font-semibold underline underline-offset-[3px] hover:decoration-2 disabled:opacity-60">
+            {check.isPending ? t("projects.limitChecking") : t("projects.limitCheck")}
+          </button>
+        )}
+        <ErrorText error={check.error} />
       </div>
     );
   }

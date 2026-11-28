@@ -57,6 +57,7 @@ from plainboard_protocol import (
 from .. import codex_cli, notices, signins
 from ..config import TOOL_RESULT_PREVIEW_CHARS
 from ..mcp_stdio import BRIDGE_FILE_ENV, write_bridge_file
+from ..read_only import allowed as read_only_command
 from ..signins import SIGN_INS
 from ..tool_bridge import ToolBridge
 from ..workspace import tool_env
@@ -215,6 +216,7 @@ def run_config(spec: RunSpec, bridge_file: Path) -> dict[str, Any]:
         "args": ["-m", "plainboard_runner.mcp_stdio"],
         "env": {BRIDGE_FILE_ENV: str(bridge_file)},
         "startup_timeout_sec": 30,
+        "required": True,  # the first step waits for the board's tools, which would otherwise come one step late
         "tool_timeout_sec": TOOL_TIMEOUT_SECONDS,
     }
     config: dict[str, Any] = {
@@ -357,13 +359,17 @@ class AppServer:
         return await asyncio.wait_for(self._messages.get(), timeout)
 
 
-async def answer_server_request(server: AppServer, message: dict[str, Any]) -> None:
-    """Approve whatever Codex asks: agents have full control of the runner, like Claude's bypass mode."""
+async def answer_server_request(server: AppServer, message: dict[str, Any], read_only: bool = False) -> None:
+    """Approve whatever Codex asks: agents have full control of the runner, like Claude's bypass mode. A turn
+    that only reads (toolset "read") runs only the commands that just read (read_only.py) and changes no file."""
     method = message.get("method")
+    command = (message.get("params") or {}).get("command") or ""
     if method in ("item/commandExecution/requestApproval", "item/fileChange/requestApproval"):
-        await server.respond(message["id"], {"decision": "accept"})
+        ok = not read_only or method == "item/commandExecution/requestApproval" and read_only_command(command)
+        await server.respond(message["id"], {"decision": "accept" if ok else "decline"})
     elif method in ("execCommandApproval", "applyPatchApproval"):
-        await server.respond(message["id"], {"decision": "approved"})
+        ok = not read_only or method == "execCommandApproval" and read_only_command(command)
+        await server.respond(message["id"], {"decision": "approved" if ok else "denied"})
     elif method == "mcpServer/elicitation/request":
         await server.respond(message["id"], {"action": "decline"})
     elif method == "item/tool/requestUserInput":
@@ -549,7 +555,7 @@ class TurnRunner:
                 if message is None:
                     raise CodexError(f"Codex exited during the turn\n{self.server.stderr()}".strip())
                 if "id" in message:
-                    await answer_server_request(self.server, message)
+                    await answer_server_request(self.server, message, read_only=self.spec.toolset == "read")
                     continue
                 method, payload = message.get("method", ""), message.get("params") or {}
                 for event in self.mapper.map(method, payload):
@@ -709,7 +715,7 @@ class CodexProvider(Provider):
 
     async def _run(self, spec: RunSpec, bridge: ToolBridge, home: Path) -> AsyncIterator[RunEvent]:
         bridge_file = BRIDGE_DIR / f"{uuid.uuid4().hex}.json"
-        write_bridge_file(bridge_file, spec.bridge, bridge.workspace)
+        write_bridge_file(bridge_file, spec.bridge, bridge.workspace, read_only=spec.toolset in ("read", "none"))
         env = {**tool_env(spec.credentials), **spec.env}
         server = AppServer(home, env=env, config=run_config(spec, bridge_file), cwd=bridge.workspace)
         try:
@@ -717,9 +723,11 @@ class CodexProvider(Provider):
                 thread = {
                     "cwd": str(bridge.workspace),
                     "model": spec.model,
-                    # The runner container is the sandbox; a question (toolset "read") only reads.
-                    "sandbox": "read-only" if spec.toolset in ("read", "none") else "danger-full-access",
-                    "approvalPolicy": "never",
+                    # The runner container is the sandbox. Codex' own one (bubblewrap) cannot start in a container: a
+                    # question (toolset "read") asks for every command, and only those that just read are approved
+                    # (answer_server_request).
+                    "sandbox": "read-only" if spec.toolset == "none" else "danger-full-access",
+                    "approvalPolicy": "untrusted" if spec.toolset == "read" else "never",
                     "developerInstructions": spec.system_prompt,
                 }
                 if spec.resume_session_id:

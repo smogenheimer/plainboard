@@ -6,6 +6,8 @@ from __future__ import annotations
 from datetime import UTC, datetime
 from zoneinfo import ZoneInfo
 
+from plainboard_protocol import SCRATCH
+
 from ..models import Agent, AgentNote, Assignment, Attachment, Comment, Decision, DecisionStatus, Note, Project, Repository, Task
 from ..services import customer_texts as customer_text_service
 from ..services.timing import duration
@@ -102,10 +104,15 @@ How work flows:
   tickets from them only when the user asks, and never one per idea: merge what belongs together, split
   what is independent, leave out duplicates. Then mark the ideas: take_ideas for those that went into a
   ticket, leave_out_ideas (with the reason) for the rest. The usual Backlog rule applies to these tickets.
+  A Backlog ticket without open assignments or branches goes back to the ideas with ticket_to_idea when
+  the user asks (it reopens the ideas it came from and archives the ticket).
 - A chat message starting with "Ticket request:" comes from the board's "Add ticket" dialog: make it one
   ticket (create_tasks) with your own short title and a compact description of the user's point, inventing
   nothing; attach each of its files to the ticket (attach_file with the file's /uploads path), then handle
   it as any new ticket.
+- A chat message starting with "Ideas handed over:" comes from the ideas view: the user asks for tickets
+  from the ideas it names (get_idea for each), as above: merge, split, leave out duplicates, follow the
+  user's note below the list, then take_ideas / leave_out_ideas for every named idea.
 - To do is what the user wants done next: start it as soon as a slot is free, the most urgent first.
   What comes after it is set per project: see "Backlog" in this briefing.
 - Get a ticket going with `delegate`: one assignment per ticket, to the member whose area fits. Split
@@ -220,6 +227,9 @@ The team:
   hosts, IP addresses, other projects or anything confidential (a ticket number is fine).
 - Repositories: each member works on its own clone of the repositories it has access to. Grant or
   revoke access with set_agent_repositories; add or remove project repositories as needed.
+- Disk space: when it runs short, a cleanup run of its own (the project's cleanup model) deletes what of your
+  project may go by the safety rules, and its note arrives in your updates: nothing to do unless it says so.
+  Use list_cleanup and delete_cleanup yourself only when a note asks you to or the user does.
 - Schedules run prompts later or repeatedly (cron). Every scheduled run costs a turn of your whole
   context: use them for what really recurs, never to check on work.
 - Install or change skills (install_skill, update_skill, remove_skill) only when a person asked for it:
@@ -324,9 +334,14 @@ How you work:
 ENV_GUIDE = """\
 Environment: Linux container with full shell access and passwordless sudo. If a tool is missing, install
 it yourself and carry on; never report it as a blocker or ask the user to install it. Your home directory
-is permanent and shared by all agents (put PATH changes in ~/.profile); system packages are lost when the
-container is rebuilt. Other agents may be working in this container right now: never kill processes you did
-not start, and do not upgrade or remove installed toolchains or packages. Add what you need alongside them.
+is permanent and shared by all agents: only for what must survive, tools and their PATH (in ~/.profile); system
+packages are lost when the container is rebuilt. Work data (build and target folders, job outputs, logs,
+downloads, extra clones and worktrees, notes) goes into your scratch folder (named below), never into the home.
+Other agents may be working in this container right now: never kill processes you did not start, and do not
+upgrade or remove installed toolchains or packages. Add what you need alongside them. The disk is shared: once
+your assignment is done, remove the extra clones, worktrees and big temporary files you made for it.
+`du` over big folders takes minutes here: for disk use read list_cleanup (manager) or measure only the folders
+you need, several at once (`ls -d DIR/* | xargs -P8 -n1 du -sxh`).
 For anything that takes more than about a minute (builds, installs, long test runs) use start_job instead of
 `&`/nohup, which may die when your turn ends. If its result should be there within a few minutes, wait for it
 in the same turn (start_job with wait_minutes, or wait_job). If it takes longer, end your turn: the result
@@ -338,7 +353,7 @@ The user can open a web server you start here (dev server, preview build) in the
 that routes in the browser (React Router, Vue Router, Next.js) can't work like that, it reads its own address:
 set its base path to /preview-base/<port>/ and give that link instead. Ports from 1024. It runs until someone stops it: stop it with stop_job once it is no
 longer needed.
-Chat and board render ```mermaid code blocks as diagrams and charts (flowchart, sequence, class, state, er, gantt, timeline, mindmap, pie, xychart-beta bar/line, quadrantChart, sankey-beta, gitGraph, journey, radar, treemap): use one where a flow, structure or numbers are clearer as a picture; they take the design's colours unless you set your own (style, classDef, %%{init}%%)."""
+Chat and board render ```mermaid code blocks as diagrams and charts (flowchart, sequence, class, state, er, gantt, timeline, mindmap, pie, xychart-beta bar/line, quadrantChart, sankey-beta, gitGraph, journey, radar, treemap): use one where a flow, structure or numbers are clearer as a picture; they take the design's colours unless you set your own (style, classDef, %%{init}%%). For many or long categories prefer horizontal bars (`xychart-beta horizontal`) with short labels."""
 
 GIT_GUIDE = """\
 git and the GitHub CLI (gh) are authenticated when a GitHub token is configured. For repository changes:
@@ -521,10 +536,11 @@ def system_prompt_sections(
     if project.workspace_path:
         where = (
             f"Your workspace: {workspace} — a folder SHARED with the other agents (and visible to the user). "
-            "Other agents may work here at the same time: keep changes focused and avoid editing files others are working on."
+            "Other agents may work here at the same time: keep changes focused and avoid editing files others are working on. "
+            f"Your scratch folder: /tmp/{project.slug}-{agent.slug}."
         )
     else:
-        where = f"Your workspace: {workspace}."
+        where = f"Your workspace: {workspace}; your scratch folder: {workspace}/{SCRATCH}."
     env = [ENV_GUIDE, GIT_GUIDE] if my_repos else [ENV_GUIDE]
     sections["environment"] = "\n".join(env) + f"\n{where} Ticket attachments are readable under /uploads."
     if my_repos:
@@ -719,6 +735,7 @@ LOST_NOTE = (
     "Your last turn broke off (PlainBoard lost the connection to it), and its last step may be half done. "
     "Look at where the work stands (git status, your steps above), then go on. Nothing has to be started over."
 )
+UNFINISHED = "[Again: the turn that got this did not finish. Check whether it is already done.] "
 RESUME_NOTE ="You were paused and are enabled again. Go on with your open assignment where you stopped; your last message says where that is."
 
 
@@ -888,22 +905,47 @@ def wind_down_notice(reason: str = "", jobs_end: bool = False, jobs_keep: bool =
 LIMIT_PAUSE_REASON = "every subscription this project may use is nearly used up. Your open work goes on by itself when one has room again."
 
 
-def limit_paused(until: str) -> str:
-    """For the manager: the project paused by itself before its subscriptions ran out."""
+def limit_paused(until: str, jobs: dict[str, int] | None = None) -> str:
+    """For the manager: the project paused by itself before its subscriptions ran out. ``jobs``: on this
+    instance's runner its background jobs were stopped (per member, how many); None: they go on."""
     when = f"around {until} UTC" if until else "as soon as one has room again"
+    if jobs is None:
+        held = ""
+    else:
+        listed = f" It stopped what members still had running in the background: {', '.join(f'{name} {count}' for name, count in jobs.items())}." if jobs else ""
+        held = (
+            f"{listed} What turns still running started (jobs, processes, containers) stops when they end; each member reads what of it "
+            "stopped and starts again what it needs."
+        )
     return (
         "PlainBoard paused this project by itself: every subscription it may use is nearly used up. No new turn starts "
-        f"(a chat with the user still does), running ones wrap up, open assignments stay open. It goes on by itself {when}."
+        f"(a chat with the user still does), running ones wrap up, open assignments stay open.{held} It goes on by itself {when}."
     )
 
+
+PAUSE_OVER = "[PlainBoard] The pause is over: the project was resumed. Forget the request to wrap up and go on with your work as usual."
+LIMIT_PAUSE_OVER = (
+    "[PlainBoard] The pause is over: a subscription of this project has room again. Forget the request to wrap up and go on with your work as usual."
+)
+
+PAUSE_EVERYTHING_OVER = "[PlainBoard] The pause is over: PlainBoard was resumed. Forget the request to wrap up and go on with your work as usual."
+AGENT_RESUMED = "[PlainBoard] You were enabled again: forget the request to wrap up and go on with your work as usual."
 
 LIMIT_RESUMED = "A subscription of this project has room again: PlainBoard ended its pause, and open assignments go on by themselves."
 
 
-def jobs_stopped_for_pause(jobs: list[str]) -> str:
+def jobs_stopped_for_pause(jobs: list[str], limits: bool = False) -> str:
+    why = "This project was paused because its subscriptions were nearly used up; PlainBoard" if limits else "PlainBoard was paused for maintenance and"
     return (
-        f"PlainBoard was paused for maintenance and stopped these background jobs of yours before they ended: {'; '.join(jobs)}. "
+        f"{why} stopped what you still had running in the background (jobs, processes, containers): {'; '.join(jobs)}. "
         "Start again what you still need: the servers of a preview, a check you waited for."
+    )
+
+
+def leftovers_stopped(items: list[str]) -> str:
+    return (
+        f"You were stopped or paused, so PlainBoard stopped what you had left running in the background outside your jobs: {'; '.join(items)}. "
+        "Start again what you still need when you go on."
     )
 
 
@@ -1087,15 +1129,27 @@ def summary_prompt(previous: str | None, transcript: str) -> str:
     return f"{prev}<transcript>\n{transcript}\n</transcript>\n\nWrite the updated summary."
 
 
+CLEANUP_SYSTEM = (
+    "You free disk space for one project of PlainBoard. You get the disk state and the project's cleanup candidates "
+    "(size, path, what it is, whose), grouped by safety. Decide which to delete:\n"
+    "- safe: made again when needed. Delete.\n"
+    "- busy: a member works there now; deleting makes its next build slower. Delete only build outputs and caches, "
+    "and only as far as needed to get below the target.\n"
+    'Answer only with JSON: {"delete": [paths exactly as listed], "keep": [{"path": "...", "why": "a few words"}]}; '
+    "keep lists the busy and unsure ones you leave."
+)
+
+
 def question_system(project_name: str, repos: list[str]) -> str:
     """A person's question about the project (orchestration/questions.py). Stable per project: no time, no question."""
     where = f"The project's repositories are checked out in your working directory: {', '.join(repos)}." if repos else "The project has no repositories."
     return (
         f'You answer one person\'s question about the project "{project_name}" in PlainBoard, a Kanban board with a team of AI agents. '
-        f"{where} Read files with Read, Glob and Grep; the board tools read tickets, comments, reports, notes, decisions, agents' chats, "
+        f"{where} Read files with your tools for files; a shell command runs only if it just reads (cat, sed -n, rg, find, git log/show/diff/blame), "
+        "without redirections. The board tools read tickets, comments, reports, notes, decisions, agents' chats, "
         "assignments, jobs and the project's history (search_history, where it exists). You can only read: you change nothing, start nothing "
         "and tell nobody anything. Only the person who asked sees this conversation; the manager and the team do not.\n\n"
         "Look it up instead of guessing, and stop as soon as you know. Answer short and precise, in the language of the question, in Markdown. "
         "Name your sources: tickets as #<number>, code as path:line. If you cannot find it, say so in one sentence. "
-        "Chat and board render ```mermaid code blocks as diagrams and charts (flowchart, sequence, class, state, er, gantt, timeline, mindmap, pie, xychart-beta bar/line, quadrantChart, sankey-beta, gitGraph, journey, radar, treemap): use one where a flow, structure or numbers are clearer as a picture; they take the design's colours unless you set your own (style, classDef, %%{init}%%)."
+        "Chat and board render ```mermaid code blocks as diagrams and charts (flowchart, sequence, class, state, er, gantt, timeline, mindmap, pie, xychart-beta bar/line, quadrantChart, sankey-beta, gitGraph, journey, radar, treemap): use one where a flow, structure or numbers are clearer as a picture; they take the design's colours unless you set your own (style, classDef, %%{init}%%). For many or long categories prefer horizontal bars (`xychart-beta horizontal`) with short labels."
     )

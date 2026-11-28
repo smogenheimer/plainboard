@@ -7,7 +7,7 @@ import { AppWindow, Check, Copy } from "lucide-react";
 import { useTranslation } from "react-i18next";
 import { useShell } from "../features/layout/shell-context";
 import { browserAddress } from "../lib/preview";
-import { isVideoName } from "../lib/media";
+import { isVideoName, previewSrc } from "../lib/media";
 import { Lightbox } from "./Lightbox";
 import { VideoThumb } from "./VideoThumb";
 import { linkMentions, MentionChip, usePeopleMap } from "./Mentions";
@@ -145,7 +145,7 @@ function ZoomableImage({ src, alt }: { src: string; alt: string }) {
             <VideoThumb src={src} />
           </span>
         ) : (
-          <img src={src} alt={alt} className="max-h-80 max-w-full rounded-sm" />
+          <img src={previewSrc(src, 800)} alt={alt} loading="lazy" decoding="async" className="max-h-80 max-w-full rounded-sm" />
         )}
       </button>
       {open && <Lightbox images={[{ src, alt, video }]} onClose={() => setOpen(false)} />}

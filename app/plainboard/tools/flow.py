@@ -156,6 +156,7 @@ async def merge_when_green(ctx: ToolContext, args: MergeWhenGreenArgs) -> str:
         task_id=task_id, repository=repo.name, branch=branch, head=head, status=str(landing.status), quick_check=quick.strip(), again=before is not None,
         carries=[c.branch for c in carried], land_first=repo.land_first,
     )  # fmt: skip
+    ctx.runs.wake_landing(repo.id)  # a train that may leave now does not wait for the next tick
     base = repo.default_branch or "the base branch"
     if landing_service.held(landing):
         why = (

@@ -66,6 +66,7 @@ from plainboard_protocol import (
 from .. import notices, signins
 from ..config import TOOL_RESULT_PREVIEW_CHARS
 from ..signins import SIGN_INS
+from ..read_only import allowed as read_only_command
 from ..tool_bridge import ToolBridge
 from ..workspace import tool_env
 from .base import Provider, ProviderError, merge_efforts
@@ -74,7 +75,10 @@ log = logging.getLogger(__name__)
 
 MCP_SERVER_NAME = "plainboard"
 BOARD_TOOLSET_BUILTINS = ["Read", "Glob", "Grep", "Bash", "Edit", "Write"]
-READ_TOOLSET_BUILTINS = ["Read", "Glob", "Grep"]  # a question about the project (app questions.py): nothing that changes anything
+# A question about the project (app questions.py): nothing that changes anything. Bash runs only commands that
+# just read (git log, read_only.py), checked by read_only_hook.
+READ_TOOLSET_BUILTINS = ["Read", "Glob", "Grep", "Bash"]
+READ_ONLY_REFUSED = "Refused: here only commands that just read may run (cat, sed -n, rg, find, git log/show/diff...), without redirections."
 # Interactive tools make no sense for headless agents; they talk back via chat or the board. Plan mode
 # waits for an approval nobody gives. The CLI's own todo list would compete with the PlainBoard task
 # list, which is the one the user and the manager see. Monitor waits for a process of its own: a turn
@@ -389,6 +393,13 @@ def build_mcp_server(bridge: ToolBridge):
     return server
 
 
+async def read_only_hook(hook_input: Any, _tool_use_id: str | None, _context: Any) -> dict[str, Any]:
+    """A question's Bash: only commands that just read."""
+    if hook_input.get("tool_name") == "Bash" and not read_only_command(str((hook_input.get("tool_input") or {}).get("command") or "")):
+        return {"hookSpecificOutput": {"hookEventName": "PreToolUse", "permissionDecision": "deny", "permissionDecisionReason": READ_ONLY_REFUSED}}
+    return {}
+
+
 class ToolTimer:
     """Measures tool calls, so that a slow one can tell the agent how long it took."""
 
@@ -467,42 +478,101 @@ def session_file(cwd: str | Path, session_id: str) -> Path:
     return Path.home() / ".claude" / "projects" / re.sub(r"[^a-zA-Z0-9]", "-", str(cwd)) / f"{session_id}.jsonl"
 
 
-# The windows Claude Code reads from the headers of every model response (unifiedWindows): a response
-# lists each of them the plan has, so one it leaves out is gone (Ultra has no 5-hour window). Windows
-# for certain models come only with requests that touch them.
-HEADER_WINDOWS = ["five_hour", "seven_day", "seven_day_overage_included", "overage"]
-# The windows of Claude Code's usage answer, each of them null where the plan has none.
+# The windows Claude Code reads from the headers of every model response (unifiedWindows): five_hour and
+# seven_day come with every response of a plan that has them, so one a response leaves out is gone (Ultra
+# has no 5-hour window). The weekly window of the models outside the plan's weekly limit
+# (seven_day_overage_included, which Claude Code calls the "Fable limit") comes only for some accounts, and
+# the usage answer reports it as well: a response without it says nothing about it.
+HEADER_WINDOWS = ["five_hour", "seven_day"]
+# Windows under a name of their own here: Claude Code's name, and the model the window is for.
+RENAMED = {"seven_day_overage_included": ("seven_day_fable", "Fable")}
+MODEL_WINDOWS = {"seven_day_opus": "Opus", "seven_day_sonnet": "Sonnet", "seven_day_fable": "Fable"}
+# The windows of Claude Code's usage answer, each of them null where the plan has none. It also passes
+# on the usage endpoint's rows (``limits``) and the weekly windows for certain models (``model_scoped``).
 USAGE_WINDOWS = ["five_hour", "seven_day", "seven_day_opus", "seven_day_sonnet"]
+# The usage rows' kinds by window name; a weekly row for a model is "seven_day_<model>", another kind keeps its own name.
+ROW_KINDS = {"session": "five_hour", "weekly_all": "seven_day"}
+SKIPPED_ROWS = {"spend"}  # extra usage paid for, no plan limit
+
+
+def _window(name: str, utilization: float, resets_at: int | None = None, status: str | None = None) -> LimitWindow:
+    name, model = RENAMED.get(name, (name, MODEL_WINDOWS.get(name)))
+    return LimitWindow(name=name, utilization=utilization, resets_at=resets_at, status=status, model=model)
 
 
 def limit_covers(info: RateLimitInfo) -> list[str]:
-    """The windows a rate limit event speaks for in full (LimitsEvent.covers)."""
-    return list(HEADER_WINDOWS) if info.raw.get("unifiedWindows") else []
+    """The windows a rate limit event speaks for in full (LimitsEvent.covers). The old name of the
+    Fable window is never reported again, so a report forgets what was stored under it."""
+    return [*HEADER_WINDOWS, "seven_day_overage_included"] if info.raw.get("unifiedWindows") else []
 
 
 def limit_windows(info: RateLimitInfo) -> list[LimitWindow]:
     """The plan's limit windows. Only the window that changed may be known, usually the one getting tight."""
     windows = {
-        name: LimitWindow(name=name, utilization=window["utilization"], resets_at=window.get("resetsAt"), status=window.get("status"))
-        for name, window in (info.raw.get("unifiedWindows") or {}).items()
+        w.name: w
+        for w in (_window(name, window["utilization"], window.get("resetsAt"), window.get("status")) for name, window in (info.raw.get("unifiedWindows") or {}).items())
     }
     kind = info.rate_limit_type
     known = info.utilization is not None or info.status == "rejected"
-    if kind and kind != "overage" and kind not in windows and known:
+    if kind and kind != "overage" and known:
         used = info.utilization if info.utilization is not None else 1.0
-        windows[kind] = LimitWindow(name=kind, utilization=used, resets_at=info.resets_at, status=info.status)
+        window = _window(kind, used, info.resets_at, info.status)
+        windows.setdefault(window.name, window)
     return list(windows.values())
 
 
+def _model_slug(display_name: str) -> str:
+    """"Fable 5.1" -> "fable": the model family, as model ids name it."""
+    found = re.search(r"[a-z]+", display_name.lower())
+    return found[0] if found else ""
+
+
+def _unix(resets: Any) -> int | None:
+    if isinstance(resets, int | float):
+        return int(resets)
+    try:
+        return int(datetime.fromisoformat(str(resets).replace("Z", "+00:00")).timestamp()) if resets else None
+    except ValueError:
+        return None
+
+
+def _percent(value: Any) -> float | None:
+    return value / 100 if isinstance(value, int | float) and not isinstance(value, bool) else None
+
+
+def _row_window(row: Any) -> LimitWindow | None:
+    """A window from one of the usage endpoint's rows: {"kind", "group", "percent", "resets_at", "scope"}.
+    A row of a kind not known here keeps its kind as its name; a row for another product (a surface) and
+    extra usage paid for are no limit of Claude Code's."""
+    if not isinstance(row, dict) or (used := _percent(row.get("percent"))) is None:
+        return None
+    kind = re.sub(r"[^a-z0-9]+", "_", str(row.get("kind") or "").lower()).strip("_")
+    scope = row.get("scope") or {}
+    model = str((scope.get("model") or {}).get("display_name") or "") if isinstance(scope, dict) else ""
+    if not kind or kind in SKIPPED_ROWS or (isinstance(scope, dict) and scope.get("surface") and not model):
+        return None
+    if model and (slug := _model_slug(model)):
+        name = f"seven_day_{slug}" if kind == "weekly_scoped" else f"{kind}_{slug}"
+    else:
+        name, model = ROW_KINDS.get(kind, kind), ""
+    return LimitWindow(name=name, utilization=used, resets_at=_unix(row.get("resets_at")), model=model or MODEL_WINDOWS.get(name))
+
+
 def usage_windows(rate_limits: dict[str, Any] | None) -> list[LimitWindow]:
-    """Limit windows from Claude Code's usage answer, which has percentages and ISO dates."""
-    windows = []
+    """Limit windows from Claude Code's usage answer, which has percentages and ISO dates: its named
+    windows, then the endpoint's rows and the weekly windows for certain models for what those leave out."""
+    rate_limits = rate_limits if isinstance(rate_limits, dict) else {}
+    windows: dict[str, LimitWindow] = {}
     for name in USAGE_WINDOWS:
-        window = (rate_limits or {}).get(name) or {}
-        if window.get("utilization") is not None:
-            resets = window.get("resets_at")
-            windows.append(LimitWindow(name=name, utilization=window["utilization"] / 100, resets_at=int(datetime.fromisoformat(resets).timestamp()) if resets else None))
-    return windows
+        window = rate_limits.get(name) or {}
+        if (used := _percent(window.get("utilization"))) is not None:
+            windows[name] = _window(name, used, _unix(window.get("resets_at")))
+    rows = [r for r in rate_limits.get("limits") or [] if isinstance(r, dict)]
+    rows += [{"kind": "weekly_scoped", "percent": m.get("utilization"), "resets_at": m.get("resets_at"), "scope": {"model": {"display_name": m.get("display_name")}}} for m in rate_limits.get("model_scoped") or [] if isinstance(m, dict)]
+    for row in rows:
+        if (window := _row_window(row)) is not None:
+            windows.setdefault(window.name, window)
+    return list(windows.values())
 
 
 def _reset_time(text: str, now: datetime) -> int | None:
@@ -532,9 +602,10 @@ def limit_hit(error: str | None, now: datetime | None = None) -> LimitWindow | N
     if not error or not (found := LIMIT_HIT.search(error)):
         return None
     kind = (found["kind"] or "").lower()
-    name = "five_hour" if "5-hour" in kind or "five" in kind else "seven_day_opus" if "opus" in kind else "seven_day_sonnet" if "sonnet" in kind else "seven_day" if "week" in kind else "five_hour"
+    model = next((name for name in MODEL_WINDOWS if name.removeprefix("seven_day_") in kind), None)
+    name = "five_hour" if "5-hour" in kind or "five" in kind else model or ("seven_day" if "week" in kind else "five_hour")
     resets = int(found["at"]) if found["at"] else _reset_time(error, now or datetime.now(UTC))
-    return LimitWindow(name=name, utilization=1.0, resets_at=resets, status="rejected")
+    return _window(name, 1.0, resets, "rejected")
 
 
 class UrgentNoticeWatch:
@@ -817,6 +888,8 @@ class ClaudeCodeProvider(Provider):
         mcp_servers[MCP_SERVER_NAME] = build_mcp_server(bridge)
         timer = ToolTimer()
         hooks = {"PreToolUse": [HookMatcher(hooks=[timer.start])], "PostToolUse": [HookMatcher(hooks=[notice_hook(spec.run_id, timer)])]}
+        if spec.toolset == "read":
+            hooks["PreToolUse"].insert(0, HookMatcher(matcher="Bash", hooks=[read_only_hook]))
         if background:
             hooks["Stop"] = [HookMatcher(hooks=[background.stop_hook])]
         allowed = [f"mcp__{MCP_SERVER_NAME}__{t.name}" for t in bridge.tools] + [f"mcp__{name}" for name in mcp_servers if name != MCP_SERVER_NAME]
@@ -913,8 +986,8 @@ class ClaudeCodeProvider(Provider):
             except Exception as exc:
                 log.info("Claude's usage could not be read, asking with a minimal turn: %s", str(exc)[:200])
                 windows = []
-            if windows:  # the usage answer names every window of the plan
-                return windows, list(USAGE_WINDOWS)
+            if windows:  # the usage answer names every window of the plan; one for certain models it may leave out
+                return windows, sorted({*USAGE_WINDOWS, *(w.name for w in windows)})
             return await self._limits_of_a_turn(credentials, home)
 
     async def _usage(self, credentials: Credentials, home: Path | None = None) -> list[LimitWindow]:

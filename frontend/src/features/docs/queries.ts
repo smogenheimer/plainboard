@@ -27,6 +27,7 @@ export const dk = {
   domain: (pid: number, site: number) => ["docs", pid, "domain", site] as const,
   find: (pid: number, site: number, q: string, release: number | null = null) => ["docs", pid, "find", site, q, release ?? "w"] as const,
   custom: (pid: number, site: number) => ["docs", pid, "custom", site] as const,
+  translationModel: (pid: number, site: number) => ["docs", pid, "translation-model", site] as const,
   outline: (pid: number, site: number, release: number | null = null) => ["docs", pid, "outline", site, release ?? "w"] as const,
 };
 

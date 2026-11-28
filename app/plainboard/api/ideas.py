@@ -3,12 +3,16 @@ Members change them, viewers read (services/access.py). Tickets come from them t
 
 from __future__ import annotations
 
-from fastapi import APIRouter, File, UploadFile
+from fastapi import APIRouter, File, Form, UploadFile
 
-from ..schemas import AttachmentOut, IdeaAnswer, IdeaChangeOut, IdeaCreate, IdeaInput, IdeaOut, IdeasOut, IdeaTicketIn, IdeaTicketOut, IdeaTopicIn, IdeaTopicOut, IdeaUpdate, IdeaVersionOut
+from ..schemas import AttachmentOut, IdeaAnswer, IdeaChangeOut, IDEA_TEXT_MAX, IdeaCreate, IdeaHandOver, IdeaHandOverOut, IdeaOut, IdeasOut, IdeaTicketIn, IdeaTicketOut, IdeaTopicIn, IdeaTopicOut, IdeaUpdate, IdeaVersionOut
+from ..models import IdeaStatus
+from ..services import agents as agent_service
 from ..services import board as board_service
 from ..services import ideas as idea_service
 from ..services import projects as project_service
+from ..services import users as user_service
+from ..services.errors import ServiceError
 from .deps import Runs, Session, Who
 
 router = APIRouter(prefix="/api/projects/{project_id}/ideas", tags=["ideas"])
@@ -22,10 +26,15 @@ async def _out(session, idea) -> IdeaOut:  # noqa: ANN001
 @router.get("", response_model=IdeasOut)
 async def list_ideas(project_id: int, session: Session, runs: Runs, closed: bool = False) -> IdeasOut:
     """The open ideas and their topics; ``closed``: also the ones taken into tickets, left out or merged."""
-    await project_service.get(session, project_id)
+    project = await project_service.get(session, project_id)
+    if not runs.ideas.reading(project_id) and await idea_service.waiting_input(session, project_id) is not None:
+        runs.ideas.read_soon(project_id)  # left waiting by a restart
     topics = [IdeaTopicOut.model_validate(t) for t in await idea_service.topics(session, project_id)]
-    ideas = await idea_service.outs(session, await idea_service.listed(session, project_id, closed=closed))
-    return IdeasOut(topics=topics, ideas=ideas, sorting=runs.ideas.sorting(project_id))
+    listed = await idea_service.listed(session, project_id, closed=closed)
+    blocked = await runs.ideas.blocked(session, project)
+    runs.ideas.sort_left(project_id, {i.id for i in idea_service.unsorted([i for i in listed if i.status == IdeaStatus.OPEN])}, blocked is not None)
+    ideas = await idea_service.outs(session, listed)
+    return IdeasOut(topics=topics, ideas=ideas, sorting=runs.ideas.sorting(project_id), model_blocked=blocked)
 
 
 @router.get("/questions", response_model=list[IdeaOut])
@@ -43,12 +52,21 @@ async def create_idea(project_id: int, body: IdeaCreate, session: Session, runs:
     return await _out(session, idea)
 
 
-@router.post("/input", response_model=IdeaChangeOut, status_code=201)
-async def read_input(project_id: int, body: IdeaInput, session: Session, runs: Runs, who: Who) -> IdeaChangeOut:
-    """What the person typed, read by the model: what it did, with the ideas it touched and an id to undo it."""
-    project = await project_service.get(session, project_id)
-    change = await runs.ideas.read_input(session, project, body.text, who.name)
-    return await idea_service.change_out(session, change, with_ideas=True)
+@router.post("/input", response_model=IdeaOut, status_code=202)
+async def take_input(
+    project_id: int, session: Session, runs: Runs, who: Who, text: str = Form("", max_length=2 * IDEA_TEXT_MAX), files: list[UploadFile] = File(default=[])
+) -> IdeaOut:
+    """What the person typed (and pasted files; a form's line breaks come as two characters each), kept at once and read by the model in the background: the idea
+    comes with status reading; what the model made of it comes as an ``idea_change.upserted`` (``summary.input_id``)."""
+    await project_service.get(session, project_id)
+    if not text.strip() and not files:
+        raise ServiceError("Type something or add a file.", 422)
+    idea = await idea_service.receive(session, project_id, text, [(f.filename or "file", f.content_type or "", f.file) for f in files], who.name)
+    if idea.status == IdeaStatus.READING:
+        runs.ideas.read_soon(project_id)
+    else:
+        runs.ideas.sort_soon(project_id)
+    return await _out(session, idea)
 
 
 @router.post("/sort", status_code=202)
@@ -62,6 +80,19 @@ async def rearrange(project_id: int, session: Session, runs: Runs) -> dict:
 @router.get("/changes", response_model=list[IdeaChangeOut])
 async def list_changes(project_id: int, session: Session, limit: int = 20) -> list[IdeaChangeOut]:
     return [await idea_service.change_out(session, c) for c in await idea_service.changes(session, project_id, min(max(limit, 1), 100))]
+
+
+@router.post("/hand-over", response_model=IdeaHandOverOut)
+async def hand_over(project_id: int, body: IdeaHandOver, session: Session, runs: Runs, who: Who) -> IdeaHandOverOut:
+    """Ideas to the manager (#163): a chat message it makes tickets from; no ids: all open ones."""
+    manager = await agent_service.get_manager(session, project_id)
+    if not manager.enabled:
+        raise ServiceError("The manager is switched off.", 409)
+    ideas, text = await idea_service.hand_over(session, project_id, body.idea_ids, body.message)
+    outs = await idea_service.outs(session, ideas)
+    several = bool(await user_service.author(session, who.user, project_id))
+    await runs.chat(session, manager, text, author=who.name or None, several=several)
+    return IdeaHandOverOut(agent_id=manager.id, ideas=outs)
 
 
 @router.post("/changes/{change_id}/undo", response_model=IdeaChangeOut)
@@ -83,8 +114,10 @@ async def update_topic(project_id: int, topic_id: int, body: IdeaTopicIn, sessio
 
 
 @router.delete("/topics/{topic_id}", status_code=204)
-async def delete_topic(project_id: int, topic_id: int, session: Session) -> None:
-    await idea_service.remove_topic(session, await idea_service.get_topic(session, project_id, topic_id))
+async def delete_topic(project_id: int, topic_id: int, session: Session, runs: Runs) -> None:
+    """Its ideas are sorted into the other topics again."""
+    if await idea_service.remove_topic(session, await idea_service.get_topic(session, project_id, topic_id)):
+        runs.ideas.sort_soon(project_id)
 
 
 @router.patch("/{idea_id}", response_model=IdeaOut)

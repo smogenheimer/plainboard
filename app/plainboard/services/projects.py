@@ -220,6 +220,7 @@ async def delete(session: AsyncSession, project: Project, runner=None, *, files:
 
 async def _delete(session: AsyncSession, project: Project, runner, files: bool) -> None:
     from . import landings as landing_service
+    from . import thumbnails
     from .board import storage_path
 
     if runner is not None:
@@ -249,6 +250,7 @@ async def _delete(session: AsyncSession, project: Project, runner, files: bool) 
     await session.commit()
     for path in files:
         path.unlink(missing_ok=True)
+        thumbnails.discard(path.name)
 
 
 async def get(session: AsyncSession, project_id: int) -> Project:

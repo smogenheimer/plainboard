@@ -63,13 +63,22 @@ def test_own_notes_are_private_and_limited(client, project):
     assert client.get(f"/api/agents/{dev['id']}/notes").json() == []
     assert [n["text"] for n in client.get(f"/api/agents/{manager['id']}/notes").json()] == ["Ask before deleting"]
 
-    for _ in range(6):
-        assert client.post(f"/api/agents/{dev['id']}/notes", json={"text": "y" * 500}).status_code == 201
-    full = client.post(f"/api/agents/{dev['id']}/notes", json={"text": "one more"})
-    assert full.status_code >= 400 and "3000 characters" in full.text
-    note_id = client.get(f"/api/agents/{dev['id']}/notes").json()[0]["id"]
-    assert client.patch(f"/api/agent-notes/{note_id}", json={"text": "short"}).json()["text"] == "short"
-    assert client.delete(f"/api/agent-notes/{note_id}").status_code == 204
+    # A full budget never blocks: what the user saves may go over it, what an agent saves pushes out the
+    # member's oldest notes it wrote itself (never the user's) and hands their text back.
+    user = client.post(f"/api/agents/{dev['id']}/notes", json={"text": "u" * 500}).json()
+    chat(client, dev["id"], "\n".join(f'TOOL remember {{"text": "{c * 500}"}}' for c in "abcd"))
+    wait_for(lambda: idle(client, pid))
+    for c in "vw":
+        assert client.post(f"/api/agents/{dev['id']}/notes", json={"text": c * 500}).status_code == 201  # 3500 of 3000
+    chat(client, dev["id"], 'TOOL remember {"text": "e"}')
+    wait_for(lambda: idle(client, pid))
+    saved = tool_results(client, dev["id"])[-1]
+    assert saved.startswith("Saved as own note") and "(2501/3000 chars)" in saved
+    assert "oldest own notes were removed:\n- [" in saved and "a" * 500 in saved and "b" * 500 in saved and "c" * 500 not in saved
+    left = [n["text"][0] for n in client.get(f"/api/agents/{dev['id']}/notes").json()]
+    assert left == ["u", "c", "d", "v", "w", "e"]
+    assert client.patch(f"/api/agent-notes/{user['id']}", json={"text": "short"}).json()["text"] == "short"
+    assert client.delete(f"/api/agent-notes/{user['id']}").status_code == 204
 
 
 def test_old_own_notes_are_put_up_for_review_in_the_next_turn(client, project):

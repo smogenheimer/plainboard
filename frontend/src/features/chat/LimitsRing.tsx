@@ -5,7 +5,7 @@ import { useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useAccounts, useLimits } from "../../api/queries";
 import type { AccountLimits, LimitForecast, LimitWindow } from "../../api/types";
-import { timeAgo } from "../../lib/format";
+import { timeAgo, whenAhead } from "../../lib/format";
 import { useDismiss, useInView } from "../../lib/hooks";
 import { useShell } from "../layout/shell-context";
 import { useUsableAccounts } from "../projects/ProjectAccounts";
@@ -77,7 +77,7 @@ function LimitLine({ account }: { account: AccountLimits }) {
   const week = weeks.length ? weeks.reduce((a, b) => (b.utilization > a.utilization ? b : a)) : undefined;
   const forecast = week && account.forecasts.find((f) => f.name === week.name);
   const risk = account.forecasts.some((f) => f.status === "over") || account.windows.some((w) => w.utilization >= 1);
-  const name = (w: LimitWindow) => t(`chat.limits.${w.name}`, { defaultValue: w.name });
+  const name = (w: LimitWindow) => limitName(t, w);
   return (
     <div className="grid h-9 grid-cols-[minmax(0,1fr)_auto_auto] items-center gap-x-3 border-b border-line px-2.5" title={forecast ? forecastHeadline(t, forecast) : undefined}>
       <span className={clsx("flex min-w-0 items-center gap-1.5", risk && "text-you-fg")}>
@@ -164,7 +164,7 @@ const forecastTone = {
 const forecastHeadline = (t: TFunction, forecast: LimitForecast) =>
   forecast.status === "over"
     ? forecast.runs_out_at
-      ? t("chat.limits.forecast.over", { percent: percent(forecast.projected), when: timeAgo(fromUnix(forecast.runs_out_at)) })
+      ? t("chat.limits.forecast.over", { percent: percent(forecast.projected), when: whenAhead(fromUnix(forecast.runs_out_at)) })
       : t("chat.limits.forecast.reached")
     : t(`chat.limits.forecast.${forecast.status}`, { percent: percent(forecast.projected) });
 
@@ -180,18 +180,34 @@ function Forecast({ forecast }: { forecast: LimitForecast }) {
   );
 }
 
+/** A plan limit's window by name: a known one translated, one only known by its length (Codex: `codex_43200_min`)
+ * by that length, a weekly one for certain models (Claude's `seven_day_fable`) by the model, else the name made readable. */
+function limitName(t: TFunction, window: LimitWindow): string {
+  const { name } = window;
+  const minutes = Number(/_(\d+)_min$/.exec(name)?.[1]);
+  if (!minutes) {
+    const readable = name.replace(/_/g, " ").replace(/^\w/, (c) => c.toUpperCase());
+    if (window.model && name.startsWith("seven_day_")) return t(`chat.limits.${name}`, { defaultValue: t("chat.limits.modelWeek", { model: window.model }) });
+    return t(`chat.limits.${name}`, { defaultValue: readable });
+  }
+  if (minutes === 10080) return t("chat.limits.seven_day");
+  if (minutes % 1440 === 0) return t("chat.limits.days", { count: minutes / 1440 });
+  if (minutes % 60 === 0) return t("chat.limits.hours", { count: minutes / 60 });
+  return t("chat.limits.minutes", { count: minutes });
+}
+
 function LimitRow({ window, forecast }: { window: LimitWindow; forecast?: LimitForecast }) {
   const { t } = useTranslation();
   return (
     <div>
       <div className="flex justify-between gap-2 font-medium">
-        <span>{t(`chat.limits.${window.name}`, { defaultValue: window.name })}</span>
+        <span>{limitName(t, window)}</span>
         <span>{percent(window.utilization)}%</span>
       </div>
       <div className="mt-1 h-1.5 bg-line">
         <div className={clsx("h-full", bar[tone(window.utilization)])} style={{ width: `${Math.min(percent(window.utilization), 100)}%` }} />
       </div>
-      {window.resets_at && <p className="mt-1 text-fg-3">{t("chat.limits.resets", { when: timeAgo(fromUnix(window.resets_at)) })}</p>}
+      {window.resets_at && <p className="mt-1 text-fg-3">{t("chat.limits.resets", { when: whenAhead(fromUnix(window.resets_at)) })}</p>}
       {forecast && <Forecast forecast={forecast} />}
     </div>
   );

@@ -2,7 +2,8 @@
 
 The turn is outside the queue: it does not wait for the manager, nor count against the project's limit of
 members at work. It runs on the project's runner and subscriptions like any turn, but only reads: the
-runner gets the toolset "read" (files: Read, Glob, Grep; no shell, no editing) and only the board tools in
+runner gets the toolset "read" (files: Read, Glob, Grep, and shell commands only if they just read, runner
+read_only.py; no editing) and only the board tools in
 ``TOOLS``, and the app refuses every other tool of the turn's token (``RunContext.tools``). Nothing of it
 reaches the manager's chat or anyone else: the answer streams back to the person who asked, and a follow-up
 goes on in the same provider session (``Thread``, in memory only). When it ends, a ``Run`` without its

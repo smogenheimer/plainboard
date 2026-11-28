@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useState, useSyncExternalStore } from "react";
 import { useMe } from "../api/queries";
 
 // What someone has typed and not sent yet stays when they go to another view and come back, and
@@ -83,4 +83,25 @@ export function clearDrafts() {
   } catch {
     /* nothing to clear */
   }
+}
+
+// A prepared request for an agent (e.g. "Ask the manager" where nothing is set up yet): the chat with that
+// agent puts it into its field when it shows, once.
+let chatSeed: { agentId: number; text: string } | null = null;
+const seedListeners = new Set<() => void>();
+
+export function seedChat(agentId: number, text: string | null) {
+  chatSeed = text ? { agentId, text } : null;
+  seedListeners.forEach((l) => l());
+}
+
+export function useChatSeed(agentId: number) {
+  const seed = useSyncExternalStore(
+    (l) => {
+      seedListeners.add(l);
+      return () => seedListeners.delete(l);
+    },
+    () => chatSeed,
+  );
+  return seed?.agentId === agentId ? seed : null;
 }

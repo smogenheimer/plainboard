@@ -43,14 +43,14 @@ async def list_own_notes(agent_id: int, session: Session) -> list[AgentNoteOut]:
 @router.post("/agents/{agent_id}/notes", response_model=AgentNoteOut, status_code=201)
 async def create_own_note(agent_id: int, body: AgentNoteBody, session: Session) -> AgentNoteOut:
     agent = await agent_service.get(session, agent_id)
-    return AgentNoteOut.model_validate(await own_note_service.save(session, agent, body.text))
+    return AgentNoteOut.model_validate((await own_note_service.save(session, agent, body.text))[0])
 
 
 @router.patch("/agent-notes/{note_id}", response_model=AgentNoteOut)
 async def update_own_note(note_id: int, body: AgentNoteBody, session: Session) -> AgentNoteOut:
     note = await own_note_service.get(session, note_id)
     agent = await agent_service.get(session, note.agent_id)
-    return AgentNoteOut.model_validate(await own_note_service.save(session, agent, body.text, note=note))
+    return AgentNoteOut.model_validate((await own_note_service.save(session, agent, body.text, note=note))[0])
 
 
 @router.delete("/agent-notes/{note_id}", status_code=204)

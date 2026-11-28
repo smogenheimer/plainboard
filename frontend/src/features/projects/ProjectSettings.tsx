@@ -2,8 +2,8 @@ import { useQueryClient } from "@tanstack/react-query";
 import { useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api, errorMessage } from "../../api/client";
-import { checks, qk, useAccounts, useMeta, useRepositories, useSettings } from "../../api/queries";
-import type { CheckResult, Project, RetentionPreview } from "../../api/types";
+import { checks, patchProject, qk, useAccounts, useAgents, useMeta, useRepositories, useSettings } from "../../api/queries";
+import type { CheckResult, RetentionPreview } from "../../api/types";
 import { ApiKeyEditor } from "../../components/ApiKeyEditor";
 import { SaveRow, SavedAtOnce, SettingsLayout, type SettingsSection } from "../../components/SettingsLayout";
 import { Button, ErrorText, Field, Input, Modal, PageHead, Select, Textarea, Toggle } from "../../components/ui";
@@ -38,6 +38,7 @@ export function ProjectSettings({ onOpenTeam, onDeleted }: { onOpenTeam: () => v
   const usableIds = useUsableAccounts(project.id);
   const repos = useRepositories(project.id);
   const meta = useMeta();
+  const agents = useAgents(project.id);
   const defaultParallel = Number(settings.data?.values.max_parallel_runs ?? 3);
   const [form, setForm] = useState({
     name: project.name,
@@ -60,6 +61,8 @@ export function ProjectSettings({ onOpenTeam, onDeleted }: { onOpenTeam: () => v
     idea_provider: project.idea_provider ?? "",
     idea_model: project.idea_model ?? "",
     idea_effort: project.idea_effort ?? "",
+    cleanup_provider: project.cleanup_provider ?? "",
+    cleanup_model: project.cleanup_model ?? "",
   });
   const [check, setCheck] = useState<CheckResult | null>(null);
   const [error, setError] = useState<unknown>(null);
@@ -74,9 +77,8 @@ export function ProjectSettings({ onOpenTeam, onDeleted }: { onOpenTeam: () => v
     const body: Record<string, unknown> = Object.fromEntries(keys.map((k) => [k, form[k]]));
     if ("workspace_path" in body) body.workspace_path = form.workspace_path.trim() || null;
     if ("github_token" in body && !form.github_token) delete body.github_token;
-    await api.patch<Project>(`/projects/${project.id}`, body);
+    await patchProject(qc, project.id, body);
     set({ github_token: "" });
-    await qc.invalidateQueries({ queryKey: qk.projects });
   };
   // Which subscriptions the project may use is an admin's call and has a route of its own, but it is
   // one form: stored with the same button as the fields around it, and first, because the
@@ -87,7 +89,7 @@ export function ProjectSettings({ onOpenTeam, onDeleted }: { onOpenTeam: () => v
       await api.put(`/projects/${project.id}/accounts`, { account_ids: form.account_ids });
       await qc.invalidateQueries({ queryKey: ["project-accounts", project.id] });
     }
-    await save("parallel_agents", "account_id", "auto_wake_manager", "continue_with_backlog", "ask_provider", "ask_model", "ask_effort", "idea_provider", "idea_model", "idea_effort");
+    await save("parallel_agents", "account_id", "auto_wake_manager", "continue_with_backlog", "ask_provider", "ask_model", "ask_effort", "idea_provider", "idea_model", "idea_effort", "cleanup_provider", "cleanup_model");
   };
   // Quick questions: the provider's small model with effort high, unless chosen here.
   const providers = meta.data?.providers ?? [];
@@ -131,6 +133,16 @@ export function ProjectSettings({ onOpenTeam, onDeleted }: { onOpenTeam: () => v
   const ideaSmall = ideaModels.filter((m) => m.tier === "small");
   const ideaDefault = ideaSmall.find((m) => m.id.includes("haiku")) ?? ideaSmall[0] ?? ideaModels[ideaModels.length - 1];
   const ideaEfforts = ideaProvider?.efforts ?? [];
+  // Cleanup runs: empty is the small model of the manager's provider, said by name; a provider the project may use
+  // no subscription of is shown as an error (the run never switches to another one).
+  const managerProvider = agents.data?.find((a) => a.is_manager)?.provider || "claude_code";
+  const cleanupProviderName = form.cleanup_provider || managerProvider;
+  const cleanupProvider = providers.find((p) => p.name === cleanupProviderName);
+  const cleanupModels = cleanupProvider?.models ?? [];
+  const cleanupSmall = cleanupModels.filter((m) => m.tier === "small");
+  const cleanupDefault = cleanupSmall.find((m) => m.id.includes("haiku")) ?? cleanupSmall[0] ?? cleanupModels[cleanupModels.length - 1];
+  const ofCleanupProvider = (accounts.data ?? []).filter((a) => a.provider === cleanupProviderName);
+  const cleanupBlocked = form.account_ids.length > 0 && ofCleanupProvider.length > 0 && !ofCleanupProvider.some((a) => form.account_ids.includes(a.id));
   const refreshRepos = () => qc.invalidateQueries({ queryKey: qk.repos(project.id) });
   // Deleting asks first, and asks what happens to the folders the agents worked in.
   const [deleting, setDeleting] = useState(false);
@@ -241,10 +253,7 @@ export function ProjectSettings({ onOpenTeam, onDeleted }: { onOpenTeam: () => v
           <div className="space-y-1">
             <Toggle
               checked={project.fast_checks}
-              onChange={async (v) => {
-                await api.patch<Project>(`/projects/${project.id}`, { fast_checks: v });
-                await qc.invalidateQueries({ queryKey: qk.projects });
-              }}
+              onChange={(v) => patchProject(qc, project.id, { fast_checks: v })}
               label={t("projects.fastChecks")}
             />
             <p className="text-fg-3">{t("projects.fastChecksHint")}</p>
@@ -263,10 +272,7 @@ export function ProjectSettings({ onOpenTeam, onDeleted }: { onOpenTeam: () => v
           <div className="space-y-1">
             <Toggle
               checked={project.limit_pause}
-              onChange={async (v) => {
-                await api.patch<Project>(`/projects/${project.id}`, { limit_pause: v });
-                await qc.invalidateQueries({ queryKey: qk.projects });
-              }}
+              onChange={(v) => patchProject(qc, project.id, { limit_pause: v })}
               label={t("projects.limitPause")}
             />
             <p className="text-fg-3">{t("projects.limitPauseHint")}</p>
@@ -386,8 +392,40 @@ export function ProjectSettings({ onOpenTeam, onDeleted }: { onOpenTeam: () => v
               </div>
             </div>
           </Field>
+          <Field group label={t("projects.cleanupModel")} hint={t("projects.cleanupModelHint")}>
+            <div data-part="cleanup-model" className="flex flex-wrap items-start gap-2">
+              {providers.length > 1 && (
+                <div className="w-full sm:w-56">
+                  <Select
+                    aria-label={t("projects.cleanupProvider")}
+                    value={form.cleanup_provider}
+                    onChange={(e) => set({ cleanup_provider: e.target.value, cleanup_model: "" })}
+                  >
+                    <option value="">{t("projects.cleanupProviderManager", { provider: cleanupProvider?.label ?? managerProvider })}</option>
+                    {providers.map((p) => (
+                      <option key={p.name} value={p.name}>
+                        {p.label}
+                      </option>
+                    ))}
+                  </Select>
+                </div>
+              )}
+              <div className="min-w-0 flex-1 basis-48">
+                <Select aria-label={t("projects.cleanupModel")} value={form.cleanup_model} onChange={(e) => set({ cleanup_model: e.target.value })}>
+                  <option value="">{t("projects.askModelSmall", { model: cleanupDefault?.label ?? cleanupDefault?.id ?? "Claude Haiku" })}</option>
+                  {cleanupModels.map((m) => (
+                    <option key={m.id} value={m.id}>
+                      {m.label}
+                    </option>
+                  ))}
+                  {form.cleanup_model && !cleanupModels.some((m) => m.id === form.cleanup_model) && <option value={form.cleanup_model}>{form.cleanup_model}</option>}
+                </Select>
+              </div>
+            </div>
+            {cleanupBlocked && <ErrorText error={t("projects.cleanupBlocked", { provider: cleanupProvider?.label ?? cleanupProviderName })} />}
+          </Field>
           <SaveRow
-            dirty={accountsDirty || dirty("parallel_agents", "account_id", "auto_wake_manager", "continue_with_backlog", "ask_provider", "ask_model", "ask_effort", "idea_provider", "idea_model", "idea_effort")}
+            dirty={accountsDirty || dirty("parallel_agents", "account_id", "auto_wake_manager", "continue_with_backlog", "ask_provider", "ask_model", "ask_effort", "idea_provider", "idea_model", "idea_effort", "cleanup_provider", "cleanup_model")}
             onSave={saveTeam}
           >
             <Button variant="ghost" onClick={onOpenTeam}>
@@ -398,10 +436,7 @@ export function ProjectSettings({ onOpenTeam, onDeleted }: { onOpenTeam: () => v
             {meta.data?.semantic_search ? (
               <Toggle
                 checked={project.semantic_search}
-                onChange={async (v) => {
-                  await api.patch<Project>(`/projects/${project.id}`, { semantic_search: v });
-                  await qc.invalidateQueries({ queryKey: qk.projects });
-                }}
+                onChange={(v) => patchProject(qc, project.id, { semantic_search: v })}
                 label={t("projects.semanticSearch")}
               />
             ) : (

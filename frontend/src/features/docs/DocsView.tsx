@@ -24,6 +24,7 @@ import type { DocPageItem, DocSite } from "../../api/types";
 import { Button, ChatPanelToggle, EmptyState, ErrorText, Field, IconButton, Input, Modal, Spinner, Textarea } from "../../components/ui";
 import { formatBytes, timeAgo } from "../../lib/format";
 import { useStored } from "../../lib/hooks";
+import { thumbSrc } from "../../lib/media";
 import { useShell } from "../layout/shell-context";
 import { DocMarkdown } from "./DocMarkdown";
 import { languageLabel, PageEditor } from "./PageEditor";
@@ -146,7 +147,7 @@ function SiteList({ sites, error, canWrite, onOpen, onNew }: { sites: DocSite[];
             {canWrite && (
               <div className="flex flex-wrap justify-center gap-2">
                 {manager && (
-                  <Button icon={<MessageSquare className="size-4" />} onClick={() => openChat(manager.id)}>
+                  <Button icon={<MessageSquare className="size-4" />} onClick={() => openChat(manager.id, t("docs.askManagerText"))}>
                     {t("docs.askManager")}
                   </Button>
                 )}
@@ -581,7 +582,7 @@ function RulesTab({ site }: { site: DocSite }) {
           </div>
           <p className="text-fg-2">{t("docs.rules.hint", { agent: site.agent?.name ?? t("docs.rules.agent") })}</p>
           {canWrite && manager && (
-            <button type="button" onClick={() => openChat(manager.id)} className="inline-flex items-center gap-1.5 text-fg-2 underline decoration-line-2 underline-offset-3 hover:text-fg">
+            <button type="button" onClick={() => openChat(manager.id, t("docs.rules.askManagerText", { name: site.name }))} className="inline-flex items-center gap-1.5 text-fg-2 underline decoration-line-2 underline-offset-3 hover:text-fg">
               <MessageSquare className="size-4" /> {t("docs.rules.withManager")}
             </button>
           )}
@@ -672,7 +673,7 @@ function FilesTab({ site }: { site: DocSite }) {
               return (
                 <li key={f.id} className="group/file flex flex-col overflow-hidden rounded-sm ring-1 ring-line ring-inset">
                   <a href={`/api/attachments/${f.id}`} target="_blank" rel="noreferrer" className="flex aspect-[4/3] items-center justify-center bg-sunk">
-                    {image ? <img src={`/api/attachments/${f.id}`} alt={f.filename} loading="lazy" className="size-full object-cover" /> : <FileText className="size-8 text-fg-3" />}
+                    {image ? <img src={thumbSrc(f.id, 400)} alt={f.filename} loading="lazy" decoding="async" className="size-full object-cover" /> : <FileText className="size-8 text-fg-3" />}
                   </a>
                   <div className="flex items-center gap-1 px-2 py-1.5">
                     <span className="min-w-0 flex-1">

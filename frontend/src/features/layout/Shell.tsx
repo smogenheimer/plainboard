@@ -60,6 +60,7 @@ import { PauseBanner } from "../settings/PauseEditor";
 import { RunningNow } from "./RunningNow";
 import { CommandPalette, NavButton, PaletteButton, ProjectMenu, type NavEntry } from "./Palette";
 import { ShellContext, type ShellApi } from "./shell-context";
+import { seedChat } from "../../lib/drafts";
 
 // Rarely used views and dialogs load on first use (own chunks), keeping the first load small.
 const BrowserView = lazy(() => import("../browser/BrowserView").then((m) => ({ default: m.BrowserView })));
@@ -397,7 +398,8 @@ function ProjectWorkspace({
       agents: visibleAgents,
       agentById,
       previews,
-      openChat: (id) => {
+      openChat: (id, text) => {
+        if (text) seedChat(id, text);
         setChatAgentId(id);
         if (isDesktop && view !== "chat") setPanelOpen(true);
         else setView("chat");
@@ -413,6 +415,10 @@ function ProjectWorkspace({
         setView("ideas");
       },
       openSettings,
+      openProjectSettings: (section) => {
+        if (section) localStorage.setItem("plainboard.projectSection", JSON.stringify(section));
+        setView("project");
+      },
       openBrowser: (address) => {
         setBrowserRequest((last) => ({ url: address, n: last.n + 1 }));
         setView("browser");

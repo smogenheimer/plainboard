@@ -210,6 +210,29 @@ async def test_board_tools_as_mcp_server():
         assert (await client.call_tool("create_ticket", {"title": "bad"})).is_error
 
 
+async def test_a_question_says_its_board_tools_only_read():
+    """Codex refuses MCP tools without readOnlyHint in a turn that only reads (#173)."""
+
+    class Bridge:
+        tools = [TOOL]
+
+    async with Client(build_server(Bridge(), read_only=True)) as client:
+        assert (await client.list_tools()).tools[0].annotations.read_only_hint is True
+    async with Client(build_server(Bridge())) as client:
+        assert (await client.list_tools()).tools[0].annotations is None
+
+
+async def test_a_question_approves_only_commands_that_read():
+    server = FakeServer([])
+    approval = "item/commandExecution/requestApproval"
+    await codex.answer_server_request(server, {"id": 1, "method": approval, "params": {"command": "/bin/bash -lc 'git log -3'"}}, read_only=True)
+    await codex.answer_server_request(server, {"id": 2, "method": approval, "params": {"command": "/bin/bash -lc 'touch x'"}}, read_only=True)
+    await codex.answer_server_request(server, {"id": 3, "method": "item/fileChange/requestApproval", "params": {}}, read_only=True)
+    await codex.answer_server_request(server, {"id": 4, "method": approval, "params": {"command": "touch x"}})
+    assert [r[1]["decision"] for r in server.responses] == ["accept", "decline", "decline", "accept"]
+    assert run_config(spec(), Path("b.json"))["mcp_servers"]["plainboard"]["required"] is True  # the first step has the board tools
+
+
 @pytest.mark.skipif(not shutil.which(codex.CODEX_BIN), reason="Codex CLI not installed")
 async def test_codex_app_server_loads_the_board_tools(tmp_path):
     """The real CLI: our config is accepted and the board tools reach it through the MCP server."""

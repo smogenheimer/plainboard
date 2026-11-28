@@ -1,5 +1,5 @@
 import clsx from "clsx";
-import { ArrowRight, Copy, GripVertical, MessageCircleQuestion, Paperclip, Send, Sparkles, TriangleAlert, X } from "lucide-react";
+import { ArrowRight, Check, Copy, GripVertical, Loader2, MessageCircleQuestion, Paperclip, Send, Sparkles, TriangleAlert, X } from "lucide-react";
 import { useState, type ReactNode } from "react";
 import { useTranslation } from "react-i18next";
 import { api, errorMessage } from "../../api/client";
@@ -28,6 +28,9 @@ export function IdeaCard({
   entering,
   onOpen,
   onShow,
+  manager,
+  onHandOver,
+  selected,
 }: {
   idea: Idea;
   byId: Map<number, Idea>;
@@ -37,14 +40,24 @@ export function IdeaCard({
   onOpen: () => void;
   /** Bring another idea into view (a similar one, the original of a duplicate). */
   onShow: (id: number) => void;
+  /** The manager's name, where ideas can go to it (#163). */
+  manager?: string;
+  onHandOver?: () => void;
+  /** In the bar of ideas to hand over to the manager. */
+  selected?: boolean;
 }) {
   const { t } = useTranslation();
-  const leaving = idea.status !== "open";
+  const reading = idea.status === "reading";
+  const leaving = idea.status !== "open" && !reading;
   const rot = ((idea.id * 37) % 5) - 2;
   const original = idea.duplicate_of !== null ? byId.get(idea.duplicate_of) : undefined;
   const twins = [...byId.values()].filter((i) => i.duplicate_of === idea.id && i.status === "open");
   const similar = idea.similar.map((id) => byId.get(id)).filter((i): i is Idea => !!i && i.id !== idea.duplicate_of && !twins.includes(i));
   const conflicts = (idea.conflicts ?? []).map((id) => byId.get(id)).filter((i): i is Idea => !!i);
+  const files = idea.attachments?.length ?? 0;
+  const forManager = idea.status === "open" && !!manager;
+  const handed = forManager && !!idea.handed_over_at;
+  const canPick = forManager && !idea.handed_over_at && !!onHandOver;
   return (
     <div
       data-idea={idea.id}
@@ -57,7 +70,7 @@ export function IdeaCard({
         tabIndex={0}
         data-part="idea-card"
         aria-label={ideaTitle(idea)}
-        draggable={draggable && !leaving}
+        draggable={draggable && !leaving && !reading}
         onDragStart={(e) => {
           e.dataTransfer.setData("application/x-plainboard-idea", String(idea.id));
           e.dataTransfer.effectAllowed = "move";
@@ -70,9 +83,10 @@ export function IdeaCard({
           }
         }}
         className={clsx(
-          "group relative flex cursor-pointer flex-col gap-1.5 rounded-md bg-[var(--card,var(--bg))] px-3 py-2.5 text-left shadow-[var(--shadow-card,none)] ring-1 ring-line transition-shadow hover:ring-line-2",
+          "group relative flex cursor-pointer flex-col gap-1.5 rounded-md bg-[var(--card,var(--bg))] px-3 py-2.5 text-left shadow-[var(--shadow-card,0_0_#0000)] ring-1 ring-line transition-shadow hover:ring-line-2",
           original && "opacity-75",
           conflicts.length > 0 && "ring-you-fg/60",
+          selected && "ring-2! ring-fg!",
         )}
       >
         {draggable && <GripVertical aria-hidden className="absolute top-3 left-0.5 size-3.5 text-fg-3 opacity-0 group-hover:opacity-100 max-sm:hidden" />}
@@ -103,14 +117,46 @@ export function IdeaCard({
             <Link onClick={() => onShow(other.id)}>{t("ideas.similarTo", { title: ideaTitle(other) })}</Link>
           </AiLine>
         ))}
-        {!idea.title && idea.sort_state === "pending" && <AiLine className="text-[0.92em]">{t("ideas.reading")}</AiLine>}
+        {reading && <ReadingLine />}
+        {!reading && !idea.title && idea.sort_state === "pending" && <AiLine className="text-[0.92em]">{t("ideas.reading")}</AiLine>}
         {idea.hint && !similar.length && !original && !conflicts.length && <AiLine className="text-[0.92em]">{idea.hint}</AiLine>}
-        {idea.attachments?.length > 0 && (
-          <span data-part="idea-files" title={t("ideas.files", { count: idea.attachments.length })} className="inline-flex items-center gap-1 self-start text-[0.92em] text-fg-3">
-            <Paperclip aria-hidden className="size-3.5" />
-            <span className="sr-only">{t("ideas.files", { count: idea.attachments.length })}</span>
-            <span aria-hidden>{idea.attachments.length}</span>
-          </span>
+        {(files > 0 || handed || canPick) && (
+          <div data-part="idea-footer" className="flex min-h-6 items-center gap-2">
+            {files > 0 && (
+              <span data-part="idea-files" title={t("ideas.files", { count: files })} className="inline-flex items-center gap-0.5 text-[0.92em] text-fg-3">
+                <Paperclip aria-hidden className="size-3.5" />
+                <span className="sr-only">{t("ideas.files", { count: files })}</span>
+                <span aria-hidden>{files}</span>
+              </span>
+            )}
+            <span className="flex-1" />
+            {handed && (
+              <span data-part="idea-handed-over" className="inline-flex items-center gap-1 rounded-full bg-ok/15 px-2 py-0.5 text-[0.85em] font-medium text-ok">
+                <Check aria-hidden className="size-3.5" />
+                {t("ideas.handOver.handed", { name: manager })}
+              </span>
+            )}
+            {canPick && (
+              <button
+                type="button"
+                data-part="idea-handover-button"
+                aria-pressed={!!selected}
+                onClick={(e) => {
+                  e.stopPropagation();
+                  onHandOver?.();
+                }}
+                onKeyDown={(e) => e.stopPropagation()}
+                className={clsx(
+                  // A wider hit area on touch screens without making the chip bigger.
+                  "relative inline-flex items-center gap-1 rounded-full px-2 py-0.5 text-[0.85em] font-medium touch:after:absolute touch:after:-inset-2.5 touch:after:content-['']",
+                  selected ? "plate" : "text-fg-3 hover:bg-sunk hover:text-fg",
+                )}
+              >
+                {selected ? <Check aria-hidden className="size-3.5" /> : <Send aria-hidden className="size-3.5" />}
+                {selected ? t("ideas.handOver.selected") : t("ideas.handOver.add", { name: manager })}
+              </button>
+            )}
+          </div>
         )}
         {(idea.status === "taken" || idea.status === "merged") && (
           <span className="inline-flex items-center gap-1 self-end font-semibold text-ok">
@@ -120,6 +166,17 @@ export function IdeaCard({
         )}
       </div>
     </div>
+  );
+}
+
+/** Typed, on its way or being read by the AI (#161). */
+export function ReadingLine() {
+  const { t } = useTranslation();
+  return (
+    <p data-part="idea-reading" className="flex items-center gap-1.5 text-[0.92em] text-fg-2">
+      <Loader2 aria-hidden className="size-3.5 shrink-0 animate-spin text-fg-3" />
+      {t("ideas.beingRead")}
+    </p>
   );
 }
 

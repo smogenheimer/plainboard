@@ -163,7 +163,7 @@ async def update(
     if enabled is not None and enabled != user.enabled:
         user.enabled = enabled
         user.session_version += 1
-    for key, value in (await permissions.clean(session, limits or {})).items():
+    for key, value in (await permissions.clean(session, limits or {}, user)).items():
         setattr(user, key, value)
     await session.commit()
     return user

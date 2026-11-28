@@ -2,10 +2,10 @@
 
 from __future__ import annotations
 
-from fastapi import APIRouter, File, UploadFile
+from fastapi import APIRouter, File, Request, UploadFile
 from sqlalchemy import select
 
-from ..models import Run, RunStatus
+from ..models import Project, Run, RunStatus
 from ..schemas import AttachmentOut, ChatMessageIn, ConversationOut, MessageOut, RunOut
 from ..services import agents as agent_service
 from ..services import board as board_service
@@ -33,13 +33,19 @@ async def get_conversation(agent_id: int, session: Session, before_id: int | Non
 
 
 @router.post("/agents/{agent_id}/messages", response_model=RunOut, status_code=202)
-async def send_message(agent_id: int, body: ChatMessageIn, session: Session, runs: Runs, who: Who) -> RunOut:
+async def send_message(agent_id: int, body: ChatMessageIn, request: Request, session: Session, runs: Runs, who: Who) -> RunOut:
     agent = await agent_service.get(session, agent_id)
     if not agent.is_manager and not await settings_service.get(session, "member_chat"):
         raise ServiceError("Direct messages to members are off. Talk to the manager, or enable it in Settings.", 403)
+    if body.client_key and (run := await runs.sent_chat(session, agent.id, body.client_key)):
+        return RunOut.model_validate(run)  # it arrived before; the answer did not
     several = bool(await user_service.author(session, who.user, agent.project_id))
-    run = await runs.chat(session, agent, body.text, body.attachment_ids, author=who.name or None, several=several)
+    run, new = await runs.chat_once(session, agent, body.text, body.attachment_ids, author=who.name or None, several=several, key=body.client_key)
+    if not new:  # an earlier try was still on its way and took it
+        return RunOut.model_validate(run)
     await mention_service.record(session, agent.project_id, body.text, kind="chat", author=who.name, author_user_id=who.user.id if who.user else None, agent_id=agent.id)
+    if await session.scalar(select(Project.limit_paused_at).where(Project.id == agent.project_id)):
+        request.app.state.limit_pause.recheck_soon()  # a person who writes may just have topped up a plan
     return RunOut.model_validate(run)
 
 

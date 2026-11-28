@@ -1,5 +1,9 @@
 """A team member's own notes. They are always in that member's prompt, so they survive context
-resets and compression; a fixed budget for all notes of a member keeps that prompt small."""
+resets and compression; a fixed budget for all notes of a member keeps that prompt small.
+
+A full budget never blocks saving: a note a member (or the manager for it) saves pushes out that member's
+oldest notes it wrote itself, and the caller gets their text back to merge what still matters. Notes from
+the user are never pushed out; a note the user saves may go over the budget."""
 
 from __future__ import annotations
 
@@ -33,25 +37,45 @@ async def get(session: AsyncSession, note_id: int, agent_id: int | None = None) 
     return note
 
 
-async def save(session: AsyncSession, agent: Agent, text: str, *, note: AgentNote | None = None, by_agent_id: int | None = None) -> AgentNote:
-    """Adds a note, or replaces the text of ``note``."""
+async def save(
+    session: AsyncSession, agent: Agent, text: str, *, note: AgentNote | None = None, by_agent_id: int | None = None
+) -> tuple[AgentNote, list[AgentNote]]:
+    """Adds a note, or replaces the text of ``note``. Returns it and the notes pushed out to make room."""
     text = text.strip()
     if not text:
         raise ServiceError("The note is empty")
-    others = used([n for n in await for_agent(session, agent.id) if note is None or n.id != note.id])
-    if others + len(text) > BUDGET_CHARS:
-        raise ServiceError(
-            f"Own notes are limited to {BUDGET_CHARS} characters in total ({others} used, this one has {len(text)}). "
-            "Shorten or delete notes first."
-        )
+    others = [n for n in await for_agent(session, agent.id) if note is None or n.id != note.id]
+    over = used(others) + len(text) - BUDGET_CHARS
+    pushed_out: list[AgentNote] = []
+    if by_agent_id is not None:  # the user's own writes push nothing out
+        for old in sorted((n for n in others if n.created_by_agent_id is not None), key=lambda n: (n.updated_at, n.id)):
+            if over <= 0:
+                break
+            pushed_out.append(old)
+            over -= len(old.text)
+    for old in pushed_out:
+        await session.delete(old)
     if note is None:
         note = AgentNote(project_id=agent.project_id, agent_id=agent.id, text=text, created_by_agent_id=by_agent_id)
         session.add(note)
     else:
         note.text = text
     await session.commit()
+    if pushed_out:
+        bus.publish(note.project_id, "ownnote.deleted", {"ids": [n.id for n in pushed_out]})
     bus.publish(note.project_id, "ownnote.upserted", AgentNoteOut.model_validate(note))
-    return note
+    return note, pushed_out
+
+
+def pushed_out_text(pushed_out: list[AgentNote], whose: str = "your", how: str = "remember with note_id") -> str:
+    """What a caller is told about notes ``save`` pushed out (empty if none)."""
+    if not pushed_out:
+        return ""
+    listed = "\n".join(f"- [{n.id}] {n.text.strip()}" for n in pushed_out)
+    return (
+        f"\nTo make room, {whose} oldest own notes were removed:\n{listed}\n"
+        f"If one still matters, merge it, shortened, into another note ({how})."
+    )
 
 
 async def delete(session: AsyncSession, notes: list[AgentNote]) -> None:

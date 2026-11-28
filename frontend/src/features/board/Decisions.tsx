@@ -1,13 +1,13 @@
 import { useQueryClient } from "@tanstack/react-query";
 import clsx from "clsx";
 import { CircleCheck, CircleSlash, FileText, Hand, MessageCircle } from "lucide-react";
-import { useState } from "react";
+import { memo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { api } from "../../api/client";
 import { qk } from "../../api/queries";
 import type { Attachment, Decision } from "../../api/types";
 import { VideoThumb } from "../../components/VideoThumb";
-import { isImageFile, isMediaFile, isVideoFile } from "../../lib/media";
+import { isImageFile, isMediaFile, isVideoFile, thumbSrc } from "../../lib/media";
 import { useDraft } from "../../lib/drafts";
 import { AttachmentLink } from "../../components/AttachmentLink";
 import { Markdown, TicketText } from "../../components/Markdown";
@@ -32,7 +32,7 @@ function Thumbs({ ids, attachments, onView, small }: { ids: number[]; attachment
       {files.map((a) =>
         isMedia(a) ? (
           <button key={a.id} type="button" onClick={() => onView(a.id)} title={a.filename} className={clsx("cursor-zoom-in overflow-hidden rounded-sm ring-1 ring-line", box)}>
-            {isVideoFile(a) ? <VideoThumb src={`/api/attachments/${a.id}`} /> : <img src={`/api/attachments/${a.id}`} alt={a.filename} className="size-full object-cover" />}
+            {isVideoFile(a) ? <VideoThumb src={`/api/attachments/${a.id}`} /> : <img src={thumbSrc(a.id, small ? 200 : 400)} alt={a.filename} loading="lazy" decoding="async" className="size-full object-cover" />}
           </button>
         ) : (
           <AttachmentLink
@@ -153,7 +153,7 @@ function ClosedDecision({ decision, attachments, onView }: { decision: Decision;
   );
 }
 
-export function Decisions({ decisions, attachments, onView }: { decisions: Decision[]; attachments: Attachment[]; onView: (id: number) => void }) {
+export const Decisions = memo(function Decisions({ decisions, attachments, onView }: { decisions: Decision[]; attachments: Attachment[]; onView: (id: number) => void }) {
   if (!decisions.length) return null;
   const open = decisions.filter((d) => d.status === "open");
   const closed = decisions.filter((d) => d.status !== "open");
@@ -167,4 +167,4 @@ export function Decisions({ decisions, attachments, onView }: { decisions: Decis
       ))}
     </section>
   );
-}
+});

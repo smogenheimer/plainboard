@@ -13,13 +13,13 @@ from fastapi import APIRouter, File, Query, Request, UploadFile
 
 from ..schemas import (
     AttachmentOut, DocAreaIn, DocAreaOut, DocGroupIn, DocGroupOut, DocOutlineOut, DocApiKeyCreate, DocApiKeyCreated, DocApiKeyOut, DocCloudflareIn, DocCustomPageCreate, DocCustomPageOut, DocCustomPageUpdate, DocTheme, DocThemePreviewOut, DocCrumb, DocDnsOut, DocDomainIn, DocDomainOut, DocKeysIn, DocPageCreate, DocPageItem, DocPageOut, DocPagesOut,
-    DocPageUpdate, DocReleaseCreate, DocReleaseOut, DocReleaseUpdate, DocSiteCreate, DocSiteOut, DocSiteUpdate, DocTranslationIn, DocTranslationItem, DocTranslationOut, DocVerifyOut, DocVersionOut,
+    DocPageUpdate, DocReleaseCreate, DocReleaseOut, DocReleaseUpdate, DocSiteCreate, DocSiteOut, DocSiteUpdate, DocTranslationIn, DocTranslationItem, DocTranslationModelOut, DocTranslationOut, DocVerifyOut, DocVersionOut,
 )  # fmt: skip
 from ..services import docs as docs_service
 from ..services import docs_api, docs_areas, docs_custom, docs_domains, docs_releases, docs_theme, docs_translate
 from ..services import projects as project_service
 from ..services.errors import NotFound
-from .deps import Session, Who
+from .deps import Runs, Session, Who
 from .guard import _hosts
 
 router = APIRouter(prefix="/api/projects/{project_id}/docs", tags=["docs"])
@@ -107,6 +107,17 @@ async def set_keys(project_id: int, site_id: int, body: DocKeysIn, session: Sess
     return await _site_out(session, site)
 
 
+@router.get("/sites/{site_id}/translation-model", response_model=DocTranslationModelOut)
+async def translation_model(project_id: int, site_id: int, session: Session, runs: Runs) -> DocTranslationModelOut:
+    """The provider and model its "llm" translations use right now, and why they can't run if so (#178)."""
+    from ..orchestration.docs_watcher import translation_choice
+
+    site = await docs_service.get_site(session, project_id, site_id)
+    agent = await docs_service.ensure_agent(session, site)
+    choice = await translation_choice(session, runs, await project_service.get(session, project_id), site, agent)
+    return DocTranslationModelOut(provider=choice.provider, model=choice.model, provider_from=choice.provider_from, model_from=choice.model_from, problem=choice.problem)
+
+
 @router.post("/sites/{site_id}/translate", status_code=202)
 async def translate_now(project_id: int, site_id: int, session: Session, request: Request) -> dict:
     """Translate what is missing or outdated now (in bounded batches, in the background)."""
@@ -135,8 +146,8 @@ async def set_domain(project_id: int, site_id: int, body: DocDomainIn, session: 
 
 
 @router.post("/sites/{site_id}/domain/verify", response_model=DocVerifyOut)
-async def verify_domain(project_id: int, site_id: int, session: Session) -> DocVerifyOut:
-    return await docs_domains.verify(session, await docs_service.get_site(session, project_id, site_id))
+async def verify_domain(project_id: int, site_id: int, session: Session, request: Request) -> DocVerifyOut:
+    return await docs_domains.verify(session, await docs_service.get_site(session, project_id, site_id), target=_target(request))
 
 
 @router.post("/sites/{site_id}/domain/cloudflare", response_model=DocDnsOut)

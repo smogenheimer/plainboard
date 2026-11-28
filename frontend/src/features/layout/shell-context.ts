@@ -11,12 +11,15 @@ export interface ShellApi {
   agentById: (id: number | null | undefined) => Agent | undefined;
   /** The servers agents have left running, to open as a preview. */
   previews: Preview[];
-  openChat: (agentId: number) => void;
+  /** The chat with an agent; `text`: a prepared request in its field, to send or change. */
+  openChat: (agentId: number, text?: string) => void;
   openTask: (taskId: number) => void;
   /** The ideas, with this idea brought into view. */
   openIdea: (ideaId: number) => void;
   /** PlainBoard settings, at a section (admins only: others see no settings). */
   openSettings: (section?: string) => void;
+  /** The project's settings, at a section (owners only). */
+  openProjectSettings: (section?: string) => void;
   /** Show an address of the agents' environment (e.g. http://localhost:5173/) in the browser window. */
   openBrowser: (address: string) => void;
   /** The side chat next to the views: only on desktop, and not in the chat view itself. */

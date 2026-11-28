@@ -25,6 +25,7 @@ from ..models import Agent, AgentNote, Attachment, Comment, Conversation, Decisi
 from ..schemas import RetentionCount, RetentionPreviewOut
 from . import flow_log
 from . import settings as settings_service
+from . import thumbnails
 from .util import format_bytes
 
 log = logging.getLogger(__name__)
@@ -168,6 +169,7 @@ async def purge(session: AsyncSession, now: datetime) -> dict[int, list[Due]]:
             a = d.attachment
             try:
                 (uploads / a.storage_name).unlink(missing_ok=True)
+                thumbnails.discard(a.storage_name)
             except OSError as exc:
                 log.warning("Attachment %s (%s) not deleted: %s", a.id, a.filename, exc)
                 continue

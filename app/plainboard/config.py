@@ -45,6 +45,10 @@ class Config(BaseSettings):
     # A train waits this long for further branches after the first one is ready: members often
     # finish within minutes of each other, and whoever misses a train waits a whole check run.
     landing_linger_seconds: float = 90.0
+    # How soon the landing watcher looks again when something is due before its next tick: a train whose
+    # wait for further branches ends, a check command that may be over, a hand-over. 0: only every
+    # landing_interval_seconds (checks on a git host are read at most every HOST_POLL_SECONDS).
+    landing_quick_seconds: float = 5.0
     # Newer versions of PlainBoard itself: the commit this build is (written by the image build; the
     # variable overrides it), where newer ones come from (a fork names its own repository) and how
     # often to ask. See services/version.py.
