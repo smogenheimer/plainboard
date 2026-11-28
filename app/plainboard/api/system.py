@@ -15,10 +15,11 @@ from .. import db_move
 from ..config import get_config
 from ..models import TaskStatus, utcnow
 from ..orchestration.prompts import PINNED_BUDGET_CHARS
-from ..schemas import AccessKeyOut, CheckOut, LimitsOut, PauseOut, PublicApiKeyIn, SearchModelIn, RetentionPreviewOut, SearchStatusOut, SettingsOut, SettingsUpdate, TokenUsageOut, UsageOut
+from ..schemas import AccessKeyOut, CheckOut, HealthOut, LimitsOut, PauseOut, PublicApiKeyIn, SearchModelIn, RetentionPreviewOut, SearchStatusOut, SettingsOut, SettingsUpdate, TokenUsageOut, UsageOut
 from ..services import access_keys as access_key_service
 from ..services import accounts as account_service
 from ..services import db_read as db_read_service
+from ..services import health as health_service
 from ..services import limits as limits_service
 from ..services import pause as pause_service
 from ..services import retention as retention_service
@@ -111,6 +112,12 @@ async def move_database() -> dict[str, Any]:
     db_move.failed(sqlite_file).unlink(missing_ok=True)
     asyncio.get_running_loop().call_later(RESTART_AFTER_SECONDS, os.kill, os.getpid(), signal.SIGTERM)
     return {"restarting": True}
+
+
+@router.get("/status", response_model=HealthOut)
+async def status(session: Session, runs: Runs, who: Who, project_id: list[int] | None = Query(default=None)) -> HealthOut:
+    """Why nothing runs (services/health.py): pauses, runners, managers, subscriptions, for what the user sees."""
+    return await health_service.check(session, runs.runners, who.user, project_id)
 
 
 @router.get("/pause", response_model=PauseOut)

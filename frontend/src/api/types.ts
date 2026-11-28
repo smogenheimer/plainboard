@@ -375,6 +375,8 @@ export interface Run {
   read_at: string | null;
   /** A queued turn held because every subscription of its agent is used up: which one is free first, the window, and when (unix seconds). */
   limit_wait?: { account: string | null; window: string | null; until: number } | null;
+  /** A queued turn something holds: everything or its project paused, its runner away, its agent off (services/health.py). */
+  hold?: HealthIssue | null;
   input_text: string;
   /** A chat message: the person who wrote it. */
   author_name: string | null;
@@ -1484,4 +1486,19 @@ export interface DocDomain {
   token: string;
   verified_at: string | null;
   cloudflare_token_set: boolean;
+}
+
+/** One thing that keeps PlainBoard from working (GET /api/status, services/health.py). */
+export interface HealthIssue {
+  code: string;
+  blocking: boolean;
+  project_id: number | null;
+  project: string;
+  agent: string;
+  account: string;
+  by: string;
+  since: string | null;
+  until: string | null;
+  count: number;
+  detail: string;
 }

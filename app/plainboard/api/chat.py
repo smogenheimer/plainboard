@@ -6,10 +6,11 @@ from fastapi import APIRouter, File, Request, UploadFile
 from sqlalchemy import select
 
 from ..models import Agent, Project, Run, RunStatus, RunTrigger
-from ..schemas import AttachmentOut, ChatMessageIn, ConversationOut, MessageOut, RunOut
+from ..schemas import AttachmentOut, ChatMessageIn, ConversationOut, HealthIssue, MessageOut, RunOut
 from ..services import accounts as account_service
 from ..services import agents as agent_service
 from ..services import board as board_service
+from ..services import health as health_service
 from ..services import mentions as mention_service
 from ..services import settings as settings_service
 from ..services import users as user_service
@@ -89,7 +90,7 @@ async def reset_session(agent_id: int, session: Session) -> dict[str, bool]:
 
 
 @router.get("/projects/{project_id}/runs", response_model=list[RunOut])
-async def list_runs(project_id: int, session: Session, agent_id: int | None = None, active: bool = False, limit: int = 50) -> list[RunOut]:
+async def list_runs(project_id: int, session: Session, runs: Runs, agent_id: int | None = None, active: bool = False, limit: int = 50) -> list[RunOut]:
     q = select(Run).where(Run.project_id == project_id)
     if agent_id:
         q = q.where(Run.agent_id == agent_id)
@@ -98,7 +99,13 @@ async def list_runs(project_id: int, session: Session, agent_id: int | None = No
     rows = (await session.scalars(q.order_by(Run.id.desc()).limit(min(limit, 200)))).all()
     out = [RunOut.model_validate(r) for r in rows]
     waits: dict[int, dict | None] = {}
+    holds: dict[int, HealthIssue | None] = {}
     for run in out:
+        if run.status == RunStatus.QUEUED and run.parent_run_id is None and not run.stop_requested_at:
+            if run.agent_id not in holds:
+                agent = await session.get(Agent, run.agent_id)
+                holds[run.agent_id] = await health_service.hold(session, runs.runners, agent) if agent else None
+            run.hold = holds[run.agent_id]
         if run.status == RunStatus.QUEUED and run.trigger != RunTrigger.CHAT and run.parent_run_id is None:
             if run.agent_id not in waits:
                 agent = await session.get(Agent, run.agent_id)
