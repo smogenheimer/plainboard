@@ -608,6 +608,7 @@ export interface StatsDay {
   tickets_done: number;
   runs: number;
   failed_runs: number;
+  limited_runs: number;
   tokens: number;
   cost_usd: number;
   branches_landed: number;
@@ -646,6 +647,7 @@ export interface StatsAgent {
   agent_id: number;
   runs: number;
   failed_runs: number;
+  limited_runs: number;
   assignments_done: number;
   busy_seconds: number;
   tokens: number;

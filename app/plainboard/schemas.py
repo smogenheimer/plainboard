@@ -792,6 +792,7 @@ class StatsDay(BaseModel):
     tickets_done: int = 0
     runs: int = 0
     failed_runs: int = 0
+    limited_runs: int = 0  # failed turns a usage limit or an overload ended: waiting, not failures
     tokens: int = 0  # input + output
     cost_usd: float = 0.0
     # How fast work reaches the base branch (see StatsPeriod).
@@ -836,6 +837,7 @@ class StatsAgent(BaseModel):
     agent_id: int
     runs: int = 0
     failed_runs: int = 0
+    limited_runs: int = 0  # failed turns a usage limit or an overload ended: waiting, not failures
     assignments_done: int = 0
     busy_seconds: int = 0
     tokens: int = 0

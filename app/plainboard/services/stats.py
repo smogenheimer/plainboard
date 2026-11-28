@@ -53,17 +53,19 @@ async def overview(session: AsyncSession, project_id: int, days: int = 30, now: 
 
     agents: dict[int, StatsAgent] = {}
     runs = await session.execute(
-        select(Run.agent_id, Run.status, Run.created_at, Run.started_at, Run.finished_at, Run.input_tokens, Run.output_tokens, Run.cost_usd).where(
+        select(Run.agent_id, Run.status, Run.limited, Run.created_at, Run.started_at, Run.finished_at, Run.input_tokens, Run.output_tokens, Run.cost_usd).where(
             Run.project_id == project_id, Run.created_at >= since
         )
     )
-    for agent_id, status, created_at, started_at, finished_at, input_tokens, output_tokens, cost in runs:
+    for agent_id, status, limited, created_at, started_at, finished_at, input_tokens, output_tokens, cost in runs:
         day = by_day.get(created_at.date().isoformat())
         agent = agents.setdefault(agent_id, StatsAgent(agent_id=agent_id))
         for item in (day, agent):
             if item is not None:
                 item.runs += 1
-                item.failed_runs += status == RunStatus.FAILED
+                # A turn a usage limit or an overload ended is waiting, not a failure of the work (#5).
+                item.failed_runs += status == RunStatus.FAILED and not limited
+                item.limited_runs += status == RunStatus.FAILED and bool(limited)
                 item.tokens += input_tokens + output_tokens
                 item.cost_usd += cost
         if started_at and finished_at:
@@ -137,11 +139,12 @@ async def work_report(session: AsyncSession, project_id: int, days: int = 14) ->
     is_manager = {a.id: a.is_manager for a in agents}
 
     def totals() -> dict:
-        return {"runs": 0, "failed": 0, "turns": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0, "cost_usd": 0.0, "busy_seconds": 0, "wait_seconds": 0, "job_wait_seconds": 0}
+        return {"runs": 0, "failed": 0, "limited": 0, "turns": 0, "input_tokens": 0, "output_tokens": 0, "cache_read_tokens": 0, "cache_creation_tokens": 0, "cost_usd": 0.0, "busy_seconds": 0, "wait_seconds": 0, "job_wait_seconds": 0}
 
     def add(item: dict, run: Run) -> None:
         item["runs"] += 1
-        item["failed"] += run.status == RunStatus.FAILED
+        item["failed"] += run.status == RunStatus.FAILED and not run.limited
+        item["limited"] += run.status == RunStatus.FAILED and run.limited
         item["turns"] += run.num_turns
         for key in ("input_tokens", "output_tokens", "cache_read_tokens", "cache_creation_tokens"):
             item[key] += getattr(run, key)
