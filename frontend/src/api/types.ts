@@ -373,6 +373,8 @@ export interface Run {
   stop_requested_at: string | null;
   /** A waiting chat message: when its busy agent read it (before the turn that answers it). */
   read_at: string | null;
+  /** A queued turn held because every subscription of its agent is used up: which one is free first, the window, and when (unix seconds). */
+  limit_wait?: { account: string | null; window: string | null; until: number } | null;
   input_text: string;
   /** A chat message: the person who wrote it. */
   author_name: string | null;

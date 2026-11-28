@@ -1110,6 +1110,9 @@ class RunOut(ORM):
     finished_at: UTCDateTime | None
     stop_requested_at: UTCDateTime | None = None
     read_at: UTCDateTime | None = None  # a waiting chat message: when its busy agent read it
+    # A queued turn that waits because every subscription of its agent is used up: the subscription that is
+    # free first (label), the limit window that holds it, and when it resets (unix seconds).
+    limit_wait: dict | None = None
 
 
 # --- notes / schedules / mcp ----------------------------------------------------------------

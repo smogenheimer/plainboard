@@ -472,6 +472,8 @@
     "stop": "Stop",
     "deleteWaiting": "Delete this message (not sent to the agent yet)",
     "queued": "Sent after this turn…",
+    "limitWait": "Waiting for a usage limit: {{account}} · {{window}}, goes on by itself around {{time}}.",
+    "limitWaitUnknown": "Waiting for a usage limit, goes on by itself around {{time}}.",
     "openQuestions": "Tickets waiting for you",
     "stopping": {
       "active_one": "Stopping {{count}} agent",

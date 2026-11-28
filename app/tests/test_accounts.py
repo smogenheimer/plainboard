@@ -567,6 +567,10 @@ def test_turns_wait_while_every_subscription_is_used_up(client, project):
     (assignment,) = client.get(f"/api/projects/{pid}/assignments").json()
     assert next(r for r in client.get(f"/api/projects/{pid}/runs").json() if r["assignment_id"] == assignment["id"])["status"] == "queued"
 
+    # The chat says why: which subscription is free first, the window that holds it, and when (#5).
+    waiting = next(r for r in client.get(f"/api/projects/{pid}/runs").json() if r["assignment_id"] == assignment["id"])
+    assert waiting["limit_wait"]["account"] in ("Claude", "Second") and waiting["limit_wait"]["until"]
+
     # One is free again: the assignment runs there.
     report_limits(client, Second=(0.1, "allowed"))
     runs = client.app_ref.state.runs

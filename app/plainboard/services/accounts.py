@@ -532,6 +532,21 @@ async def used_up_until(session: AsyncSession, agent: Agent) -> int | None:
     return min(ends) if ends else None
 
 
+async def limit_wait(session: AsyncSession, agent: Agent) -> dict[str, Any] | None:
+    """Why the agent's queued turns wait, if every subscription it may run on is used up: the one that is
+    free first (its label), the window that holds it and when it resets (unix seconds). None if one has room,
+    or the reset time is unknown. What the chat shows instead of a turn that seems stuck (#5)."""
+    until = await used_up_until(session, agent)
+    if until is None:
+        return None
+    found = await limits_service.windows(session)
+    for account in await _candidates(session, agent.provider, agent):
+        for window in found.get(account.key, []):
+            if (window.status == "rejected" or window.utilization >= 1) and window.resets_at == until and limits_service.applies(window, agent.model):
+                return {"account": account.label, "window": window.name, "until": until}
+    return {"account": None, "window": None, "until": until}
+
+
 async def pick(
     session: AsyncSession,
     provider: str,
