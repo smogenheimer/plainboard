@@ -26,9 +26,9 @@ from . import permissions
 NEAR = account_service.SWITCH_AT
 
 
-def _resets(windows: list[LimitWindow]) -> int | None:
+def _resets(windows: list[LimitWindow], models: set[str | None]) -> int | None:
     """When the windows that make the account (nearly) full have all reset; None if one does not say."""
-    full = [w.resets_at for w in windows if w.status == "rejected" or w.utilization >= NEAR]
+    full = [w.resets_at for w in windows if (w.status == "rejected" or w.utilization >= NEAR) and any(limits_service.applies(w, m) for m in models)]
     return max(full) if full and all(full) else None  # type: ignore[type-var]
 
 
@@ -38,7 +38,9 @@ async def nearly_used_up(session: AsyncSession, project: Project, found: dict[st
     for a project that does not pause so."""
     if not project.limit_pause:
         return False, None
-    providers = set(await session.scalars(select(Agent.provider).where(Agent.project_id == project.id)))
+    agents = (await session.execute(select(Agent.provider, Agent.model).where(Agent.project_id == project.id))).all()
+    providers = {provider for provider, _ in agents}
+    models = {model for _, model in agents} or {None}  # a window for certain models (Fable) leaves the others room
     allowed = await permissions.account_ids(session, project)
     accounts = [a for a in await account_service.list_accounts(session) if a.enabled and a.provider in providers and (allowed is None or a.id in allowed)]
     if pinned := next((a for a in accounts if a.id == project.account_id), None):
@@ -46,7 +48,7 @@ async def nearly_used_up(session: AsyncSession, project: Project, found: dict[st
     if not accounts or not all(account_service.has_plan(a) for a in accounts):
         return False, None
     found = await limits_service.windows(session) if found is None else found
-    if any(limits_service.fullest(found.get(a.key, [])) < NEAR for a in accounts):
+    if any(limits_service.fullest(found.get(a.key, []), m) < NEAR for a in accounts for m in models):
         return False, None
-    ends = [end for a in accounts if (end := _resets(found.get(a.key, [])))]
+    ends = [end for a in accounts if (end := _resets(found.get(a.key, []), models))]
     return True, datetime.fromtimestamp(min(ends), UTC).replace(tzinfo=None) if ends else None

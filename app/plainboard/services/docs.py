@@ -36,6 +36,7 @@ from ..events import bus
 from ..models import Agent, Attachment, DocCustomPage, DocPage, DocPageVersion, DocRelease, DocSite, DocTranslation, utcnow
 from ..schemas import AgentCreate, AgentUpdate, AttachmentOut, DocAgentOut, DocPageItem, DocSiteOut, DocTheme
 from . import board as board_service
+from . import thumbnails as thumbnail_service
 from .errors import NotFound, ServiceError
 from .util import slugify
 
@@ -84,7 +85,7 @@ def clean_languages(values: list[str], language: str) -> list[str]:
 
 def site_out(site: DocSite, pages: int = 0, stale: int = 0, agent: Agent | None = None, releases: list | None = None) -> DocSiteOut:
     return DocSiteOut(
-        releases=releases or [], versioned=site.versioned, restructure_check=site.restructure_check,
+        releases=releases or [], versioned=site.versioned, restructure_check=site.restructure_check, check_budget=site.check_budget,
         id=site.id, project_id=site.project_id, name=site.name, slug=site.slug, description=site.description, spec=site.spec,
         published=site.published, public=site.public, language=site.language, languages=list(site.languages or []),
         translator=site.translator, translate_provider=site.translate_provider, translate_model=site.translate_model,
@@ -172,6 +173,8 @@ AGENT_GUIDE = """You are the doc agent of the doc site "{name}" (slug {slug}, /d
 - Link related pages of your site where it helps readers, in new pages and when you revise one: in the running text
   and with a short "See also" line at the end of a section. Always as [text](doc-page:ID) (ids from list_docs), never
   an address or path: such links survive moves and renames. The doc spec decides over this.
+- Link external pages readers can open where they exist, e.g. a public repository, download or upstream project you
+  mention: as a normal [text](https://...) link on its first mention on a page. The doc spec decides over this too.
 - Pictures for one mode: ![alt](doc-file:ID#light) shows only in light mode, #dark only in dark mode, without one in
   both. For screenshots, where it helps, give both variants (a light and a dark one) side by side.
 - Give each page the code paths it describes (paths): changes there after a landing come back to you. On a page you
@@ -185,6 +188,9 @@ AGENT_GUIDE = """You are the doc agent of the doc site "{name}" (slug {slug}, /d
   meaning and its concrete terms (settings, commands, endpoints, UI labels) for other pages that describe what changed,
   also pages nobody marked; change them only where they now describe it wrongly. A new feature without a page: add one
   per the doc spec. Don't read all pages.
+- To find what a change made wrong: doc_grep the OLD value (a version, setting, flag, name) over all pages, doc_search
+  its meaning by section, changes_since (page) for the commits, releases and decisions since a page was last checked,
+  releases for the repositories' tags.
 - Keep a short overview of your site in your own notes (remember: which page covers what) and update it when you add,
   move or remove pages.
 - Keep pages short and find before you write (list_docs query): change a page rather than add a second one.
@@ -239,7 +245,7 @@ ASSISTANT_FIELDS = (
     "assistant_enabled", "assistant_provider", "assistant_model", "assistant_effort", "assistant_code", "assistant_daily_messages",
     "assistant_daily_cost", "assistant_max_tokens",
 )  # fmt: skip
-SITE_FIELDS = ("name", "description", "spec", "published", "public", "versioned", "restructure_check", "translator", "translate_provider", "translate_model", *ASSISTANT_FIELDS)
+SITE_FIELDS = ("name", "description", "spec", "published", "public", "versioned", "restructure_check", "check_budget", "translator", "translate_provider", "translate_model", *ASSISTANT_FIELDS)
 ASSISTANT_PROVIDERS = ("", "claude_code")  # a provider whose runs can go without any built-in tool (toolset "none")
 ASSISTANT_WARNING = (
     "With this on, the assistant reads the project's code and the public texts of its tickets to answer visitors. "
@@ -299,6 +305,7 @@ async def delete_site(session: AsyncSession, site: DocSite) -> None:
     project_id, site_id = site.project_id, site.id
     for attachment in await files(session, site_id):
         board_service.storage_path(attachment).unlink(missing_ok=True)
+        thumbnail_service.discard(attachment.storage_name)
     if (agent := await doc_agent(session, site_id)) is not None:
         from . import agents as agent_service
 
@@ -355,6 +362,7 @@ async def span_of(session: AsyncSession, site_id: int, rel: DocRelease | None) -
 _COPIED = (
     "project_id", "site_id", "parent_id", "position", "page_key", "title", "slug", "path", "depth", "body", "source_hash", "paths", "moved_from", "edited_by",
     "edited_at", "drift", "flagged_at", "flag_reason", "reminded_at", "created_at", "area_id", "group_id",
+    "human_only",
 )  # fmt: skip
 
 
@@ -577,7 +585,7 @@ def item(page: DocPage, children_count: int = 0, rel: DocRelease | None = None) 
         id=page.page_key or page.id, site_id=page.site_id, release_id=rel.id if rel is not None and not rel.working else None, parent_id=page.parent_id,
         position=page.position, title=page.title, slug=page.slug, path=page.path, depth=page.depth, children=children_count, paths=list(page.paths or []),
         edited_by=page.edited_by, edited_at=page.edited_at, drift=page.drift, flagged_at=page.flagged_at, flag_reason=page.flag_reason, updated_at=page.updated_at,
-        area_id=page.area_id, group_id=page.group_id,
+        area_id=page.area_id, group_id=page.group_id, human_only=page.human_only,
     )  # fmt: skip
 
 
@@ -713,12 +721,13 @@ async def create_page(
 async def update_page(
     session: AsyncSession, page: DocPage, author: Author, *, title: str | None = None, body: str | None = None, move: bool = False,
     parent_id: int | None = None, position: int | None = None, slug: str | None = None, paths: list[str] | None = None, reason: str = "",
-    rel: DocRelease | None = None, area_id: int | None | object = KEEP, group_id: int | None | object = KEEP,
+    rel: DocRelease | None = None, area_id: int | None | object = KEEP, group_id: int | None | object = KEEP, human_only: bool | None = None,
 ) -> DocPage:  # fmt: skip
     """A new title or text is a new version (and makes its translations outdated); a move, a new slug or new linked
     paths are none. ``page`` is its row in ``rel`` (None: the working version); a change of title, text or place goes
     to that version only, linked paths to the row (they matter in the working version only). ``area_id``,
-    ``group_id`` (given to change them; None: none): its place in the navigation, pages at the top only."""
+    ``group_id`` (given to change them; None: none): its place in the navigation, pages at the top only.
+    ``human_only`` (given to change it): written by people only, in every version of the page (#166)."""
     from . import docs_areas
 
     now = utcnow()
@@ -752,6 +761,9 @@ async def update_page(
         await docs_areas.place(session, site, page, new_area, new_group, rel)  # type: ignore[arg-type]
     if paths is not None:
         page.paths = _paths(paths)
+    if human_only is not None and human_only != page.human_only:  # the page in every version (#166)
+        await session.execute(update(DocPage).where(DocPage.page_key == page.page_key).values(human_only=human_only))
+        page.human_only = human_only
     if changed:
         page.title = title.strip()[:200] if title is not None else page.title
         page.body = body if body is not None else page.body
@@ -890,17 +902,31 @@ async def _mark_linkers(session: AsyncSession, site_id: int, gone: dict[int, str
         row.flagged_at, row.reminded_at = row.flagged_at or now, None
 
 
-async def delete_page(session: AsyncSession, page: DocPage, rel: DocRelease | None = None) -> None:
-    """With the pages below it, from this version (None: the working one); the other versions keep theirs. Gone from
-    every version, a page goes with all its versions and translations."""
-    project_id, key, site_id, parent_id, position = page.project_id, page.page_key, page.site_id, page.parent_id, page.position
-    span = await span_of(session, site_id, rel)
+async def _tree(session: AsyncSession, page: DocPage, rel: DocRelease | None) -> list[list[DocPage]]:
+    """The page and the pages below it, level by level."""
     tree = [[page]]
     for _ in range(MAX_DEPTH):
         below = list(await session.scalars(select(DocPage).where(DocPage.parent_id.in_([p.page_key for p in tree[-1]]), visible(rel))))
         if not below:
             break
         tree.append(below)
+    return tree
+
+
+HUMAN_ONLY = "written by people only"  # such a page (#166): the doc agent reads and links it, never changes it
+
+
+async def human_pages(session: AsyncSession, page: DocPage, rel: DocRelease | None = None) -> list[DocPage]:
+    """The pages written by people only among the page and those below it (what deleting it would take along)."""
+    return [row for level in await _tree(session, page, rel) for row in level if row.human_only]
+
+
+async def delete_page(session: AsyncSession, page: DocPage, rel: DocRelease | None = None) -> None:
+    """With the pages below it, from this version (None: the working one); the other versions keep theirs. Gone from
+    every version, a page goes with all its versions and translations."""
+    project_id, key, site_id, parent_id, position = page.project_id, page.page_key, page.site_id, page.parent_id, page.position
+    span = await span_of(session, site_id, rel)
+    tree = await _tree(session, page, rel)
     gone = {row.page_key: row.title for level in tree for row in level}
     for level in reversed(tree):  # the deepest first: nothing goes by a cascade before its turn
         for row in level:

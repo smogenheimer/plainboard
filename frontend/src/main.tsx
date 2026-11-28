@@ -2,6 +2,7 @@ import { QueryClient, QueryClientProvider } from "@tanstack/react-query";
 import { StrictMode } from "react";
 import { createRoot } from "react-dom/client";
 import App from "./App";
+import { ErrorBoundary } from "./components/ErrorBoundary";
 import "@fontsource-variable/sofia-sans-semi-condensed";
 import "./i18n";
 import "@fontsource-variable/inter";
@@ -17,7 +18,9 @@ const queryClient = new QueryClient({
 createRoot(document.getElementById("root")!).render(
   <StrictMode>
     <QueryClientProvider client={queryClient}>
-      <App />
+      <ErrorBoundary>
+        <App />
+      </ErrorBoundary>
     </QueryClientProvider>
   </StrictMode>,
 );

@@ -706,3 +706,38 @@ def test_a_window_the_provider_no_longer_reports_is_gone_at_once(client):
     assert names() == {"five_hour": 0.2, "seven_day": 0.6, "seven_day_opus": 0.3}
     client.portal.call(report, [], None, ("Ultra", 10.0))
     assert names() == {} and limits_of(client, first["id"])["plan"] == "Ultra"
+
+
+def test_a_deleted_subscription_leaves_no_mention_and_never_blocks_saving(client, project):
+    """#162: a deleted subscription stayed in the project's list, and saving the project's settings failed
+    with "Account not found". Deleting it removes it everywhere; one that is still stored is dropped on saving."""
+    from test_permissions import friend
+    from test_mcp_server import db
+    from plainboard.models import Project
+
+    pid = project["id"]
+    gone = client.post("/api/accounts", json={"provider": "claude_code", "label": "Gone", "auth_mode": "oauth_token", "secret": "tok-gone"}).json()
+    stays = client.post("/api/accounts", json={"provider": "claude_code", "label": "Stays", "auth_mode": "oauth_token", "secret": "tok-stays"}).json()
+    dev = make_dev(client, pid)
+    assert client.put(f"/api/projects/{pid}/accounts", json={"account_ids": [gone["id"], stays["id"]]}).status_code == 200
+    assert client.patch(f"/api/projects/{pid}", json={"account_id": gone["id"]}).status_code == 200
+    assert client.patch(f"/api/agents/{dev['id']}", json={"account_id": gone["id"]}).status_code == 200
+    person = friend(client, account_ids=[gone["id"], stays["id"]])
+
+    assert client.delete(f"/api/accounts/{gone['id']}").status_code == 204
+    shown = client.get(f"/api/projects/{pid}").json()
+    assert shown["account_ids"] == [stays["id"]] and shown["account_id"] is None
+    assert agents_by_slug(client, pid)["dev"]["account_id"] is None  # chooses automatically again
+    assert next(u for u in client.get("/api/users").json() if u["id"] == person["id"])["account_ids"] == [stays["id"]]
+    assert turn(client, pid, dev["id"]).claude_oauth_token == "tok-stays"
+
+    # A gone one still stored from before the fix: saving with it is no error, it is dropped; a new unknown one is refused.
+    async def stale(s):
+        project_row = await s.get(Project, pid)
+        project_row.account_ids = [gone["id"], stays["id"]]
+        await s.commit()
+
+    db(stale)
+    assert client.put(f"/api/projects/{pid}/accounts", json={"account_ids": [gone["id"], stays["id"]]}).json()["account_ids"] == [stays["id"]]
+    assert client.put(f"/api/projects/{pid}/accounts", json={"account_ids": [gone["id"], stays["id"]]}).status_code == 404
+    assert client.patch(f"/api/users/{person['id']}", json={"account_ids": [gone["id"]]}).status_code == 404

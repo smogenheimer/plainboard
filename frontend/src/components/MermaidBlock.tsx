@@ -249,7 +249,36 @@ function sized(svg: string, background: string): { inline: string; image: string
   return { inline: new XMLSerializer().serializeToString(root), image };
 }
 
-type State = { svg: { inline: string; image: string }; error?: undefined } | { svg?: undefined; error: string } | { svg?: undefined; error?: undefined };
+/** An xychart writes its category labels side by side, all level: many or long ones run into each
+ * other. Such a chart gets the room they need: a bar chart lies (one row per category, as wide as the
+ * block), a line chart or one that asks to stand turns its labels and grows wider (it scrolls). A
+ * chart whose labels fit, and the chart's own settings (%%{init}%%), stay as they are. */
+const XY_WIDTH = 700;
+const XY_LABEL_PX = 14;
+const charWidth = XY_LABEL_PX * 0.6;
+function xyChart(code: string, room: number) {
+  const lines = code.replace(/^\s*---\n[\s\S]*?\n---/, "").split("\n").filter((l) => l.trim() && !l.trim().startsWith("%%"));
+  const head = /^\s*xychart(?:-beta)?\b\s*(\w*)/i.exec(lines[0] ?? "");
+  const axis = /^\s*x-axis\b[^[]*\[(.*)\]/im.exec(code);
+  if (!head || !axis) return undefined;
+  const labels = axis[1].match(/"[^"]*"|[^,]+/g)?.map((l) => l.trim().replace(/^"|"$/g, "")).filter(Boolean) ?? [];
+  const longest = Math.max(0, ...labels.map((l) => l.length)) * charWidth;
+  const slot = (XY_WIDTH - 100) / Math.max(1, labels.length);
+  if (longest + 8 <= slot) return undefined;
+  const lies = head[1].toLowerCase() === "horizontal";
+  if (lies || (!head[1] && !/^\s*line\b/im.test(code))) {
+    const width = Math.round(Math.min(XY_WIDTH, Math.max(360, room)));
+    return { chartOrientation: "horizontal" as const, width, height: Math.max(300, labels.length * 24 + 120) };
+  }
+  return {
+    width: Math.max(XY_WIDTH, labels.length * 24 + 120),
+    height: 400 + Math.ceil(Math.min(longest, 240) * Math.SQRT1_2),
+    plotReservedSpacePercent: 40,
+    xAxis: { labelRotation: -45 },
+  };
+}
+
+type State ={ svg: { inline: string; image: string }; error?: undefined } | { svg?: undefined; error: string } | { svg?: undefined; error?: undefined };
 
 /** A ```mermaid block drawn as a diagram in the app's design. Until it is drawn, and when its
  * syntax is broken, it stays a code block (`fallback`), then with the error below. `open`: the block
@@ -271,6 +300,8 @@ export function MermaidBlock({ code, open, fallback }: { code: string; open: boo
     const settings = [...(code.match(/^\s*---\n[\s\S]*?\n---/) ?? []), ...(code.match(/%%\{[\s\S]*?\}%%/g) ?? [])].join("\n");
     const ownTheme = /\btheme["']?\s*:/.test(settings);
     const own = ownTheme || /\btheme(Variables|CSS)["']?\s*:/.test(settings);
+    // The block's inner width (less its padding), for a chart that should fit it.
+    const xy = xyChart(code, anchor.current.clientWidth - 16);
     draw(async (mermaid) => {
       const config = {
         startOnLoad: false,
@@ -279,6 +310,7 @@ export function MermaidBlock({ code, open, fallback }: { code: string; open: boo
         htmlLabels: false,
         // Gantt takes the page's width (it is drawn off-screen): a fixed one that suits a message.
         gantt: { useWidth: 800, fontSize: 12, sectionFontSize: 12, barHeight: 22, leftPadding: 90, axisFormat: "%b %d" },
+        xyChart: { width: XY_WIDTH, height: 500, plotReservedSpacePercent: 50, chartOrientation: "vertical" as const, xAxis: { labelRotation: 0 }, ...xy },
         ...(ownTheme ? {} : { theme: "base" as const, themeVariables: vars }),
       };
       const key = JSON.stringify(config);

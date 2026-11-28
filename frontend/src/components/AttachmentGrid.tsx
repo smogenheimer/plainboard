@@ -1,16 +1,18 @@
 import clsx from "clsx";
 import { FileText, FileX, Trash2, Upload } from "lucide-react";
-import { useRef, useState, type DragEvent } from "react";
+import { memo, useRef, useState, type DragEvent } from "react";
 import { useTranslation } from "react-i18next";
 import type { Attachment } from "../api/types";
 import { chatTime, formatBytes, formatDateTime } from "../lib/format";
-import { isMediaFile, isVideoFile } from "../lib/media";
+import { isMediaFile, isVideoFile, thumbSrc } from "../lib/media";
 import { AttachmentLink } from "./AttachmentLink";
 import { Badge, Button, IconButton } from "./ui";
 import { VideoThumb } from "./VideoThumb";
 
+const FIRST = 12; // more files are shown on request: a ticket with dozens of screenshots stays quick to open
+
 /** Files of a ticket or an idea: thumbnails, upload by button or drop, removal. Media open via onView. */
-export function AttachmentGrid({
+export const AttachmentGrid = memo(function AttachmentGrid({
   attachments,
   reviewIds,
   onUpload,
@@ -28,6 +30,11 @@ export function AttachmentGrid({
   const { t } = useTranslation();
   const input = useRef<HTMLInputElement>(null);
   const [over, setOver] = useState(false);
+  const [all, setAll] = useState(false);
+  // Files added while it is open are shown too, not hidden behind the button.
+  const [known] = useState(attachments.length);
+  const shown = all ? attachments : [...attachments.slice(0, FIRST), ...attachments.slice(Math.max(FIRST, known))];
+  const hidden = attachments.length - shown.length;
 
   const onDrop = (e: DragEvent) => {
     e.preventDefault();
@@ -72,7 +79,7 @@ export function AttachmentGrid({
           <p className="py-3 text-center text-fg-3">{t(canWrite ? "ticket.dropFiles" : "ticket.noFiles")}</p>
         ) : (
           <div className="grid grid-cols-2 gap-2 sm:grid-cols-3">
-            {attachments.map((a) => (
+            {shown.map((a) => (
               <div key={a.id} className="group relative overflow-hidden rounded-sm ring-1 ring-line">
                 {a.purged_at ? (
                   <div className="flex h-24 w-full flex-col items-center justify-center gap-1 bg-sunk px-2 text-center text-fg-3">
@@ -81,7 +88,7 @@ export function AttachmentGrid({
                   </div>
                 ) : isMediaFile(a) ? (
                   <button type="button" onClick={() => onView(a.id)} className="block h-24 w-full cursor-zoom-in">
-                    {isVideoFile(a) ? <VideoThumb src={`/api/attachments/${a.id}`} /> : <img src={`/api/attachments/${a.id}`} alt={a.filename} className="h-24 w-full object-cover" />}
+                    {isVideoFile(a) ? <VideoThumb src={`/api/attachments/${a.id}`} /> : <img src={thumbSrc(a.id, 400)} alt={a.filename} loading="lazy" decoding="async" className="h-24 w-full object-cover" />}
                   </button>
                 ) : (
                   <AttachmentLink file={a} className="flex h-24 w-full items-center justify-center bg-sunk">
@@ -113,7 +120,12 @@ export function AttachmentGrid({
             ))}
           </div>
         )}
+        {(hidden > 0 || all) && attachments.length > FIRST && (
+          <Button size="sm" variant="ghost" className="mt-2 w-full" onClick={() => setAll(!all)}>
+            {all ? t("ticket.fewerFiles") : t("ticket.allFiles", { count: attachments.length })}
+          </Button>
+        )}
       </div>
     </section>
   );
-}
+});

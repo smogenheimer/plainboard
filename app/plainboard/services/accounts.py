@@ -318,18 +318,31 @@ async def switch_off_own(session: AsyncSession) -> None:
 
 
 async def delete(session: AsyncSession, account: Account) -> None:
-    await release(session, account, gone=True)
-    await session.execute(sql_update(Agent).where(Agent.account_id == account.id).values(account_id=None))
-    await session.delete(account)
+    await _forget(session, account)
     await session.commit()
 
 
 async def delete_owned(session: AsyncSession, user: User) -> None:
     """A person is deleted: so are their own subscriptions, and what ran on them chooses again."""
     for account in list(await session.scalars(select(Account).where(Account.owner_id == user.id))):
-        await release(session, account, gone=True)
-        await session.execute(sql_update(Agent).where(Agent.account_id == account.id).values(account_id=None))
-        await session.delete(account)
+        await _forget(session, account)
+
+
+async def _forget(session: AsyncSession, account: Account) -> None:
+    """Delete the account and every mention of it (#162): what ran on it chooses automatically again (``release``),
+    and no project's or person's list of subscriptions names it any longer. Not committed."""
+    await release(session, account, gone=True)
+    await session.execute(sql_update(Agent).where(Agent.account_id == account.id).values(account_id=None))
+    await session.execute(sql_update(Project).where(Project.account_id == account.id).values(account_id=None))
+    for project in await session.scalars(select(Project)):
+        if account.id in (project.account_ids or []):
+            project.account_ids = [i for i in project.account_ids if i != account.id]
+        if account.id in (project.blocked_account_ids or []):
+            project.blocked_account_ids = [i for i in project.blocked_account_ids or [] if i != account.id]
+    for user in await session.scalars(select(User)):
+        if account.id in (user.account_ids or []):
+            user.account_ids = [i for i in user.account_ids or [] if i != account.id]
+    await session.delete(account)
 
 
 async def check_pin(session: AsyncSession, account_id: int | None, provider: str, project_id: int | None = None) -> None:
@@ -346,9 +359,9 @@ async def limit_project(session: AsyncSession, project: Project, account_ids: li
     """The only accounts the project's agents may run on from now on; none: any. What the project or
     one of its agents had chosen outside of them is chosen automatically again."""
     known = {a.id for a in await list_accounts(session)}
-    if unknown := [i for i in account_ids if i not in known]:
-        raise NotFound(f"Account not found: {unknown[0]}")
-    project.account_ids = list(dict.fromkeys(account_ids))
+    if unknown := [i for i in account_ids if i not in known and i not in (project.account_ids or [])]:
+        raise NotFound(f"Account not found: {unknown[0]}")  # one that is gone but was kept here is dropped (#162)
+    project.account_ids = [i for i in dict.fromkeys(account_ids) if i in known]
     if project.account_ids:
         keep = list(set(project.account_ids) | await permissions.contributed(session, project))  # what members gave it stays
         if project.account_id not in keep:
@@ -431,7 +444,7 @@ async def shut_out(session: AsyncSession, provider: str, agent: Agent) -> str:
     if not accounts or any(a.id in allowed for a in accounts):
         return ""
     return (
-        f"This project may only use some of the installation's subscriptions, and none of them is for {agent.provider}. "
+        f"This project may only use some of the installation's subscriptions, and none of them is for {provider}. "
         "An admin can change that (Project settings, Team, or what the project's owner may use in Settings, Users), or the agent can be given a provider the project has a subscription for."
     )
 
@@ -446,18 +459,20 @@ def _hours_left(windows: list[LimitWindow], now: float) -> float:
     return max(1.0, (max(ends, default=now + WEEK_HOURS * HOUR) - now) / HOUR)
 
 
-def _rank(account: Account, windows: list[LimitWindow], size: float = 1.0, now: float | None = None) -> tuple[int, float]:
+def _rank(account: Account, windows: list[LimitWindow], size: float = 1.0, now: float | None = None, model: str | None = None) -> tuple[int, float]:
     """Lower is better: subscriptions with room, the rest of nearly full ones, API keys, used-up
-    subscriptions; within each, the most usage left in absolute terms per hour until it is lost."""
+    subscriptions; within each, the most usage left in absolute terms per hour until it is lost.
+    ``model``: what the turn runs on; a window for other models does not count."""
     if not has_plan(account):
         return 2, 0.0
+    windows = [w for w in windows if limits_service.applies(w, model)]
     utilization = limits_service.fullest(windows)
     room = max(0.0, 1 - utilization) * size
     return (0 if utilization < SWITCH_AT else 1 if utilization < 1 else USED_UP), -room / _hours_left(windows, time.time() if now is None else now)
 
 
-def used_up_now(account: Account, windows: dict[str, list[LimitWindow]]) -> bool:
-    return _rank(account, windows.get(account.key, []))[0] == USED_UP
+def used_up_now(account: Account, windows: dict[str, list[LimitWindow]], model: str | None = None) -> bool:
+    return _rank(account, windows.get(account.key, []), model=model)[0] == USED_UP
 
 
 def plan_sizes(accounts: list[Account], said: dict[str, float]) -> dict[int, float]:
@@ -508,9 +523,9 @@ async def used_up_until(session: AsyncSession, agent: Agent) -> int | None:
     found = await limits_service.windows(session)
     ends = []
     for account in accounts:
-        if not used_up_now(account, found):
+        if not used_up_now(account, found, agent.model):
             return None
-        resets = [w.resets_at for w in found.get(account.key, []) if w.status == "rejected" or w.utilization >= 1]
+        resets = [w.resets_at for w in found.get(account.key, []) if (w.status == "rejected" or w.utilization >= 1) and limits_service.applies(w, agent.model)]
         if not resets or not all(resets):
             return None
         ends.append(max(resets))  # type: ignore[type-var]
@@ -536,9 +551,10 @@ async def pick(
     found = await limits_service.windows(session)
     sizes = plan_sizes(accounts, await limits_service.plan_sizes(session))
     now = time.time()
+    model = model or (agent.model if agent else None)
 
     def rank(account: Account) -> tuple[int, float]:
-        return _rank(account, found.get(account.key, []), sizes.get(account.id, 1.0), now)
+        return _rank(account, found.get(account.key, []), sizes.get(account.id, 1.0), now, model)
 
     best = min(accounts, key=rank)
     last = next((a for a in accounts if conv and a.key == conv.account_key), None)
@@ -578,7 +594,7 @@ async def other_with_room(session: AsyncSession, provider: str, agent: Agent, co
     """Another account for a turn the account ``used_up`` (by key) was turned away on; None if
     there is none that is not used up as well."""
     account = await pick(session, provider, agent, conv, where=where)
-    if account is None or account.key == used_up or used_up_now(account, await limits_service.windows(session)):
+    if account is None or account.key == used_up or used_up_now(account, await limits_service.windows(session), agent.model):
         return None
     return account
 

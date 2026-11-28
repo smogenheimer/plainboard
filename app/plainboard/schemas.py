@@ -246,7 +246,7 @@ class FolderOut(BaseModel):
 
 class CleanedOut(BaseModel):
     path: str
-    what: str  # build | cache | folder | logs | server
+    what: str  # build | cache | folder | workdir | logs | home | tmp | server
     bytes: int = 0
 
 
@@ -254,7 +254,7 @@ class CleanupOut(BaseModel):
     """A cleanup (services/cleanup.py): by the manager, in an emergency by itself, or servers stopped for memory."""
 
     at: UTCDateTime
-    level: str  # manager | emergency | memory
+    level: str  # manager | emergency | trim | routine | after | memory
     freed: int = 0
     free_before: int = 0
     total: int = 0
@@ -555,6 +555,8 @@ class ProjectUpdate(BaseModel):
     idea_provider: str | None = Field(default=None, max_length=50)  # sorting ideas: "" the same as questions again
     idea_model: str | None = Field(default=None, max_length=100)
     idea_effort: str | None = Field(default=None, max_length=20)
+    cleanup_provider: str | None = Field(default=None, max_length=50)  # cleanup runs: "" the manager's provider again
+    cleanup_model: str | None = Field(default=None, max_length=100)
 
 
 class ProjectAccountsIn(BaseModel):
@@ -594,6 +596,8 @@ class ProjectOut(ORM):
     idea_provider: str = ""
     idea_model: str = ""
     idea_effort: str = ""
+    cleanup_provider: str = ""
+    cleanup_model: str = ""
     label_colors: dict[str, str] = Field(default_factory=dict)
     created_at: UTCDateTime
 
@@ -1026,6 +1030,8 @@ class TaskDetail(TaskOut):
 class ChatMessageIn(BaseModel):
     text: str = ""
     attachment_ids: list[int] = Field(default_factory=list)
+    # Chosen by the browser per message: sent again (no answer came, the server restarted), it is not taken twice.
+    client_key: str | None = Field(default=None, max_length=64)
 
     @model_validator(mode="after")
     def not_empty(self) -> ChatMessageIn:
@@ -1069,6 +1075,7 @@ class ChatPartOut(BaseModel):
     text: str = ""
     attachment_ids: list[int] = Field(default_factory=list)
     at: UTCDateTime
+    key: str | None = None  # the sender's own id of it (``ChatMessageIn.client_key``): its outbox lets go of it
 
 
 class RunOut(ORM):
@@ -1592,7 +1599,7 @@ class FlowTicketBranch(BaseModel):
 
 # --- ideas (services/ideas.py, orchestration/ideas.py) -----------------------------------------
 
-IDEA_TEXT_MAX = 10000
+IDEA_TEXT_MAX = 100_000  # the ideas field says so when a paste is longer (frontend: IDEA_TEXT_MAX)
 
 
 class IdeaCreate(BaseModel):
@@ -1601,12 +1608,6 @@ class IdeaCreate(BaseModel):
     topic_id: int | None = None  # placed by a person: the model leaves its topic alone
     x: float | None = None
     y: float | None = None
-
-
-class IdeaInput(BaseModel):
-    """What a person typed into the field of the board of ideas: the model reads what they mean."""
-
-    text: str = Field(min_length=1, max_length=IDEA_TEXT_MAX)
 
 
 class IdeaUpdate(BaseModel):
@@ -1630,7 +1631,7 @@ class IdeaOut(ORM):
     title: str
     text: str
     author: str
-    status: str  # open | taken | dismissed | merged
+    status: str  # open | reading (typed, the model reads it soon) | taken | dismissed | merged
     topic_id: int | None
     topic_manual: bool
     task_id: int | None
@@ -1651,6 +1652,7 @@ class IdeaOut(ORM):
     question_at: UTCDateTime | None
     closed_at: UTCDateTime | None
     closed_reason: str
+    handed_over_at: UTCDateTime | None = None  # handed to the manager, not yet taken or left out (#163)
     attachments: list[AttachmentOut] = Field(default_factory=list)
     created_at: UTCDateTime
     updated_at: UTCDateTime
@@ -1702,10 +1704,31 @@ class IdeaChangeOut(ORM):
     ideas: list[IdeaOut] = Field(default_factory=list)  # the ideas it touched, as they are now (with an answer only)
 
 
+class IdeaModelBlocked(BaseModel):
+    """The idea model set can't be used: the project may use no subscription of its provider."""
+
+    provider: str
+    provider_label: str
+    model: str
+
+
 class IdeasOut(BaseModel):
     topics: list[IdeaTopicOut]
     ideas: list[IdeaOut]
     sorting: bool = False  # the model is sorting ideas right now
+    model_blocked: IdeaModelBlocked | None = None  # ideas stay unsorted until that is changed
+
+
+class IdeaHandOver(BaseModel):
+    """Ideas for the manager to make tickets of; no ids: all open ones."""
+
+    idea_ids: list[int] | None = None
+    message: str = Field(default="", max_length=10000)
+
+
+class IdeaHandOverOut(BaseModel):
+    agent_id: int  # the manager: its chat has the message
+    ideas: list[IdeaOut]
 
 
 class IdeaTicketIn(BaseModel):
@@ -1826,6 +1849,7 @@ class DocSiteUpdate(BaseModel):
     spec: str | None = Field(default=None, max_length=20000)
     versioned: bool | None = None  # versions (#126): off again, they stay but are not served
     restructure_check: bool | None = None  # its doc agent proposes larger restructurings now and then (#156)
+    check_budget: int | None = Field(default=None, ge=0, le=200_000)  # tokens of pages its doc agent checks a day (#190); 0: none
     published: bool | None = None
     public: bool | None = None
     languages: list[str] | None = Field(default=None, max_length=30)  # further languages, translated
@@ -1845,6 +1869,16 @@ class DocSiteUpdate(BaseModel):
     assistant_daily_cost: float | None = Field(default=None, ge=0, le=100000)  # USD per day; 0: no cap
     assistant_max_tokens: int | None = Field(default=None, ge=128, le=8192)
     theme: DocTheme | None = None  # its look (#121); DocTheme() as it is: none
+
+
+class DocTranslationModelOut(BaseModel):
+    """What the site's "llm" translations run on right now (#178), as the doc watcher decides it."""
+
+    provider: str
+    model: str
+    provider_from: str  # "site" | "agent": its own setting or its doc agent's provider
+    model_from: str  # "site" | "small": its own setting or the provider's small model
+    problem: str = ""  # why it can't run (no subscription the project may use, no sign-in); "": it can
 
 
 class DocKeysIn(BaseModel):
@@ -1969,6 +2003,7 @@ class DocSiteOut(ORM):
     agent: DocAgentOut | None = None  # its doc agent, the only agent that writes it
     versioned: bool = False  # uses versions (#126): off, it always shows the current state and visitors see no versions
     restructure_check: bool = True  # its doc agent proposes larger restructurings now and then (#156)
+    check_budget: int = 4000  # tokens of pages its doc agent checks a day, the riskiest first (#190); 0: none
     releases: list[DocReleaseOut] = []  # its versions (#126): the working one first, then the released ones, newest first
     url: str  # its address under this PlainBoard: /docs/<slug>/
     pages: int = 0
@@ -1999,6 +2034,7 @@ class DocPageItem(ORM):
     updated_at: UTCDateTime
     area_id: int | None = None  # its area and group in the navigation (#159): pages at the top only
     group_id: int | None = None
+    human_only: bool = False  # written by people only: the doc agent never changes it (#166)
 
 
 class DocCrumb(BaseModel):
@@ -2045,6 +2081,7 @@ class DocPageUpdate(BaseModel):
     reason: str = Field(default="", max_length=300)
     area_id: int | None = None  # given: its area and group change (None: none); pages at the top only
     group_id: int | None = None
+    human_only: bool | None = None  # written by people only (#166): in every version of the page
 
 
 class DocAreaIn(BaseModel):
@@ -2114,7 +2151,8 @@ class DocDnsOut(BaseModel):
 
 class DocVerifyOut(BaseModel):
     verified: bool
-    detail: str = ""
+    detail: str = ""  # not verified: what the domain answered and what that means
+    hint: str = ""  # what to do about it
     verified_at: UTCDateTime | None = None
 
 

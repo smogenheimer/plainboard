@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import asyncio
 from datetime import UTC, datetime
 
 from fastapi import APIRouter, File, Query, UploadFile
@@ -18,6 +19,7 @@ from ..schemas import (
     FlowHistory,
     FlowLive,
     FlowTicketBranch,
+    IdeaOut,
     RunOut,
     StatsOut,
     TaskCreate,
@@ -30,8 +32,10 @@ from ..services import board as board_service
 from ..services import decisions as decision_service
 from ..services import flow as flow_service
 from ..services import flow_check as flow_check_service
+from ..services import ideas as idea_service
 from ..services import projects as project_service
 from ..services import stats as stats_service
+from ..services import thumbnails as thumbnail_service
 from ..services import trace as trace_service
 from ..services import users as user_service
 from ..services.errors import NotFound, ServiceError
@@ -79,6 +83,15 @@ async def update_task(task_id: int, body: TaskUpdate, session: Session, runs: Ru
 @router.delete("/tasks/{task_id}", status_code=204)
 async def delete_task(task_id: int, session: Session) -> None:
     await board_service.delete_task(session, await board_service.get_task(session, task_id))
+
+
+@router.post("/tasks/{task_id}/to-idea", response_model=list[IdeaOut])
+async def ticket_to_idea(task_id: int, session: Session, runs: Runs, who: Who) -> list[IdeaOut]:
+    """A ticket of the Backlog back into the ideas (#172): its ideas open again, or a new one; the ticket is archived."""
+    task = await board_service.get_task(session, task_id)
+    ideas = await idea_service.from_ticket(session, task, who.name)
+    runs.ideas.sort_soon(task.project_id)
+    return await idea_service.outs(session, ideas)
 
 
 @router.post("/tasks/{task_id}/start", response_model=RunOut)
@@ -193,7 +206,7 @@ async def answer_decision(decision_id: int, body: DecisionAnswer, session: Sessi
 
 
 @router.get("/attachments/{attachment_id}")
-async def download(attachment_id: int, session: Session, inline: bool = True) -> FileResponse:
+async def download(attachment_id: int, session: Session, inline: bool = True, w: int | None = Query(None, ge=1, le=4000)) -> FileResponse:
     attachment = await board_service.get_attachment(session, attachment_id)
     path = board_service.storage_path(attachment)
     if attachment.purged_at is not None:
@@ -203,6 +216,10 @@ async def download(attachment_id: int, session: Session, inline: bool = True) ->
     # Inline only what is passive by its content (pictures, PDF, plain text); never a page or an SVG on this origin.
     shown = board_service.inline_type(path, attachment.filename) if inline else None
     headers = {"X-Content-Type-Options": "nosniff"}
+    if w is not None and shown and (small := await asyncio.to_thread(thumbnail_service.preview, path, attachment.storage_name, shown, w)):
+        # A file never changes under its id: the browser keeps the preview without asking again.
+        headers |= {"Content-Security-Policy": "default-src 'none'; sandbox", "Cache-Control": "private, max-age=2592000, immutable"}
+        return FileResponse(small, media_type="image/webp", content_disposition_type="inline", headers=headers)
     if shown != "application/pdf":  # the browsers' PDF viewers do not open under the sandbox; a PDF runs no script on the origin
         headers["Content-Security-Policy"] = "default-src 'none'; sandbox"
     if shown:

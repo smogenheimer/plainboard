@@ -56,6 +56,7 @@ class RunTrigger(StrEnum):
     IDEAS = "ideas"  # sorting ideas or planning tickets from them (orchestration/ideas.py): for the statistics only
     DOCS = "docs"  # translating doc pages (services/docs_translate.py): for the statistics only
     DOC_ASSISTANT = "doc_assistant"  # a visitor's question to a doc site's assistant (orchestration/docs_assistant.py): statistics only
+    CLEANUP = "cleanup"  # a disk-space cleanup run (orchestration/cleanup_run.py): for the statistics only
 
 
 class AssignmentStatus(StrEnum):
@@ -222,6 +223,9 @@ class Project(Timestamps, Base):
     idea_provider: Mapped[str] = mapped_column(String(50), default="", server_default="")
     idea_model: Mapped[str] = mapped_column(String(100), default="", server_default="")
     idea_effort: Mapped[str] = mapped_column(String(20), default="", server_default="")
+    # What cleans up its disk space (orchestration/cleanup_run.py). Empty: the manager's provider, its small model.
+    cleanup_provider: Mapped[str] = mapped_column(String(50), default="", server_default="")
+    cleanup_model: Mapped[str] = mapped_column(String(100), default="", server_default="")
 
     agents: Mapped[list[Agent]] = relationship(back_populates="project", cascade="all, delete-orphan", passive_deletes=True)
 
@@ -472,6 +476,7 @@ class Task(Timestamps, Base):
 
 class IdeaStatus(StrEnum):
     OPEN = "open"
+    READING = "reading"  # typed, waiting for the model to read it (orchestration/ideas.py); not yet an idea for anything else
     TAKEN = "taken"  # became (part of) a ticket: task_id
     DISMISSED = "dismissed"  # left out on purpose (closed_reason), or its creation was undone
     MERGED = "merged"  # went into another idea (merged_into_id)
@@ -521,6 +526,7 @@ class Idea(Timestamps, Base):
     question_status: Mapped[str] = mapped_column(String(10), default="", server_default="")  # "" | open | answered | withdrawn
     question_answer: Mapped[str] = mapped_column(Text, default="", server_default="")
     question_at: Mapped[datetime | None] = mapped_column(DateTime)
+    handed_over_at: Mapped[datetime | None] = mapped_column(DateTime)  # handed to the manager to make tickets of (#163)
 
 
 class IdeaLink(Base):
@@ -664,6 +670,10 @@ class DocSite(Timestamps, Base):
     restructure_check: Mapped[bool] = mapped_column(Boolean, default=True, server_default=true())
     structure_checked_at: Mapped[datetime | None] = mapped_column(DateTime)
     structure_pages: Mapped[int] = mapped_column(Integer, default=0, server_default="0")
+    # The daily rolling check (#190, orchestration/docs_watcher.py): its doc agent gets the riskiest pages, together at
+    # most this many tokens of text a day (0: none). And how far the watcher read decisions and files for it.
+    check_budget: Mapped[int] = mapped_column(Integer, default=4000, server_default="4000")
+    changes_at: Mapped[datetime | None] = mapped_column(DateTime)
 
 
 class DocProposal(Timestamps, Base):
@@ -720,6 +730,9 @@ class DocPage(Timestamps, Base):
     # Its area and group in the navigation (#159, services/docs_areas.py): pages at the top only, by their keys.
     area_id: Mapped[int | None] = mapped_column(ForeignKey("doc_areas.id", ondelete="SET NULL"), index=True)
     group_id: Mapped[int | None] = mapped_column(ForeignKey("doc_groups.id", ondelete="SET NULL"), index=True)
+    # Written by people only (#166): the doc agent reads and links it but never changes it; the docs watcher orders no
+    # work on it. Set on every row of the page (all its versions) at once.
+    human_only: Mapped[bool] = mapped_column(Boolean, default=False, server_default=false())
 
 
 class DocArea(Timestamps, Base):
@@ -870,6 +883,23 @@ class DocWatch(Base):
     head: Mapped[str] = mapped_column(String(64), default="")
     landed_at: Mapped[datetime | None] = mapped_column(DateTime)
     checked_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)
+
+
+class RepoTag(Base):
+    """A tag (release) of a project's repository, as the docs watcher read them (#190): its doc agents hear of a new one
+    with what changed since the one before, and see them (tools releases, changes_since). Not moved with the project:
+    read anew from the repository there."""
+
+    __tablename__ = "repo_tags"
+    __table_args__ = (UniqueConstraint("repository_id", "name", name="uq_repo_tags_name"),)
+    id: Mapped[int] = mapped_column(primary_key=True)
+    project_id: Mapped[int] = mapped_column(ForeignKey("projects.id", ondelete="CASCADE"), index=True)
+    repository_id: Mapped[int] = mapped_column(ForeignKey("repositories.id", ondelete="CASCADE"), index=True)
+    name: Mapped[str] = mapped_column(String(250))
+    sha: Mapped[str] = mapped_column(String(64), default="")
+    tagged_at: Mapped[datetime | None] = mapped_column(DateTime)  # when it was made (naive UTC)
+    subject: Mapped[str] = mapped_column(String(300), default="")
+    seen_at: Mapped[datetime] = mapped_column(DateTime, default=utcnow)  # when the watcher first read it
 
 
 class Decision(Timestamps, Base):

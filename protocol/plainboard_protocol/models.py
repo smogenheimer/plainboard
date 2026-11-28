@@ -15,6 +15,7 @@ Toolset = Literal["full", "board", "read", "none"]
 # A provider account's key on the runner. The default account keeps the sign-in from before accounts existed.
 DEFAULT_ACCOUNT = "default"
 ACCOUNT_KEY_PATTERN = r"^[A-Za-z0-9_-]{1,40}$"
+SCRATCH = ".scratch"  # an agent's folder for work data, in its workspace (made by the runner, counted to its project)
 
 
 class ModelInfo(BaseModel):
@@ -243,6 +244,32 @@ class JobSpec(BaseModel):
     command: str
     workspace: str
     credentials: Credentials
+    env: dict[str, str] = Field(default_factory=dict)  # e.g. PLAINBOARD_AGENT: whose it is (LeftoverSpec)
+
+
+class LeftoverOwner(BaseModel):
+    agent: str  # as in PLAINBOARD_AGENT, which its turns and jobs carry in their environment
+    workspace: str = ""  # its own folder (not one the team shares): what runs in it, or a container mounts from it, is its too
+
+
+class LeftoverSpec(BaseModel):
+    """What these agents left running outside their jobs: detached processes and Docker containers."""
+
+    owners: list[LeftoverOwner]
+    stop: bool = False
+    before: float | None = None  # unix time: only what started before then
+
+
+class Leftover(BaseModel):
+    agent: str
+    kind: Literal["process", "container"]
+    id: str  # the pid, or the container's id
+    label: str  # its command line, or the container's name and image
+
+
+class LeftoverResult(BaseModel):
+    found: list[Leftover] = Field(default_factory=list)
+    docker: str = ""  # why containers were not looked at ("": they were, or there is no Docker here)
 
 
 class JobState(BaseModel):
@@ -317,6 +344,7 @@ class CleanupFolder(BaseModel):
     idle_since: float = 0  # unix time of its agent's last turn; oldest first
     orphan: bool = False  # no agent has it any more (deleted or renamed): may go entirely if nothing in it is unpushed
     busy: bool = False  # its agent works (turn, open assignment, running job): only listed, deleted only when asked to
+    clones: list[str] | None = None  # names of the project's repositories (its clones there); other folders in it are extra work folders. None: none are offered
 
 
 class CleanupSpec(BaseModel):
@@ -325,11 +353,12 @@ class CleanupSpec(BaseModel):
     level: CleanupLevel  # soft: what costs nothing to rebuild; hard: also installed dependencies
     need: int  # bytes to free; cleaning stops once that much is gone
     folders: list[CleanupFolder] = Field(default_factory=list)
+    tmp_days: float = 0  # > 0: also leftovers in the temp folder nothing changed in for that long (the regular cleanup)
 
 
 class CleanedItem(BaseModel):
     path: str
-    what: Literal["build", "cache", "folder", "logs", "home"]
+    what: Literal["build", "cache", "folder", "workdir", "logs", "home", "tmp"]
     bytes: int
     users: list[str] = Field(default_factory=list)  # trimmed shared cache: the agent folders whose clones use its tool
 
@@ -347,7 +376,7 @@ class CleanupCandidate(BaseModel):
     """Something the manager may delete to free room (runner ``cleanup.candidates``)."""
 
     path: str
-    what: Literal["build", "cache", "folder", "home"]  # build output in an agent's folder, a cache, a removed agent's folder, a folder in the shared home
+    what: Literal["build", "cache", "folder", "workdir", "home"]  # build output in an agent's folder, a cache, a removed agent's folder, an extra work folder in an agent's folder (a worktree, another clone), a folder in the shared home
     bytes: int = 0
     safety: CandidateSafety  # safe: can be made again; busy: its agent works now; unsure: may hold work; keep: holds unpushed work or tools
     why: str = ""
@@ -356,10 +385,14 @@ class CleanupCandidate(BaseModel):
     tool: str = ""  # a shared tool cache (sccache, cargo, npm, pip, ...): nobody's, PlainBoard trims it itself
     modified: float = 0  # unix time of the newest change anywhere in it
     entries: dict[str, int] = Field(default_factory=dict)  # home and cache: its biggest top-level entries, bytes
+    parent: str = ""  # home: the folder at the top of the home it is in (a folder of several agents' work); build: the home folder it is in
+    agents: list[int] = Field(default_factory=list)  # home: the agents (PLAINBOARD_AGENT) whose processes work in it now
+    measured: float = 0  # unix time its size was measured (sizes are kept for a while)
 
 
 class CandidatesSpec(BaseModel):
     folders: list[CleanupFolder] = Field(default_factory=list)  # every agent folder of the projects without a folder of their own
+    home: bool = True  # False: only what is in these folders, not the shared home
 
 
 class UnpushedSpec(BaseModel):
@@ -492,6 +525,8 @@ class GitLogSpec(BaseModel):
     limit: int = Field(default=1000, ge=1, le=5000)  # the newest ones
     upto: str | None = Field(default=None, pattern=r"^[0-9a-f]{7,64}$")  # the older history: read from this commit instead of the head, when it is on the branch
     skip: int = Field(default=0, ge=0)  # with upto: after its newest this many (the pages read already)
+    diffs: int = Field(default=0, ge=0, le=500)  # the newest this many commits come with their changed lines (the docs watcher, #190)
+    diff_chars: int = Field(default=8000, ge=0, le=200_000)  # of each such diff
 
 
 class GitCommit(BaseModel):
@@ -504,6 +539,7 @@ class GitCommit(BaseModel):
     file_count: int = 0
     insertions: int = 0
     deletions: int = 0
+    diff: str = ""  # with GitLogSpec.diffs: its changed lines (git show -U0, lock files left out), cut at diff_chars
 
 
 class GitLogResult(BaseModel):
@@ -511,6 +547,33 @@ class GitLogResult(BaseModel):
     head: str = ""  # the branch's commit now: where the next call starts (with upto: the commit read from)
     total: int | None = None  # the branch's commits without merges (None: a runner from before it)
     commits: list[GitCommit] = Field(default_factory=list)  # newest first
+
+
+class GitTagsSpec(BaseModel):
+    """A repository's tags (releases), newest first; for those not ``known`` yet also what changed since the tag
+    before them (the docs watcher, #190). An empty ``known``: only the list."""
+
+    credentials: Credentials
+    key: str = Field(pattern=TRAIN_KEY)
+    remote: RepoSpec
+    limit: int = Field(default=100, ge=1, le=1000)
+    known: list[Annotated[str, Field(max_length=250)]] = Field(default_factory=list, max_length=1000)
+    diffs: int = Field(default=5, ge=0, le=50)  # new tags that come with the changes since their previous tag
+    diff_chars: int = Field(default=20000, ge=0, le=200_000)
+
+
+class GitTag(BaseModel):
+    name: str
+    sha: str = ""  # the commit it names
+    date: str = ""  # ISO 8601: when it was made (an annotated tag) or its commit's date
+    subject: str = ""  # its message's first line (annotated) or its commit's
+    previous: str = ""  # the tag before it, with the changes below
+    subjects: list[str] = Field(default_factory=list)  # of the commits since ``previous``
+    diff: str = ""  # their changed lines since ``previous`` (-U0, lock files left out), cut at diff_chars
+
+
+class GitTagsResult(BaseModel):
+    tags: list[GitTag] = Field(default_factory=list)
 
 
 class GitPresentSpec(BaseModel):
@@ -717,6 +780,8 @@ class LimitWindow(BaseModel):
     utilization: float  # fraction used; can pass 1
     resets_at: int | None = None  # unix seconds
     status: str | None = None
+    # The model (family) the window limits, as the provider names it (e.g. "Fable"); None: all of the plan's usage.
+    model: str | None = None
 
 
 class LimitsEvent(BaseModel):

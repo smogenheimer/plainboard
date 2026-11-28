@@ -712,7 +712,10 @@ def purged_text(attachment: Attachment) -> str:
 
 
 def _remove_file(attachment: Attachment) -> None:
+    from . import thumbnails
+
     storage_path(attachment).unlink(missing_ok=True)
+    thumbnails.discard(attachment.storage_name)
 
 
 # What an attachment may be shown as in the browser: told by its first bytes, not by what the uploader

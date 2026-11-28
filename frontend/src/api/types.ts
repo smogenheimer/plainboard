@@ -50,6 +50,9 @@ export interface Project {
   idea_provider: string;
   idea_model: string;
   idea_effort: string;
+  /** What cleans up the project's disk space; "" : the manager's provider, its small model. */
+  cleanup_provider: string;
+  cleanup_model: string;
   label_colors: Record<string, string>;
   created_at: string;
 }
@@ -357,6 +360,8 @@ export interface ChatPart {
   text: string;
   attachment_ids: number[];
   at: string;
+  /** The sender's own id of it (its outbox's key). */
+  key?: string | null;
 }
 
 export interface Run {
@@ -521,6 +526,8 @@ export interface LimitWindow {
   utilization: number;
   resets_at: number | null;
   status: string | null;
+  /** The model (family) the window limits, e.g. "Fable"; null: all of the plan's usage. */
+  model?: string | null;
 }
 
 export interface LimitForecast {
@@ -849,14 +856,14 @@ export interface UsageStorage {
   notices: StorageNotice[];
 }
 
-/** What a cleanup removed (by the manager, in an emergency by itself, shared caches trimmed above the target), or which servers it stopped (level "memory"). */
+/** What a cleanup removed (by the manager, in an emergency by itself, shared caches trimmed above the target, the regular cleanup daily or after an assignment), or which servers it stopped (level "memory"). */
 export interface UsageCleanup {
   at: string;
-  level: "manager" | "emergency" | "trim" | "memory";
+  level: "manager" | "emergency" | "trim" | "routine" | "after" | "memory";
   freed: number;
   free_before: number;
   total: number;
-  items: { path: string; what: "build" | "cache" | "folder" | "logs" | "home" | "server"; bytes: number }[];
+  items: { path: string; what: "build" | "cache" | "folder" | "workdir" | "logs" | "home" | "tmp" | "server"; bytes: number }[];
   kept: string[];
   told: boolean;
   by: string;
@@ -1148,7 +1155,8 @@ export interface Idea {
   title: string;
   text: string;
   author: string;
-  status: "open" | "taken" | "dismissed" | "merged";
+  /** reading: typed, the AI reads it in the background (#161). */
+  status: "open" | "reading" | "taken" | "dismissed" | "merged";
   topic_id: number | null;
   /** Placed by a person: the AI leaves its topic alone. */
   topic_manual: boolean;
@@ -1174,6 +1182,8 @@ export interface Idea {
   question_at: string | null;
   closed_at: string | null;
   closed_reason: string;
+  /** Handed to the manager to make tickets of, not yet taken or left out (#163). */
+  handed_over_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -1217,11 +1227,22 @@ export interface IdeasData {
   ideas: Idea[];
   /** The AI is sorting ideas right now. */
   sorting: boolean;
+  /** The idea model set can't be used: the project may use no subscription of its provider. */
+  model_blocked: { provider: string; provider_label: string; model: string } | null;
 }
 
 // --- doc sites (#118) ---------------------------------------------------------------------------
 
 export type DocTranslator = "" | "llm" | "deepl" | "google";
+
+/** What the site's "llm" translations run on right now (#178): provider_from "site" | "agent", model_from "site" | "small". */
+export interface DocTranslationModel {
+  provider: string;
+  model: string;
+  provider_from: "site" | "agent";
+  model_from: "site" | "small";
+  problem: string;
+}
 
 export interface DocAgent {
   id: number;
@@ -1278,6 +1299,8 @@ export interface DocSite {
   versioned: boolean;
   /** Its doc agent proposes larger restructurings now and then, the user decides (#156). */
   restructure_check: boolean;
+  /** Tokens of page text its doc agent re-checks a day, the riskiest pages first (#190); 0: none. */
+  check_budget: number;
   /** Its versions: the working one first, then the released ones, the newest first. */
   releases: DocRelease[];
   created_at: string;
@@ -1381,6 +1404,8 @@ export interface DocPageItem {
   /** Pages at the top: their area and group in the navigation (#159). */
   area_id?: number | null;
   group_id?: number | null;
+  /** Written by people only: the doc agent reads and links it but never changes it (#166). */
+  human_only?: boolean;
 }
 
 /** An area of a doc site's navigation (#159): its id is the same in every version. */

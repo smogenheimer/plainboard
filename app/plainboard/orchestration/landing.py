@@ -79,6 +79,11 @@ MERGE_METHODS = ["merge", "rebase", "squash"]
 GUARD_BUSY_SECONDS = 3 * 60
 GUARD_QUIET_SECONDS = 20 * 60
 RED_REMIND_SECONDS = 4 * 3600  # a red base branch nothing repairs: the manager hears of it again after this
+# Checks on a git host (an API with a quota) are read faster than every tick only around the time they
+# usually end (the median of the repository's last runs): from this much before it to this much after.
+HOST_POLL_SECONDS = 10
+HOST_EARLY_SECONDS = 45
+HOST_LATE_SECONDS = 300
 ACTIONS_RUN = re.compile(r"/actions/runs/(\d+)")
 
 
@@ -126,11 +131,16 @@ class Repo:
 
 
 class LandingWatcher:
-    def __init__(self, sessionmaker: async_sessionmaker[AsyncSession], runs: RunManager, interval: float, linger: float = 0.0):
+    def __init__(self, sessionmaker: async_sessionmaker[AsyncSession], runs: RunManager, interval: float, linger: float = 0.0, quick: float = 0.0):
         self._sm = sessionmaker
         self._runs = runs
         self._interval = interval
         self.linger = linger  # seconds a train waits for further branches before it leaves
+        # Between ticks, a repository is looked at again when something of it is due (0: never): measured,
+        # the 30 s tick added a quarter of a minute to every departure and to every check that ended.
+        self.quick = quick
+        self._due: dict[int, datetime] = {}  # repository -> when it is looked at before the next tick
+        self._wake = asyncio.Event()
         self._holds: set[tuple[int, datetime]] = set()  # red phases whose hold is in the work log already
         # Branches held back because they change a file someone resolves a conflict in, with what was
         # being resolved then (Busy.key). While that is the same, they are not tried again.
@@ -146,16 +156,53 @@ class LandingWatcher:
             self._task.cancel()
             await asyncio.gather(self._task, return_exceptions=True)  # its database connection is back before the engine goes
 
+    def wake(self, repository_id: int) -> None:
+        """Something of this repository may go on now (a branch was handed over): look at it right away."""
+        if self.quick > 0:
+            self._due[repository_id] = utcnow()
+            self._wake.set()
+
     async def _loop(self) -> None:
+        loop = asyncio.get_running_loop()
+        tick_at = loop.time()
         while True:
             try:
-                await self.tick()
+                if loop.time() >= tick_at:
+                    tick_at = loop.time() + self._interval
+                    await self.tick()
+                else:
+                    await self.look()
             except Exception:
                 log.exception("Landing watcher tick failed")
-            await asyncio.sleep(self._interval)
+            self._wake.clear()
+            delay = tick_at - loop.time()
+            if self._due:
+                delay = min(delay, (min(self._due.values()) - utcnow()).total_seconds())
+            if delay > 0:
+                try:
+                    await asyncio.wait_for(self._wake.wait(), delay)
+                except TimeoutError:
+                    pass
+
+    async def look(self, now: datetime | None = None) -> None:
+        """Between ticks: only the repositories something is due for (_due), and only their trains."""
+        now = now or utcnow()
+        due = sorted(repository_id for repository_id, at in self._due.items() if at <= now)
+        for repository_id in due:
+            del self._due[repository_id]
+        if not due:
+            return
+        async with self._sm() as s:
+            for repository_id in due:
+                try:
+                    await self._repository(s, repository_id, now, quick=True)
+                except (RunnerError, ServiceError) as exc:
+                    await s.rollback()
+                    log.info("Landing for repository %s postponed: %s", repository_id, exc)
 
     async def tick(self, now: datetime | None = None) -> None:
         now = now or utcnow()
+        self._due.clear()  # each repository that is busy is looked at now and says again what is due
         async with self._sm() as s:
             waiting = await s.scalars(select(Landing.repository_id).where(Landing.status.in_(landing_service.ACTIVE)))
             running = await s.scalars(select(Train.repository_id).where(Train.status.in_(landing_service.RUNNING_TRAINS)))
@@ -197,7 +244,7 @@ class LandingWatcher:
             redact=secret_service.redactor(credentials.secrets),
         )
 
-    async def _repository(self, s: AsyncSession, repository_id: int, now: datetime) -> None:
+    async def _repository(self, s: AsyncSession, repository_id: int, now: datetime, quick: bool = False) -> None:
         r = await self._repo(s, repository_id)
         if r is None:
             return
@@ -206,7 +253,8 @@ class LandingWatcher:
             train = await landing_service.running_train(s, repo.id)
         else:
             # Trains of branches don't wait for a look at the base branch: both go on side by side.
-            if guard := await landing_service.running_train(s, repo.id, direct=True):
+            # Nothing waits for that look either, so it is left to the tick.
+            if not quick and (guard := await landing_service.running_train(s, repo.id, direct=True)):
                 try:
                     await self._watch_base(s, r, guard, now)
                 except RunnerError as exc:
@@ -231,8 +279,9 @@ class LandingWatcher:
                     )
                 raise
             if not over:
+                await self._again(s, r, train, now)
                 return
-        if self._runs.paused or project.paused_at is not None:
+        if self._runs.paused or project.paused_at is not None or project.limit_paused_at is not None:
             return  # paused (everything, or this project): the train on its way is watched to its end, no new one leaves
         if not self._runs.runners.accepts(project.id):
             return  # its runner is about to restart for its self-update: a check run started now would be cut
@@ -511,7 +560,7 @@ class LandingWatcher:
             return
         if group is not None and await self._unrepaired(s, r, pick):
             return
-        if group is None and self.linger > 0 and (now - min(p.updated_at for p in pick)).total_seconds() < self.linger:
+        if group is None and await self._lingers(s, r, pick, now, full=len(pick) >= size):
             return  # more branches may be about to get ready: a fuller train means fewer check runs
         if r.mode is None:
             for landing in pick:
@@ -560,6 +609,8 @@ class LandingWatcher:
                 landing.status, landing.train_id, landing.head_sha = LandingStatus.TRAIN, train.id, result.merged[landing.branch]
                 landing.conflict_at, landing.conflict_files = None, []
         await s.commit()
+        if train is not None:
+            await self._again(s, r, train, now)
         await flow_log.record(
             s, r.project.id, "train.departed" if train else "train.empty", train_id=train.id if train else None, branches=[p.branch for p in on_train],
             ready=len(waiting), size_limit=size, repaired_group=group is not None, mode=r.mode, landed_already=list(result.landed), conflicts=list(result.conflicts),
@@ -567,6 +618,51 @@ class LandingWatcher:
         )  # fmt: skip
 
         await self._left_out(s, r, result, by_branch, tickets, now, busy)
+
+    async def _lingers(self, s: AsyncSession, r: Repo, pick: list[Landing], now: datetime, *, full: bool) -> bool:
+        """Whether the next train still waits for further branches (``linger``). Not when it is full, nor
+        when nobody could hand one over meanwhile: a branch is handed over in a turn, so without a turn of
+        a member who works on this repository nothing more comes (measured: a third of all trains waited
+        the whole minute and a half for nothing). The waiting ends to the second, not with the next tick."""
+        if full or self.linger <= 0:
+            return False
+        left = self.linger - (now - min(p.updated_at for p in pick)).total_seconds()
+        if left <= 0:
+            return False
+        if not await self._may_hand_over(s, r):
+            return False
+        if self.quick > 0:  # the turn that may hand one over can end before that: looked at again soon
+            self._due[r.repo.id] = now + timedelta(seconds=min(left, self.quick))
+        return True
+
+    @staticmethod
+    async def _may_hand_over(s: AsyncSession, r: Repo) -> bool:
+        """Whether a member who works on this repository has a turn that runs or is about to."""
+        members = or_(Agent.all_repos, Agent.id.in_(select(agent_repositories.c.agent_id).where(agent_repositories.c.repository_id == r.repo.id)))
+        q = select(Run.id).join(Agent, Agent.id == Run.agent_id).where(
+            Run.project_id == r.project.id, Run.status.in_(ACTIVE_RUN_STATUSES), Agent.is_manager.is_(False), Agent.doc_site_id.is_(None), members
+        )
+        return bool(await s.scalar(q.limit(1)))
+
+    async def _again(self, s: AsyncSession, r: Repo, train: Train, now: datetime) -> None:
+        """When a train that is not over is looked at again before the next tick. A check command is a job
+        on the runner: looked at every few seconds. Checks on a git host: around the time they usually end."""
+        if self.quick <= 0 or train.status != TrainStatus.CHECKING:
+            return
+        if train.job_id:
+            self._due[r.repo.id] = now + timedelta(seconds=self.quick)
+            return
+        q = select(Train.check_seconds).where(
+            Train.repository_id == train.repository_id, Train.direct == train.direct, (Train.size > 0) if train.size else (Train.size == 0),
+            Train.status.in_((TrainStatus.LANDED, TrainStatus.FAILED)), Train.check_seconds > 0, Train.rerun_at.is_(None),
+        )  # fmt: skip
+        seconds = sorted(await s.scalars(q.order_by(Train.id.desc()).limit(10)))
+        if not seconds:
+            return
+        usual, since = seconds[len(seconds) // 2], train.rerun_at or train.created_at
+        if now >= since + timedelta(seconds=usual + HOST_LATE_SECONDS):
+            return
+        self._due[r.repo.id] = max(since + timedelta(seconds=usual - HOST_EARLY_SECONDS), now + timedelta(seconds=max(self.quick, HOST_POLL_SECONDS)))
 
     async def _ready(self, s: AsyncSession, r: Repo, now: datetime) -> tuple[list[Landing], landing_service.Busy]:
         """What can go to the base branch next: handed over, or repaired since it came back. A branch
@@ -640,7 +736,7 @@ class LandingWatcher:
         waiting, busy = await self._ready(s, r, now)
         waiting = await self._hold(s, r, waiting, now)
         pick = waiting[: landing_service.MAX_BATCH]
-        if not pick or (self.linger > 0 and (now - min(p.updated_at for p in pick)).total_seconds() < self.linger):
+        if not pick or await self._lingers(s, r, pick, now, full=len(pick) >= landing_service.MAX_BATCH):
             return
         tickets = {p.id: await self._ticket(s, p) for p in pick}
         spec = TrainSpec(
@@ -691,6 +787,7 @@ class LandingWatcher:
             r.repo.tidied_at = None  # the branch tidy looks again (orchestration/tidy.py)
             await s.commit()
             timing_service.forget_cache()
+            await self._again(s, r, train, now)
             await flow_log.record(
                 s, r.project.id, "train.landed", train_id=train.id, branches=[m.branch for m in landed], direct=True, ready=len(waiting), mode=train.mode,
                 conflicts=list(result.conflicts), missing=list(result.missing), unchanged=list(result.unchanged), waits=list(result.waits), held=list(result.held),
@@ -726,7 +823,7 @@ class LandingWatcher:
             return
         self._looked[repository_id] = now
         r = await self._repo(s, repository_id)
-        if r is None or self._runs.paused or r.project.paused_at is not None:
+        if r is None or self._runs.paused or r.project.paused_at is not None or r.project.limit_paused_at is not None:
             return
         await self._remind(s, r, now)
         if r.slug is None:

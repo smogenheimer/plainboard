@@ -51,7 +51,8 @@ async def lifespan(app: FastAPI):
     runs = RunManager(sessionmaker(), runner)
     scheduler = Scheduler(sessionmaker(), runs, config.scheduler_interval_seconds)
     job_watcher = JobWatcher(sessionmaker(), runs, config.job_watch_interval_seconds)
-    landing = LandingWatcher(sessionmaker(), runs, config.landing_interval_seconds, config.landing_linger_seconds)
+    landing = LandingWatcher(sessionmaker(), runs, config.landing_interval_seconds, config.landing_linger_seconds, config.landing_quick_seconds)
+    runs.wake_landing = landing.wake
     app.state.runner, app.state.runs, app.state.scheduler, app.state.job_watcher = runner, runs, scheduler, job_watcher
     app.state.landing = landing
     tidy = app.state.tidy = BranchTidy(sessionmaker(), runs, config.tidy_interval_seconds)

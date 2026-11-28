@@ -590,6 +590,13 @@ def test_rate_limit_events_become_limit_windows():
     assert limit_windows(RateLimitInfo(status="rejected", rate_limit_type="overage")) == []
     # A response's headers name every header window of the plan (Ultra has no 5-hour one); a lone type doesn't.
     assert "five_hour" in limit_covers(RateLimitInfo(status="allowed", raw=raw)) and limit_covers(RateLimitInfo(status="rejected", rate_limit_type="five_hour")) == []
+    # The weekly window of the overage-included models is Claude Code's "Fable limit"; only some responses carry it,
+    # so one without it says nothing about it (it may come from the usage answer).
+    raw = {"unifiedWindows": {"seven_day": {"utilization": 0.24, "resetsAt": 200}, "seven_day_overage_included": {"utilization": 0.6, "resetsAt": 300, "status": "allowed"}}}
+    assert [(w.name, w.model) for w in limit_windows(RateLimitInfo(status="allowed", raw=raw))] == [("seven_day", None), ("seven_day_fable", "Fable")]
+    assert "seven_day_fable" not in limit_covers(RateLimitInfo(status="allowed", raw=raw))
+    (hit,) = limit_windows(RateLimitInfo(status="rejected", rate_limit_type="seven_day_overage_included", resets_at=5))
+    assert (hit.name, hit.model, hit.utilization) == ("seven_day_fable", "Fable", 1.0)
 
 
 def test_usage_answer_becomes_limit_windows():
@@ -608,6 +615,32 @@ def test_usage_answer_becomes_limit_windows():
     assert (week.name, week.utilization, week.resets_at) == ("seven_day", 0.4, int(datetime(2026, 10, 30, 12, tzinfo=UTC).timestamp()))
     assert usage_windows(None) == []
 
+    # Claude Code 2.1.330 on Ultra: no 5-hour window, the usage endpoint's rows passed on, the per-model ones also as model_scoped.
+    answer = {
+        "five_hour": None,
+        "seven_day": {"utilization": 24.0, "resets_at": "2026-12-03T23:00:00.000Z"},
+        "seven_day_oauth_apps": None,
+        "seven_day_opus": None,
+        "seven_day_sonnet": None,
+        "extra_usage": {"is_enabled": False, "monthly_limit": None, "used_credits": None, "utilization": None},
+        "limits": [
+            {"kind": "weekly_all", "group": "weekly", "percent": 24, "resets_at": "2026-12-03T23:00:00.000Z", "severity": "normal", "is_active": True, "scope": None},
+            {"kind": "weekly_scoped", "group": "weekly", "percent": 57, "resets_at": "2026-12-02T08:00:00.000Z", "severity": "normal", "is_active": False, "scope": {"model": {"display_name": "Fable"}}},
+            {"kind": "weekly_scoped", "group": "weekly", "percent": 12, "resets_at": None, "severity": "normal", "is_active": False, "scope": {"surface": {"display_name": "Cowork"}}},
+            {"kind": "spend", "group": "monthly", "percent": 54, "resets_at": "2026-12-01T00:00:00.000Z", "severity": "normal", "is_active": False},
+            {"kind": "daily_burst", "group": "daily", "percent": 8, "resets_at": "2026-11-28T00:00:00Z", "severity": "normal", "is_active": False},
+        ],
+        "model_scoped": [{"display_name": "Fable", "utilization": 57, "resets_at": "2026-12-02T08:00:00.000Z"}],
+    }
+    windows = {w.name: w for w in usage_windows(answer)}
+    assert list(windows) == ["seven_day", "seven_day_fable", "daily_burst"]
+    fable = windows["seven_day_fable"]
+    assert (fable.utilization, fable.model, fable.resets_at) == (0.57, "Fable", int(datetime(2026, 12, 2, 8, tzinfo=UTC).timestamp()))
+    assert windows["seven_day"].utilization == 0.24 and windows["seven_day"].model is None and windows["daily_burst"].utilization == 0.08
+    # Only the rows: the 5-hour and weekly windows by their kinds, a model by the first word of its name.
+    rows = {"limits": [{"kind": "session", "percent": 30, "resets_at": None}, {"kind": "weekly_all", "percent": 5, "resets_at": None}, {"kind": "weekly_scoped", "percent": 9, "resets_at": None, "scope": {"model": {"display_name": "Opus 5"}}}]}
+    assert [(w.name, w.utilization, w.model) for w in usage_windows(rows)] == [("five_hour", 0.3, None), ("seven_day", 0.05, None), ("seven_day_opus", 0.09, "Opus 5")]
+
 
 def test_a_turn_turned_away_by_a_used_up_limit_reports_the_window():
     from datetime import UTC, datetime
@@ -623,6 +656,8 @@ def test_a_turn_turned_away_by_a_used_up_limit_reports_the_window():
     assert limit_hit("You've hit your weekly limit · resets 2am (UTC)", now).resets_at == int(datetime(2026, 11, 20, 2, tzinfo=UTC).timestamp())
     assert limit_hit("Claude AI usage limit reached|1795200000", now).resets_at == 1795200000
     assert limit_hit("API Error: 500", now) is None and limit_hit(None) is None
+    fable = limit_hit("You've hit your Fable limit · resets 2am (UTC)", now)
+    assert (fable.name, fable.model) == ("seven_day_fable", "Fable")
 
     def result(error: str) -> ResultMessage:
         return ResultMessage(subtype="success", duration_ms=1, duration_api_ms=1, is_error=True, num_turns=0, session_id="s", result=error)
@@ -911,7 +946,7 @@ async def test_the_limits_of_a_token_subscription_come_from_a_minimal_turn(monke
     # It answers with nothing (the token is for model requests only): one word to the small model shows them.
     FakeUsageClient.usage = None
     windows = {w.name: w for w in await provider.limits(token)}
-    assert windows["seven_day"].utilization == 0.41 and windows["seven_day"].resets_at == 1795143600 and "seven_day_overage_included" in windows
+    assert windows["seven_day"].utilization == 0.41 and windows["seven_day"].resets_at == 1795143600 and "seven_day_fable" in windows
     assert FakeUsageClient.asked == ["claude-haiku-5-5: ok"]
     assert "five_hour" in (await provider.limits_report(token))[1]  # the turn's headers had no 5-hour window: it is gone
 

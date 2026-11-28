@@ -15,7 +15,11 @@ ideas (``Project.idea_*``; default: the provider's small model), stored as a ``R
   rearrangement is an undoable change.
 - Ideas that sorting or rearranging found to say the same or to belong in one are then merged into one, one
   call per group with their whole texts: an undoable change each (``_merge_duplicates``).
-- Reading an input and an answer happen while the person waits: a few seconds of a small model.
+- What a person types is kept at once (status reading) and read in the background, one input after the
+  other in the order they came (``read_soon``): a person can type idea after idea without waiting. Then it is
+  sorted with the others that came meanwhile. Reading, sorting, rearranging and merging take turns per project
+  (``_lock``), so that none works on what another is changing.
+- An answer to a question is read while the person waits: a few seconds of a small model.
 """
 
 from __future__ import annotations
@@ -34,6 +38,7 @@ from ..services import accounts as account_service
 from ..services import agents as agent_service
 from ..services import ideas as idea_service
 from ..services import settings as settings_service
+from ..schemas import IdeaModelBlocked
 from ..services.util import truncate
 from . import questions
 
@@ -59,6 +64,73 @@ class Ideas:
         self._reorder: dict[int, str] = {}  # project -> why the topics are rearranged next: auto | button
         self._fresh: dict[int, int] = {}  # project -> ideas sorted since its topics were last rearranged
         self._focus: dict[int, set[int | None]] = {}  # project -> the topics they went into
+        self._readers: dict[int, asyncio.Task[None]] = {}
+        self._read_again: set[int] = set()  # more input came while reading
+        self._locks: dict[int, asyncio.Lock] = {}
+        self._tried: dict[int, set[int]] = {}  # project -> the unsorted ideas last sent to be sorted
+        self._shut: set[int] = set()  # projects whose idea model could not be used (``blocked``) at the last call
+        self._retry: set[int] = set()  # projects whose ideas left unsorted go to the model even one alone
+
+    def _lock(self, project_id: int) -> asyncio.Lock:
+        return self._locks.setdefault(project_id, asyncio.Lock())
+
+    # --- reading what was typed, in the background ---------------------------------------------
+
+    def reading(self, project_id: int) -> bool:
+        task = self._readers.get(project_id)
+        return task is not None and not task.done()
+
+    def read_soon(self, project_id: int) -> None:
+        """Read the inputs waiting (status reading), oldest first; also after a restart (``list_ideas`` calls it)."""
+        if self.reading(project_id):
+            self._read_again.add(project_id)
+            return
+        self._readers[project_id] = asyncio.create_task(self._read_loop(project_id), name=f"ideas-read-{project_id}")
+
+    async def _read_loop(self, project_id: int) -> None:
+        try:
+            while True:
+                self._read_again.discard(project_id)
+                while await self._read_one(project_id):
+                    pass
+                if project_id not in self._read_again:
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            log.exception("Reading the ideas typed in project %s failed", project_id)
+        finally:
+            if self._readers.get(project_id) is asyncio.current_task():
+                del self._readers[project_id]
+
+    async def _after_reading(self, project_id: int) -> None:
+        while (task := self._readers.get(project_id)) is not None and not task.done():
+            await asyncio.wait([task])
+
+    async def _read_one(self, project_id: int) -> bool:
+        """The oldest waiting input, read by the model. Returns whether there was one. If reading it breaks, its
+        text stays an idea as written and the next one is read."""
+        async with self._lock(project_id), self.runs._sm() as s:
+            idea = await idea_service.waiting_input(s, project_id)
+            if idea is None:
+                return False
+            idea_id = idea.id
+            try:
+                project = await s.get(Project, project_id)
+                if project is None:
+                    return False
+                prompt = await idea_service.intent_prompt(s, project, idea.text)
+                data, _error = await self._ask(s, project, idea_service.INTENT_SYSTEM, prompt)
+                await s.refresh(idea)
+                if idea.status == IdeaStatus.READING:  # not deleted meanwhile
+                    await idea_service.apply_intent(s, project_id, data, idea.text, idea.author, typed=idea)
+            except Exception:
+                log.exception("Reading idea %s of project %s failed", idea_id, project_id)
+                await s.rollback()
+                if (idea := await s.get(Idea, idea_id)) is not None and idea.status == IdeaStatus.READING:
+                    await idea_service.keep_unread(s, idea)
+        self.sort_soon(project_id)
+        return True
 
     # --- in the background ---------------------------------------------------------------------
 
@@ -76,14 +148,33 @@ class Ideas:
         self._sorters[project_id] = asyncio.create_task(self._loop(project_id), name=f"ideas-sort-{project_id}")
         bus.publish(project_id, "ideas.sorting", {"sorting": True})
 
+    def sort_left(self, project_id: int, ids: set[int], blocked: bool = False) -> None:
+        """More than one idea left without a topic (sorting failed, or their topic was removed): sorted once more,
+        unless just these were sent last time (a broken model is not asked again and again), or the idea model
+        can't be used (``blocked``); once it can again, they are."""
+        if blocked:
+            return
+        if project_id in self._shut:  # it can be used again: what waited for it is sorted now
+            self._shut.discard(project_id)
+            self._tried.pop(project_id, None)
+            if ids:
+                self._retry.add(project_id)
+                self.sort_soon(project_id)
+            return
+        if len(ids) > 1 and not self.sorting(project_id) and not self.reading(project_id) and not ids <= self._tried.get(project_id, set()):
+            self.sort_soon(project_id)
+
     async def _loop(self, project_id: int) -> None:
         try:
             await asyncio.sleep(0 if self._reorder.get(project_id) == "button" else SORT_DELAY)
             while True:
+                await self._after_reading(project_id)  # what is typed in a row is sorted together
                 self._again.discard(project_id)
                 more = await self._sort(project_id)
                 if (source := self._reorder.pop(project_id, None)) is not None:
-                    await self._rearrange(project_id, source)
+                    changed = await self._rearrange(project_id, source)
+                    if source == "button" and changed is False:
+                        bus.publish(project_id, "ideas.rearranged", {"changed": False})  # the button gets an answer
                 if await self._merge_duplicates(project_id):
                     more = True  # the merged idea is sorted again
                 if not more and project_id not in self._again:
@@ -101,21 +192,31 @@ class Ideas:
 
     async def _sort(self, project_id: int) -> bool:
         """One call for the ideas waiting to be sorted. Returns whether more are still waiting."""
+        async with self._lock(project_id):
+            return await self._sort_locked(project_id)
+
+    async def _sort_locked(self, project_id: int) -> bool:
         async with self.runs._sm() as s:
             project = await s.get(Project, project_id)
             if project is None:
                 return False
             ideas = await idea_service.open_ideas(s, project_id)
-            batch = [i for i in ideas if i.sort_state == idea_service.PENDING][:SORT_BATCH]
+            # New and changed ones, and with them those left unsorted; those alone once more than one is left.
+            pending = [i for i in ideas if i.sort_state == idea_service.PENDING]
+            left = [i for i in idea_service.unsorted(ideas) if i.sort_state != idea_service.PENDING]
+            retry = project_id in self._retry
+            self._retry.discard(project_id)
+            batch = (pending + left)[:SORT_BATCH] if pending or len(left) > 1 or retry else []
             if not batch:
                 return False
             ids = [i.id for i in batch]
+            self._tried[project_id] = set(ids)
             prompt = await idea_service.sort_request(s, project, ideas, batch)
             data, error = await self._ask(s, project, idea_service.SORT_SYSTEM, prompt)
         async with self.runs._sm() as s:
             if data is None:
                 await idea_service.sort_failed(s, project_id, ids)
-                bus.publish(project_id, "ideas.sort_failed", {"error": truncate(error, 300)})
+                bus.publish(project_id, "ideas.sort_failed", {"error": truncate(error, 300), "blocked": project_id in self._shut})
                 return False  # no retry loop over a broken model: "rearrange" retries
             count, unsure = await idea_service.apply_sort(s, project_id, ids, data)
             self._fresh[project_id] = self._fresh.get(project_id, 0) + count
@@ -125,30 +226,34 @@ class Ideas:
             left = (await s.scalars(select(Idea.id).where(Idea.project_id == project_id, Idea.status == IdeaStatus.OPEN, Idea.sort_state == idea_service.PENDING))).first()
             return left is not None
 
-    async def _rearrange(self, project_id: int, source: str) -> None:
+    async def _rearrange(self, project_id: int, source: str) -> bool | None:
         """All topics at once on a small board; on a big one group by group (``reorder_groups``): after sorting
-        only the groups around the topics new ideas went into, with the button all of them. A change per call."""
+        only the groups around the topics new ideas went into, with the button all of them. A change per call.
+        Returns whether anything changed, None if the model failed (``ideas.sort_failed`` says why)."""
+        changed = False
         self._fresh[project_id] = 0
         focus = self._focus.pop(project_id, set())
         async with self.runs._sm() as s:
             project = await s.get(Project, project_id)
             groups = await idea_service.reorder_groups(s, project, None if source == "button" else focus) if project else []
         for topic_ids, idea_ids in groups[:REORDER_CALLS]:
-            async with self.runs._sm() as s:
-                project = await s.get(Project, project_id)
-                every = await idea_service.topics(s, project_id)
-                ideas = [i for i in await idea_service.open_ideas(s, project_id) if i.id in set(idea_ids)] if project else []
-                if not ideas:
-                    continue
-                whole = len(groups) == 1 and len(idea_ids) == await idea_service.count_open(s, project_id)
-                inside = [t for t in every if whole or t.id in topic_ids]
-                prompt = idea_service.reorder_prompt(project, inside, ideas, None if whole else [t for t in every if t.id not in topic_ids])
-                data, error = await self._ask(s, project, idea_service.REORDER_SYSTEM, prompt)
-            if data is None:
-                bus.publish(project_id, "ideas.sort_failed", {"error": truncate(error, 300)})
-                return
-            async with self.runs._sm() as s:
-                await idea_service.apply_reorder(s, project_id, data, source)
+            async with self._lock(project_id):
+                async with self.runs._sm() as s:
+                    project = await s.get(Project, project_id)
+                    every = await idea_service.topics(s, project_id)
+                    ideas = [i for i in await idea_service.open_ideas(s, project_id) if i.id in set(idea_ids)] if project else []
+                    if not ideas:
+                        continue
+                    whole = len(groups) == 1 and len(idea_ids) == await idea_service.count_open(s, project_id)
+                    inside = [t for t in every if whole or t.id in topic_ids]
+                    prompt = idea_service.reorder_prompt(project, inside, ideas, None if whole else [t for t in every if t.id not in topic_ids])
+                    data, error = await self._ask(s, project, idea_service.REORDER_SYSTEM, prompt)
+                if data is None:
+                    bus.publish(project_id, "ideas.sort_failed", {"error": truncate(error, 300), "blocked": project_id in self._shut})
+                    return None
+                async with self.runs._sm() as s:
+                    changed = await idea_service.apply_reorder(s, project_id, data, source) is not None or changed
+        return changed
 
     async def _merge_duplicates(self, project_id: int) -> bool:
         """Merge what was found to say the same, group by group. Returns whether anything was merged."""
@@ -156,27 +261,21 @@ class Ideas:
             groups = await idea_service.duplicate_groups(s, project_id)
         merged = False
         for ids in groups[:MERGE_BATCH]:
-            async with self.runs._sm() as s:
-                project = await s.get(Project, project_id)
-                request = await idea_service.merge_request(s, project, ids) if project else None
-                if request is None:
-                    continue
-                prompt, seen = request
-                data, _error = await self._ask(s, project, idea_service.MERGE_SYSTEM, prompt)
-            async with self.runs._sm() as s:
-                merged = await idea_service.apply_merge(s, project_id, seen, data) is not None or merged
+            async with self._lock(project_id):
+                async with self.runs._sm() as s:
+                    project = await s.get(Project, project_id)
+                    request = await idea_service.merge_request(s, project, ids) if project else None
+                    if request is None:
+                        continue
+                    prompt, seen = request
+                    data = idea_service.merged_as_written(seen)
+                    if data is None:
+                        data, _error = await self._ask(s, project, idea_service.MERGE_SYSTEM, prompt)
+                async with self.runs._sm() as s:
+                    merged = await idea_service.apply_merge(s, project_id, seen, data) is not None or merged
         return merged
 
     # --- while the person waits ----------------------------------------------------------------
-
-    async def read_input(self, s: AsyncSession, project: Project, text: str, author: str) -> IdeaChange:
-        """What the person typed, as the model reads it: a new idea, an addition, several, a merge, a question."""
-        text = text.strip()
-        prompt = await idea_service.intent_prompt(s, project, text)
-        data, _error = await self._ask(s, project, idea_service.INTENT_SYSTEM, prompt)
-        change = await idea_service.apply_intent(s, project.id, data, text, author)
-        self.sort_soon(project.id)
-        return change
 
     async def answer(self, s: AsyncSession, project: Project, idea: Idea, option_index: int | None, text: str, author: str) -> IdeaChange:
         """The person's answer to the model's question about an idea, worked into it by the model; an option of
@@ -195,15 +294,24 @@ class Ideas:
     async def choice(self, s: AsyncSession, project: Project) -> tuple[str, str, str | None]:
         """Provider, model and effort for ideas: the project's own, else the provider's small model."""
         provider = project.idea_provider or DEFAULT_PROVIDER
-        model = project.idea_model
-        if not model:
-            catalog: list[ProviderInfo] = []
-            try:
-                catalog = await account_service.catalog(s, await self.runs.runner.providers())
-            except Exception:
-                catalog = []
-            model = questions.default_model(provider, catalog)
+        model = project.idea_model or questions.default_model(provider, await self._catalog(s))
         return provider, model, project.idea_effort or None
+
+    async def blocked(self, s: AsyncSession, project: Project) -> IdeaModelBlocked | None:
+        """The idea model set can't be used: the project may use no subscription of its provider. Ideas then
+        stay unsorted (never another model instead) until that is changed; the ideas view shows it."""
+        provider = project.idea_provider or DEFAULT_PROVIDER
+        manager = await agent_service.get_manager(s, project.id)
+        if not await account_service.shut_out(s, provider, manager):
+            return None
+        _provider, model, _effort = await self.choice(s, project)
+        return IdeaModelBlocked(provider=provider, provider_label=account_service.LABELS.get(provider, provider), model=model)
+
+    async def _catalog(self, s: AsyncSession) -> list[ProviderInfo]:
+        try:
+            return await account_service.catalog(s, await self.runs.runner.providers())
+        except Exception:
+            return []
 
     async def _ask(self, s: AsyncSession, project: Project, system: str, prompt: str) -> tuple[dict | None, str]:
         """The model's JSON answer, or None and why not. ``s`` is committed before the call; the cost is stored."""
@@ -211,9 +319,14 @@ class Ideas:
         manager = await agent_service.get_manager(s, project.id)
         where = self.runs.runners.where(project.id)
         account = await account_service.pick(s, provider, manager, None, model=model, fresh=True, where=where)
-        why = ""
+        why = ""  # never another model than the one set: the ideas view says why it can't be used (``blocked``)
         if account is None:
-            why = await account_service.shut_out(s, provider, manager) or await account_service.not_signed_in(s, provider, manager, where)
+            why = await account_service.shut_out(s, provider, manager)
+            if why:
+                self._shut.add(project.id)
+            why = why or await account_service.not_signed_in(s, provider, manager, where)
+        if not why:
+            self._shut.discard(project.id)
         values = await settings_service.get_all(s)
         credentials = settings_service.credentials(values, account=account_service.fields(account))
         account_key = account.key if account else None

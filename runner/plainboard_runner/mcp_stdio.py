@@ -23,16 +23,21 @@ from .tool_bridge import ToolBridge
 BRIDGE_FILE_ENV = "PLAINBOARD_BRIDGE_FILE"
 
 
-def write_bridge_file(path: Path, spec: ToolBridgeSpec, workspace: Path) -> None:
+def write_bridge_file(path: Path, spec: ToolBridgeSpec, workspace: Path, read_only: bool = False) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
     with os.fdopen(fd, "w", encoding="utf-8") as fh:
-        json.dump({"spec": spec.model_dump(mode="json"), "workspace": str(workspace)}, fh)
+        json.dump({"spec": spec.model_dump(mode="json"), "workspace": str(workspace), "read_only": read_only}, fh)
 
 
-def build_server(bridge: ToolBridge) -> Server:
+def build_server(bridge: ToolBridge, read_only: bool = False) -> Server:
+    """``read_only``: a turn that only reads (toolset "read" or "none"), whose tools the app limits to reading ones.
+    They say so (readOnlyHint): Codex refuses every other MCP tool in such a turn."""
+    annotations = types.ToolAnnotations(read_only_hint=True) if read_only else None
+
     async def list_tools(_ctx: Any, _params: Any) -> types.ListToolsResult:
-        return types.ListToolsResult(tools=[types.Tool(name=t.name, description=t.description, input_schema=t.input_schema) for t in bridge.tools])
+        tools = [types.Tool(name=t.name, description=t.description, input_schema=t.input_schema, annotations=annotations) for t in bridge.tools]
+        return types.ListToolsResult(tools=tools)
 
     async def call_tool(_ctx: Any, params: types.CallToolRequestParams) -> types.CallToolResult:
         result = await bridge.call(params.name, params.arguments or {})
@@ -45,7 +50,7 @@ def build_server(bridge: ToolBridge) -> Server:
 async def main() -> None:
     data = json.loads(Path(os.environ[BRIDGE_FILE_ENV]).read_text(encoding="utf-8"))
     bridge = ToolBridge(ToolBridgeSpec.model_validate(data["spec"]), Path(data["workspace"]))
-    server = build_server(bridge)
+    server = build_server(bridge, read_only=data.get("read_only", False))
     try:
         async with stdio_server() as (read, write):
             await server.run(read, write, server.create_initialization_options())

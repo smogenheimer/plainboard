@@ -324,21 +324,75 @@ def test_finished_branches_are_checked_together_and_one_check_run_lands_them_all
     assert len(fake.check_specs) == 2 and len(fake.land_specs) == 2  # four branches, two check runs
 
 
-def test_a_train_waits_a_moment_for_further_branches(client, project):
+def set_turn(client, agent_id: int, status: str) -> int:
+    """A turn of this member that runs (or ended), as the dispatcher would have it: the fake runner ends turns at once."""
+    from plainboard.db import sessionmaker
+    from plainboard.models import Run
+
+    pid = pid_of(client)
+
+    async def write() -> int:
+        async with sessionmaker()() as s:
+            run = Run(project_id=pid, agent_id=agent_id, trigger="chat", status=status)
+            s.add(run)
+            await s.commit()
+            return run.id
+
+    return client.portal.call(write)
+
+
+def end_turn(client, run_id: int) -> None:
+    from plainboard.db import sessionmaker
+    from plainboard.models import Run
+
+    async def write() -> None:
+        async with sessionmaker()() as s:
+            (await s.get(Run, run_id)).status = "succeeded"
+            await s.commit()
+
+    client.portal.call(write)
+
+
+def test_a_train_waits_a_moment_for_further_branches_while_a_member_could_hand_one_over(client, project):
+    pid = project["id"]
+    fake = team_with_branches(client, pid, ["feat-a"])
+    client.app_ref.state.landing.linger = 90
+    busy = set_turn(client, make_member(client, pid, "Busy")["id"], "running")
+    land_tick(client)
+    assert not fake.train_specs  # a member at work may be about to finish: one train for both is one check run
+    end_turn(client, busy)
+    hand_over(client, pid, fake, "Late", "feat-b")
+    land_tick(client)  # nobody at work any more: nothing more can come, it leaves before the time is up
+    assert [t.members for t in fake.train_specs] == [["feat-a", "feat-b"]]
+    finish_check(client, fake)
+
+    # The manager's turns don't count: it hands nothing over that it did not write.
+    hand_over(client, pid, fake, "Third", "feat-c")
+    manager = set_turn(client, manager_of(client, pid)["id"], "running")
+    land_tick(client)
+    assert [t.members for t in fake.train_specs][-1] == ["feat-c"]
+    end_turn(client, manager)
+
+
+def test_between_ticks_a_train_leaves_and_its_check_is_read_within_seconds(client, project):
     from plainboard.models import utcnow
 
     pid = project["id"]
-    fake = team_with_branches(client, pid, ["feat-a"])
     watcher = client.app_ref.state.landing
-    watcher.linger = 90
-    land_tick(client)
-    assert not fake.train_specs  # a second member may be about to finish: one train for both is one check run
-    late = make_member(client, pid, "Late")
-    fake.branches["feat-b"] = "sha-feat-b"
-    chat(client, late["id"], "TOOL merge_when_green " + json.dumps({"repository": "api", "branch": "feat-b"}))
-    wait_for(lambda: idle(client, pid))
-    client.portal.call(watcher.tick, utcnow() + timedelta(seconds=91))
-    assert [t.members for t in fake.train_specs] == [["feat-a", "feat-b"]]
+    client.portal.call(watcher.stop)  # the test looks by itself
+    watcher.quick = 5
+    fake = team_with_branches(client, pid, ["feat-a"])
+    assert watcher._due  # the hand-over asked for a look right away, not with the next tick
+    client.portal.call(watcher.look)
+    (check,) = fake.check_specs
+    now = utcnow()
+    (due,) = watcher._due.values()
+    assert due - now < timedelta(seconds=6)  # a check command is a job on the runner: looked at again in seconds
+    client.portal.call(watcher.look, now + timedelta(seconds=6))
+    assert not fake.land_specs and watcher._due  # still running: again in a moment
+    fake.jobs[check.id] = JobState(running=False, exit_code=0, log_path="/jobs/check.log", tail="all passed")
+    client.portal.call(watcher.look, now + timedelta(seconds=12))
+    assert len(fake.land_specs) == 1 and not watcher._due
 
 
 def hand_over(client, pid: int, fake: FakeRunner, name: str, branch: str) -> None:

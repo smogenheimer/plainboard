@@ -27,6 +27,17 @@ const TAP_MS = 300;
 const TAP_PX = 24;
 const MOVED_PX = 4; // a pointer that went further than this dragged, it did not click
 
+/** Without an alt text, the file name from the address; a data: address has none. */
+function shownName(src: string) {
+  if (src.startsWith("data:")) return "";
+  const last = src.split(/[?#]/)[0].split("/").pop() ?? "";
+  try {
+    return decodeURIComponent(last);
+  } catch {
+    return last;
+  }
+}
+
 function ControlButton({
   label,
   onClick,
@@ -194,11 +205,12 @@ export function Lightbox({ images, start = 0, onClose }: { images: LightboxImage
   if (!image) return null;
   const enlarged = view.scale > 1;
   const video = image.video === true;
+  const name = image.alt || shownName(image.src);
   return createPortal(
     <div
       role="dialog"
       aria-modal="true"
-      aria-label={image.alt}
+      aria-label={name}
       // React events bubble through portals: keep them away from the surrounding modal.
       onMouseDown={(e) => e.stopPropagation()}
       onClick={(e) => {
@@ -207,10 +219,13 @@ export function Lightbox({ images, start = 0, onClose }: { images: LightboxImage
       }}
       className="fixed inset-0 z-[70] flex flex-col bg-black/90 pb-[env(safe-area-inset-bottom)]"
     >
-      <div className="flex shrink-0 items-center gap-2 p-3 text-line-2">
-        <span className="min-w-0 flex-1 truncate">
-          {image.alt}
-          {many && <span className="ml-2 text-fg-3">{t("lightbox.position", { current: current + 1, total: images.length })}</span>}
+      <div className="flex shrink-0 flex-wrap items-center justify-end gap-2 p-3 text-white">
+        {/* On a phone the name has its own line under the buttons: next to them only a few letters would fit. */}
+        <span className="flex min-w-0 flex-1 items-baseline gap-2 max-sm:order-last max-sm:basis-full">
+          <span title={name} className="min-w-0 truncate">
+            {name}
+          </span>
+          {many && <span className="shrink-0 text-white/60 tabular-nums">{t("lightbox.position", { current: current + 1, total: images.length })}</span>}
         </span>
         {!video && (
           <>

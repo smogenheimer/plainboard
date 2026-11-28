@@ -4,7 +4,7 @@ import { memo, useCallback, useEffect, useLayoutEffect, useMemo, useRef, useStat
 import { useTranslation } from "react-i18next";
 import ReactMarkdown, { type Components } from "react-markdown";
 import remarkGfm from "remark-gfm";
-import { useAutoGrow } from "../lib/hooks";
+import { sendsOnEnter, useAutoGrow } from "../lib/hooks";
 import { parseUrl } from "./api";
 import { CodeBlock } from "./Content";
 import type { PageView, SiteView } from "./types";
@@ -296,7 +296,7 @@ export default function AssistantPanel({
   ].filter((s): s is string => !!s);
 
   const onKey = (e: KeyboardEvent<HTMLTextAreaElement>) => {
-    if (e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing) {
+    if (sendsOnEnter(e)) {
       e.preventDefault();
       void ask(input);
     }
@@ -381,7 +381,6 @@ export default function AssistantPanel({
             rows={1}
             placeholder={t("docsSite.assistant.placeholder")}
             aria-label={t("docsSite.assistant.placeholder")}
-            enterKeyHint="send"
           />
           {busy ? (
             <button type="button" className="doc-ai-send is-stop" onClick={() => abort.current?.abort()} aria-label={t("docsSite.assistant.stop")} title={t("docsSite.assistant.stop")}>

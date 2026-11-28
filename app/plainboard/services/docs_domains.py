@@ -11,7 +11,9 @@ proxied CNAME to the target.
 
 from __future__ import annotations
 
+import asyncio
 import logging
+import re
 import time
 
 import httpx
@@ -87,22 +89,101 @@ def setup(site: DocSite, target: str) -> DocDomainOut | None:
     )  # fmt: skip
 
 
-async def verify(session: AsyncSession, site: DocSite, client: httpx.AsyncClient | None = None) -> DocVerifyOut:
-    """Ask the domain for the site's token, over HTTPS and then HTTP. Found: verified from now on (the site is
-    served there while it is published). Not found: what came back instead; an earlier verification stays."""
+# Cloudflare's own error pages (body "error code: 525"): what happened, what to do. {domain}/{target} are filled in.
+CLOUDFLARE_ERRORS: dict[int, tuple[str, str]] = {
+    520: ("Cloudflare reaches your server, but it answers with something empty or unexpected (Cloudflare error 520).",
+          "Check that PlainBoard runs behind your reverse proxy and look at the proxy's log for {domain}."),
+    521: ("Cloudflare reaches your server's address, but the connection is refused (Cloudflare error 521): the web server or reverse proxy is down or not listening.",
+          "Start the reverse proxy and PlainBoard, and check that ports 80/443 are open to Cloudflare."),
+    522: ("Cloudflare cannot connect to your server in time (Cloudflare error 522): the server is down, a firewall blocks Cloudflare, or the DNS record points to the wrong address.",
+          "Check that the server is up, that ports 80/443 are open to Cloudflare, and that the DNS record points to the PlainBoard server{cname}."),
+    523: ("Cloudflare cannot reach the address the DNS record points to (Cloudflare error 523): usually a wrong IP address or host in the record.",
+          "Check that the DNS record points to the PlainBoard server{cname}."),
+    524: ("Cloudflare connected to your server, but it did not answer within 100 seconds (Cloudflare error 524).",
+          "Check that PlainBoard and the reverse proxy respond; look at their logs."),
+    525: ("Cloudflare reaches your server, but the TLS handshake fails (Cloudflare error 525): your reverse proxy doesn't serve this hostname or has no certificate for it.",
+          "Add {domain} to the proxy host of PlainBoard with a certificate covering it, and check that the DNS record points to the PlainBoard server{cname}."),
+    526: ("Cloudflare reaches your server, but its certificate is not valid for {domain} (Cloudflare error 526, SSL mode \"Full (strict)\").",
+          "Give the proxy host of PlainBoard a valid certificate covering {domain} (e.g. Let's Encrypt or a Cloudflare origin certificate), or set Cloudflare's SSL mode to \"Full\"."),
+    527: ("Cloudflare could not connect to your server through Railgun (Cloudflare error 527).",
+          "Check the Railgun connection, or turn Railgun off for {domain}."),
+    530: ("Cloudflare cannot reach your server (Cloudflare error 530).",
+          "Check that the DNS record points to the PlainBoard server{cname} or to a running Cloudflare tunnel."),
+    1001: ("Cloudflare does not know {domain} (Cloudflare error 1001): the DNS record is missing or still new.",
+           "Create the DNS record{cname} in the domain's Cloudflare zone and try again in a few minutes."),
+    1014: ("Cloudflare refuses the CNAME (Cloudflare error 1014): it points to a host in another Cloudflare account.",
+           "Point the record directly to the PlainBoard server's IP, or turn the proxy (orange cloud) off for it."),
+    1016: ("Cloudflare cannot resolve the host the DNS record points to (Cloudflare error 1016).",
+           "Check the target of the DNS record: it must be the PlainBoard server{cname}."),
+    1033: ("The Cloudflare tunnel for {domain} is not connected (Cloudflare error 1033).",
+           "Start cloudflared and give the tunnel a public hostname {domain} that points to PlainBoard."),
+}  # fmt: skip
+_CF_CODE = re.compile(r"error code:\s*(\d{3,4})", re.I)
+
+
+def _is_cloudflare(resp: httpx.Response) -> bool:
+    return "cf-ray" in resp.headers or resp.headers.get("server", "").lower() == "cloudflare"
+
+
+async def _resolves(domain: str) -> bool:
+    try:
+        return bool(await asyncio.get_running_loop().getaddrinfo(domain, 443))
+    except (OSError, UnicodeError):
+        return False
+
+
+async def _explain(domain: str, url: str, result: httpx.Response | Exception) -> tuple[str, str]:
+    """What the domain's answer (or failure) means, and what to do about it: (detail, hint) with {cname}."""
+    proxy = f"Check that the DNS record points to the PlainBoard server{{cname}} and that your reverse proxy forwards {domain} to PlainBoard."
+    if isinstance(result, httpx.TooManyRedirects):
+        return (f"{url} redirects in a loop.",
+                "Behind Cloudflare this is usually SSL mode \"Flexible\" while the proxy redirects to HTTPS: set Cloudflare's SSL mode to \"Full\".")  # fmt: skip
+    if isinstance(result, httpx.TimeoutException):
+        return f"{url} did not answer within {VERIFY_TIMEOUT:g} seconds.", "Check that the server is up and that ports 80/443 are open."
+    if isinstance(result, Exception):
+        text = str(result)
+        if isinstance(result, httpx.ConnectError) and not await _resolves(domain):
+            return (f"{domain} does not resolve: there is no DNS record for it (yet).",
+                    "Create the DNS record{cname}; a new record can take a few minutes to be seen.")  # fmt: skip
+        if "CERTIFICATE" in text.upper() or "SSL" in text.upper():
+            return (f"{url}: the TLS certificate is not valid for {domain} ({text[:160]}).",
+                    f"Give the proxy host of PlainBoard a certificate covering {domain}.")  # fmt: skip
+        return f"{url} could not be reached ({type(result).__name__}).", "Check that the server is up and that ports 80/443 are open. " + proxy
+    resp = result
+    where = str(resp.url)
+    if where.split("?", 1)[0] != url:
+        where = f"{url} (redirected to {where})"
+    if _is_cloudflare(resp):
+        found = _CF_CODE.search(resp.text[:2000])
+        code = int(found.group(1)) if found else resp.status_code
+        if code in CLOUDFLARE_ERRORS:
+            detail, hint = CLOUDFLARE_ERRORS[code]
+            return detail.format(domain=domain, cname="{cname}"), hint.format(domain=domain, cname="{cname}")
+        if found or 520 <= resp.status_code <= 530:
+            return f"Cloudflare answered {where} with error {code}: it does not reach PlainBoard.", proxy
+    if resp.status_code == 200:
+        return f"{where} answered, but not with this site's token: that is not this PlainBoard.", proxy
+    return f"{where} answered {resp.status_code} instead of this site's token: the domain does not reach this PlainBoard.", proxy
+
+
+async def verify(session: AsyncSession, site: DocSite, client: httpx.AsyncClient | None = None, target: str = "") -> DocVerifyOut:
+    """Ask the domain for the site's token, over HTTPS and then HTTP, following redirects (http -> https). Found:
+    verified from now on (the site is served there while it is published). Not found: what went wrong (a Cloudflare
+    error page, no DNS record, a certificate, another server) and what to do; an earlier verification stays."""
     if not site.domain:
         raise ServiceError("This site has no domain.")
     domain, token = site.domain, site.domain_token
     await session.commit()  # nothing of the database is held while the domain answers
     own = client is None
-    client = client or httpx.AsyncClient(timeout=VERIFY_TIMEOUT, follow_redirects=False)
-    detail = ""
+    client = client or httpx.AsyncClient(timeout=VERIFY_TIMEOUT)
+    results: list[tuple[str, httpx.Response | Exception]] = []
     try:
         for scheme in ("https", "http"):
+            url = f"{scheme}://{domain}{WELL_KNOWN}"
             try:
-                resp = await client.get(f"{scheme}://{domain}{WELL_KNOWN}")
+                resp = await client.get(url, follow_redirects=True)
             except httpx.HTTPError as exc:
-                detail = f"{scheme}://{domain} could not be reached ({type(exc).__name__})."
+                results.append((url, exc))
                 continue
             if resp.status_code == 200 and resp.text.strip() == token:
                 site.domain_verified_at = utcnow()
@@ -112,11 +193,15 @@ async def verify(session: AsyncSession, site: DocSite, client: httpx.AsyncClient
 
                 await docs_service.publish_site(session, site)
                 return DocVerifyOut(verified=True, verified_at=site.domain_verified_at)
-            detail = f"{scheme}://{domain}{WELL_KNOWN} answered {resp.status_code}, not with this site's token: the domain does not reach this PlainBoard yet."
+            results.append((url, resp))
     finally:
         if own:
             await client.aclose()
-    return DocVerifyOut(verified=False, detail=detail, verified_at=site.domain_verified_at)
+    # the HTTPS answer tells most (http usually only redirects there); a failed connection less than any answer
+    url, result = next(((u, r) for u, r in results if isinstance(r, httpx.Response)), results[0])
+    detail, hint = await _explain(domain, url, result)
+    cname = f" (a CNAME to {target})" if target and target != domain else ""
+    return DocVerifyOut(verified=False, detail=detail, hint=hint.replace("{cname}", cname), verified_at=site.domain_verified_at)
 
 
 async def set_cloudflare_token(session: AsyncSession, site: DocSite, token: str) -> None:

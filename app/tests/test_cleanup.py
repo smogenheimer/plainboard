@@ -5,11 +5,12 @@ import time
 from datetime import datetime, timedelta
 
 import pytest
-from plainboard_protocol import CleanedItem, CleanupCandidate, CleanupResult, FolderUsage, MachineUsage, VolumeUsage
+from plainboard_protocol import CleanedItem, CleanupCandidate, CleanupResult, CompletionResult, FolderUsage, MachineUsage, VolumeUsage
 from sqlalchemy import select
 
 from plainboard.db import sessionmaker
-from plainboard.models import Agent, FlowEvent, InboxItem, Job, Project, Repository, utcnow
+from plainboard.models import Agent, Assignment, FlowEvent, InboxItem, Job, Project, Repository, Run, RunTrigger, utcnow
+from plainboard.orchestration import prompts
 from plainboard.services import cleanup, storage
 
 from conftest import agents_by_slug, idle, wait_for
@@ -104,7 +105,7 @@ def _told(fake, text):
     return [s.prompt for s in fake.specs if text in s.prompt]
 
 
-def test_at_the_target_the_manager_is_told_once_and_nothing_is_deleted(client, project):
+def test_at_the_target_without_a_usable_cleanup_run_the_manager_is_told_once_with_a_turn(client, project):
     pid, slug = project["id"], project["slug"]
     wait_for(lambda: idle(client, pid))
     fake = client.app_ref.state.runner
@@ -119,10 +120,11 @@ def test_at_the_target_the_manager_is_told_once_and_nothing_is_deleted(client, p
     wait_for(lambda: idle(client, pid) and _told(fake, "Disk space: 85 % used"))
     prompt = _told(fake, "Disk space")[0]
     assert "Clean up now." in prompt and "Workspaces: Manager 40.0 GB." in prompt
+    assert "No cleanup run: the cleanup model claude-haiku-5-5 (Claude) could not be used: its answer held no JSON." in prompt  # the fake answers no JSON
     assert f"- 30.0 GB /workspaces/{slug}/manager/repo/target: build output of Manager; busy\n" in prompt
     assert "Shared, not yours (47.0 GB; PlainBoard trims the shared tool caches itself" in prompt and "admin" not in prompt
     assert "- 21.0 GB /home/agent/.cache/sccache: cache, shared: sccache's shared cache, PlainBoard trims it itself; safe" in prompt
-    assert "26.0 GB /home/agent/fw-jobs: home folder, shared; unsure: fw-jobs/run.log is not in a clone" in prompt
+    assert "26.0 GB /home/agent/fw-jobs: home folder, shared: whose is unknown (no name, script, file, job or command of a project names it); unsure: fw-jobs/run.log is not in a clone" in prompt
     view = client.get("/api/usage").json()["storage"]
     assert view["notify_percent"] == 80 and view["emergency_percent"] == 97 and round(view["percent"]) == 85
     assert [n["reason"] for n in view["notices"]] == ["over"]
@@ -143,9 +145,10 @@ def test_near_full_safe_things_go_by_themselves_and_the_manager_hears_what(clien
     _tick(client)
     (spec,) = fake.cleanups
     assert spec.level == "soft" and spec.need == 18 * GB  # down to the target
-    wait_for(lambda: idle(client, pid) and _told(fake, "PlainBoard deleted by itself"))
-    prompt = _told(fake, "PlainBoard deleted by itself")[0]
+    manager = agents_by_slug(client, pid)["manager"]
+    (prompt,) = [t for t in _inbox(client, manager["id"]) if "PlainBoard deleted by itself" in t]
     assert f"/workspaces/{slug}/gone (folder) 10.0 GB" in prompt and "Now about 88 % used" in prompt and "Disk space: 88 % used" in prompt
+    assert "Nothing of your project can go now by the safety rules: no cleanup run." in prompt and not _told(fake, "Disk space")  # no turn for it
     (done,) = client.get("/api/usage").json()["cleanups"]
     assert done["level"] == "emergency" and done["freed"] == 10 * GB
     _tick(client, utcnow() + timedelta(minutes=5))
@@ -174,6 +177,62 @@ def test_a_busy_agents_folder_is_left_to_the_manager(client, project):
     assert next(f for f in fake.candidate_specs[-1].folders if f.path == f"/workspaces/{slug}/manager").busy  # the manager sees it, marked busy
 
 
+def _inbox(client, agent_id):
+    async def read():
+        async with sessionmaker()() as s:
+            return [i.text for i in await s.scalars(select(InboxItem).where(InboxItem.agent_id == agent_id))]
+
+    return client.portal.call(read)
+
+
+def test_a_cleanup_run_of_its_own_decides_and_the_manager_hears_it_without_a_turn(client, project):
+    pid, slug = project["id"], project["slug"]
+    wait_for(lambda: idle(client, pid))
+    manager = agents_by_slug(client, pid)["manager"]
+    fake = client.app_ref.state.runner
+    target, workdir, kept = f"/workspaces/{slug}/manager/repo/target", f"/workspaces/{slug}/manager/ws-2", f"/workspaces/{slug}/gone"
+    fake.machine_usage = MachineUsage(volumes=[_volume(85)])
+    fake.candidates = [
+        CleanupCandidate(path=target, what="build", bytes=30 * GB, safety="safe"),
+        CleanupCandidate(path=workdir, what="workdir", bytes=6 * GB, safety="unsure", why="uncommitted changes"),
+        CleanupCandidate(path=kept, what="folder", bytes=2 * GB, safety="keep", why="repo has unpushed commits"),
+    ]
+    asked = []
+
+    async def complete(spec):
+        asked.append(spec)
+        return CompletionResult(text=json.dumps({"delete": [target, kept, "/etc"], "keep": [{"path": workdir, "why": "may hold work"}]}), input_tokens=300, output_tokens=40)
+
+    fake.complete = complete
+    assert client.patch(f"/api/projects/{pid}", json={"cleanup_model": "claude-sonnet-5-5"}).json()["cleanup_model"] == "claude-sonnet-5-5"
+    cleanups = client.app_ref.state.cleanup.cleanups
+    _tick(client)
+    client.portal.call(cleanups.wait)
+    (spec,) = asked
+    assert (spec.provider, spec.model, spec.system_prompt) == ("claude_code", "claude-sonnet-5-5", prompts.CLEANUP_SYSTEM)
+    assert spec.prompt.startswith("Disk space: 85 % used") and "free 8.0 GB." in spec.prompt  # to a little below the target
+    assert f"Safe (made again when needed):\n- 30.0 GB {target}: build output of Manager; safe" in spec.prompt  # the same lines as list_cleanup
+    assert workdir not in spec.prompt  # unsure ones are never the model's to delete
+    assert kept not in spec.prompt  # kept ones are not even offered
+    assert [(d.paths, d.force) for d in fake.deletes] == [([target], False)]  # only what was offered
+    (note,) = [t for t in _inbox(client, manager["id"]) if "cleanup run" in t]
+    assert "A cleanup run (claude-sonnet-5-5 (Claude)) decided for you" in note and f"Deleted 30.0 GB: {target} 30.0 GB." in note
+    assert "Unsure, not deleted" in note and f"- 6.0 GB {workdir}: extra work folder of Manager; unsure: uncommitted changes" in note
+    assert not _told(fake, "Disk space")  # no turn of the manager
+
+    async def runs():
+        async with sessionmaker()() as s:
+            return list(await s.scalars(select(Run).where(Run.trigger == RunTrigger.CLEANUP)))
+
+    (run,) = client.portal.call(runs)
+    assert run.agent_id == manager["id"] and run.input_tokens == 300 and run.input_text == ""
+    assert client.get("/api/usage").json()["cleanups"][0]["by"] == "Cleanup run (claude-sonnet-5-5 (Claude))"
+
+    _tick(client, utcnow() + timedelta(hours=7))  # the reminder: what was left alone is not offered again, nothing new
+    client.portal.call(cleanups.wait)
+    assert len(asked) == 1 and len(client.get("/api/usage").json()["storage"]["notices"]) == 2
+
+
 def _results(client, agent_id):
     messages = client.get(f"/api/agents/{agent_id}/conversation").json()["messages"]
     return [m["meta"]["result"] for m in messages if m["kind"] == "tool" and "result" in m["meta"]]
@@ -188,7 +247,9 @@ def test_the_manager_lists_and_deletes_only_his_projects_data_by_the_safety_rule
     fake.machine_usage = MachineUsage(volumes=[_volume(85)])
     safe, busy, kept = f"/workspaces/{slug}/manager/repo/target", f"/workspaces/{slug}/manager/web/node_modules", f"/workspaces/{slug}/gone"
     theirs, shared = f"/workspaces/{other['slug']}/manager/repo/target", "/home/agent/scratch"
+    workdir, gone = f"/workspaces/{slug}/manager/ws-2", f"/workspaces/{slug}/manager/ws-old/target"
     fake.candidates = [
+        CleanupCandidate(path=workdir, what="workdir", bytes=6 * GB, safety="busy"),
         CleanupCandidate(path=safe, what="build", bytes=5 * GB, safety="safe"),
         CleanupCandidate(path=busy, what="build", bytes=3 * GB, safety="busy"),
         CleanupCandidate(path=kept, what="folder", bytes=2 * GB, safety="keep", why="repo has unpushed commits"),
@@ -197,20 +258,22 @@ def test_the_manager_lists_and_deletes_only_his_projects_data_by_the_safety_rule
     ]
     calls = [
         "TOOL list_cleanup {}",
-        "TOOL delete_cleanup " + json.dumps({"paths": [safe, busy, kept, theirs, shared, "/etc"]}),
-        "TOOL delete_cleanup " + json.dumps({"paths": [busy, kept, theirs, shared], "force": True}),
+        "TOOL delete_cleanup " + json.dumps({"paths": [safe, busy, kept, theirs, shared, "/etc", gone + "/"]}),
+        "TOOL delete_cleanup " + json.dumps({"paths": [workdir, busy, kept, theirs, shared], "force": True}),
     ]
     assert client.post(f"/api/agents/{manager['id']}/messages", json={"text": "\n".join(calls)}).status_code == 202
     wait_for(lambda: idle(client, pid) and len(_results(client, manager["id"])) >= 3)
     listed, first, forced = _results(client, manager["id"])[-3:]
-    assert "Safe (made again when needed):\n- 5.0 GB " + safe in listed and "Kept (unpushed work or tools; delete_cleanup won't):" in listed
+    assert "Safe (made again when needed):\n- 5.0 GB " + safe in listed and "Kept (work that is nowhere else, or tools; delete_cleanup won't" in listed
+    assert f"- 6.0 GB {workdir}: extra work folder of Manager; busy: Manager works now" in listed
     assert theirs not in listed  # another project's data is not even shown
-    assert "Shared, not yours (4.0 GB;" in listed and "- 4.0 GB /home/agent/scratch: home folder, shared; safe" in listed
+    assert "Shared, not yours (4.0 GB;" in listed and "- 4.0 GB /home/agent/scratch: home folder, shared: whose is unknown (no name, script, file, job or command of a project names it); safe" in listed
     assert first.startswith("Deleted 5.0 GB: " + safe) and f"{busy}: busy" in first and f"{kept}: keep" in first
-    refused = f"Refused, not your project's (only its own data can be deleted): {theirs}, {shared}, /etc."
-    assert refused in first
-    assert forced.startswith("Deleted 3.0 GB: " + busy) and f"{kept}: keep" in forced and f"{theirs}, {shared}." in forced  # force changes nothing about whose it is
-    assert [d.paths for d in fake.deletes] == [[safe, busy, kept], [busy, kept]]
+    refused = f"Refused, not in your project's folders (only its own data can be deleted; give the paths as list_cleanup shows them): {theirs}, {shared}, /etc."
+    assert refused in first and f"{gone}: gone already" in first  # in its own folders, but no candidate (any more): the runner says why
+    assert forced.startswith(f"Deleted 9.0 GB: {workdir} 6.0 GB, {busy}") and f"{kept}: keep" in forced and f"{theirs}, {shared}." in forced  # force changes nothing about whose it is
+    assert [d.paths for d in fake.deletes] == [[safe, busy, kept, gone], [workdir, busy, kept]]
+    assert next(f for f in fake.candidate_specs[-1].folders if f.path == f"/workspaces/{slug}/manager").clones is not None  # extra work folders are offered
     assert any(c.path == theirs for c in fake.candidates)
 
     async def events():
@@ -265,7 +328,7 @@ def test_the_manager_deletes_a_cache_of_his_project_and_another_manager_cannot(c
     wait_for(lambda: idle(client, other["id"]) and len(_results(client, theirs["id"])) >= 2)
     listed, refused = _results(client, theirs["id"])[-2:]
     assert f"{cache}: cache, shared; safe" not in listed and cache not in listed  # another project's: not even shown
-    assert refused == f"Refused, not your project's (only its own data can be deleted): {cache}."
+    assert refused == f"Refused, not in your project's folders (only its own data can be deleted; give the paths as list_cleanup shows them): {cache}."
 
     manager = agents_by_slug(client, pid)["manager"]
     assert client.post(f"/api/agents/{manager['id']}/messages", json={"text": call}).status_code == 202
@@ -273,14 +336,6 @@ def test_the_manager_deletes_a_cache_of_his_project_and_another_manager_cannot(c
     listed, deleted = _results(client, manager["id"])[-2:]
     assert f"- 37.0 GB {cache}: cache, yours: its name; safe (last changed 2 h ago; holds set1 30.0 GB, set2 7.0 GB)" in listed
     assert deleted.startswith(f"Deleted 37.0 GB: {cache}")
-
-
-def _inbox(client, agent_id):
-    async def read():
-        async with sessionmaker()() as s:
-            return [i.text for i in await s.scalars(select(InboxItem).where(InboxItem.agent_id == agent_id))]
-
-    return client.portal.call(read)
 
 
 def test_above_the_target_shared_caches_are_trimmed_and_their_users_hear_it(client, project):
@@ -309,3 +364,121 @@ def test_above_the_target_shared_caches_are_trimmed_and_their_users_hear_it(clie
     assert client.put("/api/settings", json={"values": {"cleanup": False}}).status_code < 300
     _tick(client, utcnow() + timedelta(hours=4))
     assert len(fake.trims) == 1  # switched off
+
+
+def test_the_regular_cleanup_keeps_the_disk_small_below_the_target_and_the_manager_hears_it(client, project):
+    pid, slug = project["id"], project["slug"]
+    wait_for(lambda: idle(client, pid))
+    manager = agents_by_slug(client, pid)["manager"]
+    fake = client.app_ref.state.runner
+    target, gone, extra, unsure, busy = (f"/workspaces/{slug}/manager/repo/target", f"/workspaces/{slug}/gone", f"/workspaces/{slug}/manager/ws-2", f"/workspaces/{slug}/manager/ws-3", f"/workspaces/{slug}/manager/web/node_modules")
+    fake.machine_usage = MachineUsage(volumes=[_volume(60)])
+    fake.cleanup_result = CleanupResult(freed=GB, items=[CleanedItem(path=f"/tmp/{slug}-parity1", what="tmp", bytes=GB)])
+    fake.candidates = [
+        CleanupCandidate(path=target, what="build", bytes=9 * GB, safety="safe"),
+        CleanupCandidate(path=gone, what="folder", bytes=4 * GB, safety="safe"),
+        CleanupCandidate(path=extra, what="workdir", bytes=3 * GB, safety="safe"),
+        CleanupCandidate(path=unsure, what="workdir", bytes=2 * GB, safety="unsure", why="notes.txt is not in a clone"),
+        CleanupCandidate(path=busy, what="build", bytes=2 * GB, safety="busy"),
+    ]
+    watcher = client.app_ref.state.cleanup
+    _tick(client)
+    client.portal.call(watcher.wait_regular)
+    (spec,) = fake.cleanups
+    assert spec.tmp_days == storage.TMP_DAYS and not spec.folders  # logs, old cache files, temp leftovers: no agent folder
+    (trim,) = fake.trims
+    assert trim.need == storage.ROUTINE_TRIM and trim.large == storage.TRIM_LARGE  # whatever the disk
+    assert [d.paths for d in fake.deletes] == [[gone, extra]]  # the build output's agent worked just now: it stays for now
+    assert not any(d.force for d in fake.deletes)
+    (note,) = [t for t in _inbox(client, manager["id"]) if "Regular cleanup" in t]
+    assert f"{gone} 4.0 GB" in note and f"{extra} 3.0 GB" in note and f"/tmp/{slug}-parity1 1.0 GB" in note
+    assert f"- 2.0 GB {unsure}: extra work folder of Manager; unsure: notes.txt is not in a clone" in note and busy not in note
+    assert not _told(fake, "Regular cleanup")  # no turn
+    (done,) = client.get("/api/usage").json()["cleanups"]
+    assert done["level"] == "routine" and done["freed"] == 8 * GB
+
+    _tick(client, utcnow() + timedelta(hours=2))
+    client.portal.call(watcher.wait_regular)
+    assert len(fake.trims) == 1  # once a day
+
+    _tick(client, utcnow() + timedelta(hours=25))
+    client.portal.call(watcher.wait_regular)
+    assert len(fake.trims) == 2 and fake.deletes[-1].paths == [target]  # idle long enough now
+    note = [t for t in _inbox(client, manager["id"]) if "Regular cleanup" in t][-1]
+    assert unsure not in note  # named once
+
+    assert client.put("/api/settings", json={"values": {"cleanup": False}}).status_code < 300
+    _tick(client, utcnow() + timedelta(hours=50))
+    client.portal.call(watcher.wait_regular)
+    assert len(fake.trims) == 2  # switched off
+
+
+def test_the_regular_cleanup_after_an_assignment_deletes_only_that_agents_extra_work_folders(client, project):
+    pid, slug = project["id"], project["slug"]
+    wait_for(lambda: idle(client, pid))
+    manager = agents_by_slug(client, pid)["manager"]
+    fake = client.app_ref.state.runner
+    watcher = client.app_ref.state.cleanup
+    fake.machine_usage = MachineUsage(volumes=[_volume(50)])
+    _tick(client)  # the daily one
+    client.portal.call(watcher.wait_regular)
+    extra, kept, target = f"/workspaces/{slug}/manager/wt", f"/workspaces/{slug}/manager/ws", f"/workspaces/{slug}/manager/repo/target"
+    fake.candidates = [
+        CleanupCandidate(path=extra, what="workdir", bytes=GB, safety="safe"),
+        CleanupCandidate(path=kept, what="workdir", bytes=GB, safety="keep", why="ws has unpushed commits"),
+        CleanupCandidate(path=target, what="build", bytes=5 * GB, safety="safe"),
+    ]
+
+    async def ended():
+        async with sessionmaker()() as s:
+            s.add(Assignment(project_id=pid, agent_id=manager["id"], title="Done", instructions="x", status="done", finished_at=utcnow() + timedelta(minutes=1)))
+            await s.commit()
+
+    client.portal.call(ended)
+    deletes = len(getattr(fake, "deletes", []))
+    _tick(client, utcnow() + timedelta(minutes=5))
+    client.portal.call(watcher.wait_regular)
+    assert not fake.candidate_specs[-1].home and [f.path for f in fake.candidate_specs[-1].folders] == [f"/workspaces/{slug}/manager"]
+    assert [d.paths for d in fake.deletes[deletes:]] == [[extra]]  # not the build output, not what is kept
+    (note,) = [t for t in _inbox(client, manager["id"]) if "assignment ended" in t]
+    assert f"{extra} 1.0 GB" in note and "Nothing to do." in note
+    assert client.get("/api/usage").json()["cleanups"][0]["level"] == "after"
+    _tick(client, utcnow() + timedelta(minutes=10))
+    client.portal.call(watcher.wait_regular)
+    assert len(fake.deletes) == deletes + 1  # each ended assignment once
+
+
+def test_folders_of_the_home_go_to_the_project_whose_members_name_them_and_a_mixed_one_is_split():
+    from plainboard.services import home_refs
+
+    assert home_refs.named('{"command": "cd ~/scratch/k483 && cargo build --target-dir $HOME/work/a88-fp-target"}') == {"scratch", "scratch/k483", "work", "work/a88-fp-target"}
+    assert home_refs.named("ls /home/agent/dt-jobs/b434/x ~/.cache/pp ~/.ssh/id /workspaces/p/home/x/y") == {"dt-jobs", "dt-jobs/b434", ".cache/pp"}
+    mine, paw = Project(id=1, name="Mine", slug="mine"), Project(id=2, name="PaperPaw", slug="paperpaw")
+    dev, fw = Agent(id=11, project_id=1, name="Dev"), Agent(id=21, project_id=2, name="Firmware")
+    refs = home_refs.Refs()
+    refs.add({"scratch", "scratch/k1", "dt-jobs/b1", "dt-jobs/b2"}, fw.id, utcnow())
+    refs.add({"scratch"}, dev.id, utcnow())
+    refs.add({"scratch/old"}, dev.id, utcnow() - timedelta(days=home_refs.DAYS + 1))  # too long ago
+    o = storage.Owners([mine, paw], [], {}, "/workspaces", [dev, fw], refs)
+
+    def home(path, parent="", **kw):
+        return CleanupCandidate(path=f"/home/agent/{path}", what="home", safety="unsure", parent=f"/home/agent/{parent}" if parent else "", **kw)
+
+    found = [
+        home("scratch"),
+        home("scratch/k1", "scratch"),
+        home("scratch/k2", "scratch", agents=[dev.id]),  # a process of Dev works in it
+        home("scratch/old", "scratch"),
+        home("paperpaw-jobs"),
+        home("paperpaw-jobs/x", "paperpaw-jobs"),
+        home("dt-jobs"),
+        home("dt-jobs/b1", "dt-jobs"),
+        home("dt-jobs/b2", "dt-jobs"),
+    ]
+    homes = {p.removeprefix("/home/agent/"): (pid, why, used) for p, (pid, why, used) in storage.home_owners(found, o).items()}
+    assert "scratch" not in homes  # of several projects: offered folder by folder
+    assert homes["scratch/k1"] == (2, "used by Firmware", {fw.id})
+    assert homes["scratch/k2"] == (1, "used by Dev", {dev.id})
+    assert homes["scratch/old"] == (None, storage.UNKNOWN, set())
+    assert homes["paperpaw-jobs"][0] == 2 and "paperpaw-jobs/x" not in homes  # all of it one project's: as a whole
+    assert homes["dt-jobs"] == (2, "all folders in it are yours", {fw.id}) and "dt-jobs/b1" not in homes  # nothing else names it

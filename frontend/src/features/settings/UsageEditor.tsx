@@ -8,7 +8,7 @@ import { qk, useUsage } from "../../api/queries";
 import type { MachineUsage, RunnerUsage, Usage, UsageCleanup, UsageStorage } from "../../api/types";
 import { Button, ErrorText, Segmented, Spinner } from "../../components/ui";
 import { useStored } from "../../lib/hooks";
-import { formatBytes, timeAgo } from "../../lib/format";
+import { exactTime, formatBytes, timeAgo } from "../../lib/format";
 import { CpuUsage } from "./CpuUsage";
 import { TokenUsage } from "./TokenUsage";
 
@@ -53,7 +53,7 @@ function StorageTarget({ storage }: { storage: UsageStorage }) {
         ] as const
       )
         .filter(([, h]) => h != null && h > 0)
-        .map(([what, h]) => t("cleanup.eta", { what, time: hours(h as number) }))
+        .map(([what, h]) => t("cleanup.eta", { what, time: hours(h as number), at: exactTime(new Date(Date.now() + (h as number) * 3_600_000).toISOString()) }))
     : [];
   const trend = storage.rate == null ? t("cleanup.trendUnknown") : growing ? t("cleanup.growing", { rate: formatBytes(storage.rate) }) : t("cleanup.notGrowing");
   return (

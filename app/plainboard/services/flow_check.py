@@ -429,23 +429,29 @@ async def _tool_errors(session, project_id, agents, since, now) -> list[Finding]
             40,
             f"{sum(sum(r.values()) for _n, r in often)} calls of PlainBoard's tools were refused",
             f"{listed}.",
-            "Each refused call is a step for nothing. Remove what it says: full notes (edit_member_note), a tool that is used wrongly (say how in the member's instructions).",
+            "Each refused call is a step for nothing. Remove what it says: a tool that is used wrongly (say how in the member's instructions).",
         )
     ]
 
 
 async def _full_notes(session, project_id, agents, since, now) -> list[Finding]:
-    used = dict((await session.execute(select(AgentNote.agent_id, func.sum(func.length(AgentNote.text))).where(AgentNote.agent_id.in_(list(agents))).group_by(AgentNote.agent_id))).all())
-    full = [f"{agents[agent_id].name} ({chars} of {own_notes.BUDGET_CHARS})" for agent_id, chars in used.items() if chars >= 0.9 * own_notes.BUDGET_CHARS]
-    if not full:
+    """Full notes block nothing (a new one pushes out the member's oldest), but notes from the user are never
+    pushed out: when they take most of the budget, the member's own notes keep being pushed out."""
+    q = (
+        select(AgentNote.agent_id, func.sum(func.length(AgentNote.text)))
+        .where(AgentNote.agent_id.in_(list(agents)), AgentNote.created_by_agent_id.is_(None))
+        .group_by(AgentNote.agent_id)
+    )
+    crowded = [f"{agents[agent_id].name} ({chars} of {own_notes.BUDGET_CHARS})" for agent_id, chars in (await session.execute(q)).all() if chars >= own_notes.BUDGET_CHARS // 2]
+    if not crowded:
         return []
     return [
         Finding(
             "full_notes",
-            35,
-            f"The own notes of {len(full)} agent{'s are' if len(full) != 1 else ' is'} full",
-            f"{_listed(full)} characters. Saving a note fails then, and every one of them is read with every turn.",
-            "Delete what no longer applies (member_notes, edit_member_note; your own: forget): the state of work that is finished, things the tickets say.",
+            25,
+            f"Notes from the user fill the own notes of {len(crowded)} agent{'s' if len(crowded) != 1 else ''}",
+            f"{_listed(crowded)} characters. They are never pushed out, so what the agent saves itself pushes out its other notes soon.",
+            "Shorten them or delete what no longer applies (member_notes, edit_member_note); what several members need belongs in a project note.",
         )
     ]
 

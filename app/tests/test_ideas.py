@@ -58,10 +58,26 @@ def add(client, pid: int, text: str, **more) -> dict:
     return resp.json()
 
 
-def typed(client, pid: int, text: str) -> dict:
-    resp = client.post(f"/api/projects/{pid}/ideas/input", json={"text": text})
-    assert resp.status_code == 201, resp.text
+def send(client, pid: int, text: str, files=None) -> dict:
+    """What is typed: kept at once, to be read in the background."""
+    resp = client.post(f"/api/projects/{pid}/ideas/input", data={"text": text}, files=files)
+    assert resp.status_code == 202, resp.text
     return resp.json()
+
+
+def read(client, pid: int, kept: dict) -> dict:
+    """The change the model made of an input once it is read, with the ideas it touched."""
+    wait_for(lambda: by_id(ideas_of(client, pid, closed=True))[kept["id"]]["status"] != "reading")
+    (change,) = [c for c in client.get(f"/api/projects/{pid}/ideas/changes").json() if c["summary"].get("input_id") == kept["id"]]
+    ideas = by_id(ideas_of(client, pid, closed=True))
+    change["ideas"] = [ideas[i] for i in change["summary"]["ideas"]]
+    return change
+
+
+def typed(client, pid: int, text: str) -> dict:
+    kept = send(client, pid, text)
+    assert (kept["status"], kept["text"]) == ("reading", text)
+    return read(client, pid, kept)
 
 
 def settled(client, pid: int) -> dict:
@@ -362,11 +378,19 @@ def test_the_manager_reads_ideas_and_marks_what_went_into_tickets(client, projec
     settled(client, pid)
     manager = agents_by_slug(client, pid)["manager"]
     runner = client.app_ref.state.runner
+    # Their files go onto the ticket as copies (#168): a file it has already (same name and size) and purged ones are left out.
+    files = {}
+    for idea, name, data in ((card, "card.png", b"card"), (card, "terms.pdf", b"%PDF"), (paypal, "card.png", b"CARD"), (paypal, "old.txt", b"old")):
+        resp = client.post(f"/api/projects/{pid}/ideas/{idea['id']}/attachments", files=[("files", (name, data, "text/plain"))])
+        assert resp.status_code == 201, resp.text
+        files[(idea["id"], name)] = resp.json()[0]
+    _purged(client, files[(paypal["id"], "old.txt")]["id"])
+    ticket = client.post(f"/api/projects/{pid}/tasks", json={"title": "Payments"}).json()
+    assert client.post(f"/api/tasks/{ticket['id']}/attachments", files=[("files", ("terms.pdf", b"%PDF", "application/pdf"))]).status_code == 201
 
     lines = [
         "TOOL list_ideas {}",
         "TOOL get_idea " + json.dumps({"idea": card["id"]}),
-        'TOOL create_tasks {"tickets": [{"title": "Payments"}]}',
         "TOOL take_ideas " + json.dumps({"ticket": 1, "ideas": [card["id"], paypal["id"]]}),
         "TOOL leave_out_ideas " + json.dumps({"ideas": [again["id"]], "reason": "duplicate", "duplicate_of": card["id"]}),
         "TOOL take_ideas " + json.dumps({"ticket": 1, "ideas": [card["id"]]}),
@@ -374,7 +398,7 @@ def test_the_manager_reads_ideas_and_marks_what_went_into_tickets(client, projec
     chat(client, manager["id"], "Make tickets from the payment ideas\n" + "\n".join(lines))
     wait_for(lambda: idle(client, pid))
     assert "Ideas: 3 open (list_ideas)." in runner.specs[-1].prompt
-    listed, detail, _created, taken, left, twice = tool_results(client, manager["id"])[-6:]
+    listed, detail, taken, left, twice = tool_results(client, manager["id"])[-5:]
     assert listed.startswith("Ideas 1-3 of 3:") and "## Payment" in listed and f"i{card['id']} (no title)\n  Pay by card" in listed and "## No topic" in listed
     assert detail.startswith(f"i{card['id']} (no title) — open") and "Pay by card" in detail
     assert taken == "2 idea(s) taken into #1." and left == "1 idea(s) left out." and "no longer open" in twice
@@ -384,6 +408,81 @@ def test_the_manager_reads_ideas_and_marks_what_went_into_tickets(client, projec
     kept = by_id(ideas_of(client, pid, closed=True))
     assert (kept[card["id"]]["status"], kept[card["id"]]["task_number"]) == ("taken", 1)
     assert (kept[again["id"]]["status"], kept[again["id"]]["closed_reason"]) == ("dismissed", "duplicate")
+    on_ticket = client.get(f"/api/tasks/{ticket['id']}").json()["attachments"]
+    assert [(a["filename"], a["idea_id"]) for a in on_ticket] == [("terms.pdf", None), ("card.png", None)]
+    assert client.get(f"/api/attachments/{on_ticket[1]['id']}").content == b"card"
+    assert {(a["filename"], a["id"]) for i in (card, paypal) for a in kept[i["id"]]["attachments"]} == {(n, a["id"]) for (_, n), a in files.items()}  # the ideas keep theirs
+
+
+def _purged(client, attachment_id: int) -> None:
+    from sqlalchemy import update
+
+    from plainboard.db import sessionmaker
+    from plainboard.models import Attachment, utcnow
+
+    async def run():
+        async with sessionmaker()() as s:
+            await s.execute(update(Attachment).where(Attachment.id == attachment_id).values(purged_at=utcnow()))
+            await s.commit()
+
+    client.portal.call(run)
+
+
+def test_ideas_handed_to_the_manager_are_marked_and_named_in_its_chat(client, project):
+    pid = project["id"]
+    answer(client)
+    card = add(client, pid, "Pay by card")
+    paypal = add(client, pid, "PayPal")
+    settled(client, pid)
+    runner = client.app_ref.state.runner
+    resp = client.post(f"/api/projects/{pid}/ideas/hand-over", json={"idea_ids": [card["id"]], "message": "Only the card for now"})
+    assert resp.status_code == 200, resp.text
+    assert [(i["id"], bool(i["handed_over_at"])) for i in resp.json()["ideas"]] == [(card["id"], True)]
+    wait_for(lambda: idle(client, pid))
+    assert f"Ideas handed over:\n- i{card['id']} " in runner.specs[-1].prompt and "Only the card for now" in runner.specs[-1].prompt
+    assert {i["id"]: bool(i["handed_over_at"]) for i in ideas_of(client, pid)["ideas"]} == {card["id"]: True, paypal["id"]: False}
+
+    every = client.post(f"/api/projects/{pid}/ideas/hand-over", json={})
+    assert sorted(i["id"] for i in every.json()["ideas"]) == sorted([card["id"], paypal["id"]])
+    wait_for(lambda: idle(client, pid))
+    assert f"- i{paypal['id']} " in runner.specs[-1].prompt
+
+
+def test_a_backlog_ticket_goes_back_to_the_ideas(client, project):
+    """#172: its ideas open again with what the ticket added (text, people's comments, files); else a new idea.
+    The ticket is archived, not deleted; the manager does the same with ticket_to_idea."""
+    pid = project["id"]
+    answer(client)
+    card = add(client, pid, "Pay by card")
+    settled(client, pid)
+    assert client.post(f"/api/projects/{pid}/ideas/{card['id']}/attachments", files=[("files", ("card.png", b"card", "image/png"))]).status_code == 201
+    ticket = client.post(f"/api/projects/{pid}/ideas/{card['id']}/ticket", json={"status": "backlog"}).json()["ticket"]
+    client.patch(f"/api/tasks/{ticket['id']}", json={"description": "Pay by card\n\nAlso Visa"})
+    client.post(f"/api/tasks/{ticket['id']}/comments", json={"body": "And Mastercard"})
+    assert client.post(f"/api/tasks/{ticket['id']}/attachments", files=[("files", ("plan.txt", b"plan", "text/plain"))]).status_code == 201
+
+    resp = client.post(f"/api/tasks/{ticket['id']}/to-idea")
+    assert resp.status_code == 200, resp.text
+    (back,) = resp.json()
+    assert back["id"] == card["id"] and back["status"] == "open" and back["task_number"] is None
+    assert back["text"] == f"Pay by card\n\nFrom ticket #1 {ticket['title']}:\n\nAlso Visa\n\nComment: And Mastercard"
+    assert sorted(a["filename"] for a in back["attachments"]) == ["card.png", "plan.txt"]  # its own file once, the ticket's added
+    assert [v["text"] for v in client.get(f"/api/projects/{pid}/ideas/{card['id']}/versions").json()] == ["Pay by card"]
+    kept = client.get(f"/api/tasks/{ticket['id']}").json()
+    assert kept["archived_at"] and [a["filename"] for a in kept["attachments"]] == ["card.png", "plan.txt"]  # nothing lost
+    assert client.post(f"/api/tasks/{ticket['id']}/to-idea").status_code == 409  # archived
+
+    doing = client.post(f"/api/projects/{pid}/tasks", json={"title": "Dark mode", "status": "todo"}).json()
+    assert client.post(f"/api/tasks/{doing['id']}/to-idea").status_code == 409  # not in the Backlog
+    plain = client.post(f"/api/projects/{pid}/tasks", json={"title": "Bigger fonts", "description": "For old eyes"}).json()
+    manager = agents_by_slug(client, pid)["manager"]
+    chat(client, manager["id"], "Back to the ideas\nTOOL ticket_to_idea " + json.dumps({"ticket": plain["number"]}))
+    wait_for(lambda: idle(client, pid))
+    (result,) = tool_results(client, manager["id"])[-1:]
+    new = [i for i in ideas_of(client, pid)["ideas"] if i["id"] != card["id"]]
+    assert [(i["title"], i["text"]) for i in new] == [("Bigger fonts", "For old eyes")]
+    assert result == f"#{plain['number']} archived; back in the ideas as i{new[0]['id']}."
+    assert client.get(f"/api/tasks/{plain['id']}").json()["archived_at"]
 
 
 def test_one_idea_becomes_a_ticket_and_the_project_moves_with_its_ideas(client, project):
@@ -471,13 +570,16 @@ def test_files_of_an_idea_are_shown_read_by_the_manager_kept_by_the_retention_an
     assert f"  file: {sketch['id']} sketch.png (10 B): /uploads/" in listed
     assert f"Attachments:\n- {sketch['id']} sketch.png (10 B): /uploads/" in detail
 
-    # Taken into a ticket that is done long since: the retention leaves the idea's file alone.
+    # Taken into a ticket (#168): it gets a copy of the file. Done long since: the retention deletes the copy, never the idea's file.
     ticket = client.post(f"/api/projects/{pid}/ideas/{idea['id']}/ticket", json={}).json()["ticket"]
+    (on_ticket,) = client.get(f"/api/tasks/{ticket['id']}").json()["attachments"]
+    assert (on_ticket["filename"], on_ticket["size"], on_ticket["idea_id"]) == ("sketch.png", 10, None) and on_ticket["id"] != sketch["id"]
+    assert client.get(f"/api/attachments/{on_ticket['id']}").content == b"x" * 10
     assert client.patch(f"/api/tasks/{ticket['id']}", json={"status": "done"}).status_code == 200
     _age(client, pid, ticket["number"], 400)
     assert client.patch(f"/api/projects/{pid}", json={"attachment_retention_days": 30}).status_code == 200
-    assert _purge(client) == {}
-    assert _file(sketch).is_file()
+    assert _purge(client) == {pid: [on_ticket["id"]]}
+    assert _file(sketch).is_file() and not _file(on_ticket).exists()
     assert by_id(ideas_of(client, pid, closed=True))[idea["id"]]["attachments"][0]["purged_at"] is None
 
     moved = bring_in(client, export(client, pid))
@@ -488,6 +590,8 @@ def test_files_of_an_idea_are_shown_read_by_the_manager_kept_by_the_retention_an
     assert client.get(f"/api/attachments/{copy['id']}").content == b"x" * 10
 
     path = _file(sketch)
+    assert client.delete(f"/api/tasks/{ticket['id']}").status_code == 204  # the ticket goes: the idea keeps its file
+    assert path.is_file() and client.get(f"/api/attachments/{sketch['id']}").content == b"x" * 10
     assert client.delete(f"/api/projects/{pid}/ideas/{idea['id']}").status_code == 204
     assert not path.exists() and client.get(f"/api/attachments/{sketch['id']}").status_code == 404
 
@@ -746,3 +850,224 @@ def test_a_board_of_hundreds_of_ideas_never_goes_to_the_model_whole(client, proj
     assert all(len(ids) <= idea_service.REORDER_IDEAS for ids in seen) and all(len(spec.prompt) < 40_000 for spec in asked["reorder"])
     assert sorted(i for ids in seen for i in ids) == sorted(i["id"] for i in ideas_of(client, pid)["ideas"])
     assert all("Other topics:" in spec.prompt for spec in asked["reorder"])
+
+
+def test_inputs_typed_in_a_row_are_kept_at_once_read_one_after_the_other_and_sorted_together(client, project):
+    """#161: nobody waits for the model; with a slow one, ten inputs are kept at once and read in order."""
+    import threading
+
+    pid = project["id"]
+    gate = threading.Event()
+    seen: list[str] = []
+
+    async def slow(spec) -> str:
+        import asyncio
+
+        await asyncio.to_thread(gate.wait, 10)
+        typed_text = spec.prompt.split("The person typed:\n")[1]
+        seen.append(typed_text)
+        return json.dumps({"action": "new", "ideas": [{"title": typed_text, "text": typed_text}]})
+
+    asked = answer(client)
+    runner = client.app_ref.state.runner
+    plain = runner.complete
+
+    async def complete(spec):
+        if KINDS.get(spec.system_prompt) == "intent":
+            asked["intent"].append(spec)
+            return CompletionResult(text=await slow(spec), input_tokens=50, output_tokens=20, cost_usd=0.001)
+        return await plain(spec)
+
+    runner.complete = complete
+    texts = [f"Idea number {n}" for n in range(10)]
+    kept = [send(client, pid, text) for text in texts]  # the model has not answered any of them yet
+    assert [k["status"] for k in kept] == ["reading"] * 10
+    board = ideas_of(client, pid)
+    assert [i["text"] for i in board["ideas"]] == texts and all(i["status"] == "reading" for i in board["ideas"])
+    gate.set()
+    data = settled(client, pid)
+    assert seen == texts  # one after the other, in the order typed
+    assert [i["id"] for i in data["ideas"]] == [k["id"] for k in kept]  # each input became its idea: none lost, none twice
+    assert all(i["status"] == "open" and i["title"] == i["text"] for i in data["ideas"])
+    # Each was read knowing the ones before (an addition to the last idea is possible), never a waiting one.
+    assert f"i{kept[0]['id']} " in asked["intent"][1].prompt and f"i{kept[2]['id']} " not in asked["intent"][1].prompt
+    (sort,) = asked["sort"]  # sorted together once all were read
+    assert ids_in(sort, "Sort these:") == [k["id"] for k in kept]
+
+
+def test_an_input_that_cannot_be_read_stays_as_written_and_the_others_go_on(client, project, monkeypatch):
+    pid = project["id"]
+    answer(client, intent=[json.dumps({"action": "new", "ideas": [{"title": "Fine", "text": "fine"}]})] * 2)
+    apply = idea_service.apply_intent
+
+    async def broken(session, project_id, data, text, author, **more):
+        if text == "breaks":
+            raise RuntimeError("boom")
+        return await apply(session, project_id, data, text, author, **more)
+
+    monkeypatch.setattr(idea_service, "apply_intent", broken)
+    first, bad, last = send(client, pid, "first"), send(client, pid, "breaks"), send(client, pid, "last")
+    data = by_id(settled(client, pid))
+    assert data[bad["id"]]["status"] == "open" and data[bad["id"]]["text"] == "breaks" and data[bad["id"]]["sort_state"] == "failed"
+    assert data[first["id"]]["status"] == data[last["id"]]["status"] == "open"
+
+
+def test_the_files_of_an_input_go_where_it_was_read_into_and_a_waiting_input_is_read_after_a_restart(client, project):
+    pid = project["id"]
+    answer(client)
+    booking = add(client, pid, "Book appointments online", title="Booking")
+    settled(client, pid)
+    amend = {"action": "amend", "target": booking["id"], "title": "Booking", "text": "Book online, with a photo of the room"}
+    answer(client, intent=[json.dumps(amend)])
+    kept = send(client, pid, "add the photo to booking", files=[("files", ("room.png", b"x" * 10, "image/png"))])
+    assert [a["filename"] for a in kept["attachments"]] == ["room.png"]
+    change = read(client, pid, kept)
+    assert change["kind"] == "amend" and [i["id"] for i in change["ideas"]] == [booking["id"]]
+    shown = by_id(ideas_of(client, pid, closed=True))
+    assert [a["filename"] for a in shown[booking["id"]]["attachments"]] == ["room.png"] and shown[booking["id"]]["text"].endswith("room")
+    assert (shown[kept["id"]]["status"], shown[kept["id"]]["merged_into_id"]) == ("merged", booking["id"])
+
+    # Files alone: an idea named after them, not read.
+    alone = send(client, pid, "", files=[("files", ("plan.pdf", b"%PDF", "application/pdf"))])
+    assert (alone["status"], alone["text"]) == ("open", "plan.pdf")
+    assert client.post(f"/api/projects/{pid}/ideas/input", data={"text": " "}).status_code == 422
+
+    # Left waiting (e.g. by a restart): looking at the board reads it.
+    reading = client.app_ref.state.runs.ideas.read_soon
+    client.app_ref.state.runs.ideas.read_soon = lambda project_id: None
+    waiting = send(client, pid, "after a restart")
+    client.app_ref.state.runs.ideas.read_soon = reading
+    answer(client, intent=[json.dumps({"action": "new", "ideas": [{"title": "Restart", "text": "after a restart"}]})])
+    assert read(client, pid, waiting)["kind"] == "new"
+
+
+def test_ideas_left_unsorted_are_sorted_again_once_more_than_one_is_left(client, project):
+    """#171: no idea stays under "no topic": failed or topicless ones go along with the next sorting, and more
+    than one of them is sorted again on its own (once per set: a broken model is not asked again and again)."""
+    pid = project["id"]
+    answer(client, sort=["Sorry", json.dumps({"topics": [{"name": "App", "ideas": []}]})])  # no topic for it: unsorted too
+    one = add(client, pid, "Dark mode")
+    settled(client, pid)
+    two = add(client, pid, "Light mode")
+    data = by_id(settled(client, pid))
+    assert all(data[i["id"]]["sort_state"] == "failed" and data[i["id"]]["topic_id"] is None for i in (one, two))
+
+    asked = answer(client, sort=[sort_all])
+    settled(client, pid)
+    assert asked["sort"] == []  # just these were tried: not again on every look at the board
+    client.app_ref.state.runs.ideas._tried.clear()  # e.g. a restart: looking at the board sorts them
+    ideas_of(client, pid)
+    wait_for(lambda: len(asked["sort"]) == 1 and not ideas_of(client, pid)["sorting"])
+    assert sorted(ids_in(asked["sort"][0], "Sort these:")) == sorted([one["id"], two["id"]])
+    data = by_id(ideas_of(client, pid))
+    assert all(i["sort_state"] == "sorted" and i["topic_id"] is not None for i in data.values())
+
+    # A removed topic: its ideas are sorted into others.
+    (topic,) = ideas_of(client, pid)["topics"]
+    asked = answer(client, sort=[lambda spec: json.dumps({"topics": [{"name": "Look", "ideas": ids_in(spec, "Sort these:")}]})])
+    assert client.delete(f"/api/projects/{pid}/ideas/topics/{topic['id']}").status_code == 204
+    wait_for(lambda: len(asked["sort"]) == 1 and not ideas_of(client, pid)["sorting"])
+    data = ideas_of(client, pid)
+    assert [t["name"] for t in data["topics"]] == ["Look"] and all(i["topic_id"] == data["topics"][0]["id"] for i in data["ideas"])
+
+    # Failing again: tried once, not on every look at the board.
+    asked = answer(client, fail=True)
+    client.delete(f"/api/projects/{pid}/ideas/topics/{data['topics'][0]['id']}")
+    wait_for(lambda: len(asked["sort"]) == 1 and not ideas_of(client, pid)["sorting"])
+    settled(client, pid)
+    assert len(asked["sort"]) == 1
+
+
+def test_the_sorting_model_moves_renames_and_merges_topics_in_one_answer_undone_as_one(client, project):
+    """#171: the sorting answer groups ideas by topic and may move ideas already sorted, rename and merge topics:
+    many at once, one undoable change."""
+    pid = project["id"]
+    names = board(client, pid, {"Pay": ["Card", "PayPal"], "Misc": ["Login", "Chat"]})
+    login, chat = ({"id": i["id"]} for i in ideas_of(client, pid)["ideas"] if i["text"] in ("Login", "Chat"))
+
+    def regroup(spec) -> str:
+        (new,) = ids_in(spec, "Sort these:")
+        return json.dumps(
+            {
+                "rename": [{"topic": "Pay", "name": "Payment"}, {"topic": "Misc", "name": "Accounts"}, {"topic": "Nope", "name": "X"}],
+                "topics": [{"name": "Accounts", "hint": "2 ideas", "ideas": [new, login["id"]]}, {"name": "Talk", "ideas": [chat["id"], 999]}],
+                "ideas": [{"id": new, "hint": "which one?"}],
+            }
+        )
+
+    answer(client, sort=[regroup])
+    google = add(client, pid, "Google login")
+    data = settled(client, pid)
+    topics = {t["id"]: t for t in data["topics"]}
+    ideas = by_id(data)
+    assert {t["name"] for t in topics.values()} == {"Payment", "Accounts", "Talk"} and names["Pay"] in topics and names["Misc"] in topics
+    assert topics[ideas[google["id"]]["topic_id"]]["name"] == "Accounts" and ideas[google["id"]]["hint"] == "which one?"
+    assert topics[ideas[login["id"]]["topic_id"]]["name"] == "Accounts" and topics[ideas[chat["id"]]["topic_id"]]["name"] == "Talk"
+    assert topics[names["Misc"]]["hint"] == "2 ideas"
+    (change,) = [c for c in client.get(f"/api/projects/{pid}/ideas/changes").json() if c["kind"] == "reorder"]
+    assert change["source"] == "auto" and {r["to"] for r in change["summary"]["renamed"]} == {"Payment", "Accounts"}
+    assert [m["idea_id"] for m in change["summary"]["moved"]] == [chat["id"]]
+
+    assert client.post(f"/api/projects/{pid}/ideas/changes/{change['id']}/undo").status_code == 200
+    data = ideas_of(client, pid)
+    topics = {t["id"]: t["name"] for t in data["topics"]}
+    assert topics[names["Pay"]] == "Pay" and topics[names["Misc"]] == "Misc" and by_id(data)[chat["id"]]["topic_id"] == names["Misc"]
+
+    # Renamed to an existing one: merged into it, the emptied topic is gone.
+    answer(client, sort=[lambda spec: json.dumps({"rename": [{"topic": "Misc", "name": "Pay"}], "topics": [{"name": "Pay", "ideas": ids_in(spec, "Sort these:")}]})])
+    add(client, pid, "Invoices")
+    data = settled(client, pid)
+    assert [t["name"] for t in data["topics"] if t["name"] in ("Pay", "Misc")] == ["Pay"]
+    assert {i["topic_id"] for i in data["ideas"]} == {names["Pay"]} | ({by_id(data)[google["id"]]["topic_id"]} - {None})
+
+
+def test_a_long_pasted_text_is_kept_as_written_and_too_long_a_text_says_so(client, project):
+    """#171: line breaks come as two characters each from a form; a long text is not rewritten by the reading
+    model, but kept as written and sorted; one past the limit gets a clear error."""
+    from plainboard.schemas import IDEA_TEXT_MAX
+
+    pid = project["id"]
+    asked = answer(client, sort=[sort_all])
+    long = "\r\n".join(f"Line {n}: the board should keep every word of a long note" for n in range(400))  # ~22,000 characters
+    kept = send(client, pid, long)
+    assert kept["status"] == "open" and kept["text"] == long.replace("\r\n", "\n")
+    data = settled(client, pid)
+    assert asked["intent"] == [] and data["ideas"][0]["sort_state"] == "sorted"
+    resp = client.post(f"/api/projects/{pid}/ideas/input", data={"text": "x" * (IDEA_TEXT_MAX + 1)})
+    assert resp.status_code == 422 and "at most 100,000 characters" in resp.text
+
+    # Merged with another one: too long for the model to write out again, so their texts go one after the other.
+    def duplicate(spec) -> str:
+        (new,) = ids_in(spec, "Sort these:")
+        return json.dumps({"topics": [{"name": "App", "ideas": [new]}], "ideas": [{"id": new, "merge_with": kept["id"]}]})
+
+    asked = answer(client, sort=[duplicate, sort_all])
+    add(client, pid, "Keep long notes")
+    wait_for(lambda: len(ideas_of(client, pid)["ideas"]) == 1)
+    data = settled(client, pid)
+    assert asked["merge"] == []
+    (idea,) = data["ideas"]
+    assert idea["id"] == kept["id"] and idea["text"] == long.replace("\r\n", "\n") + "\n\nKeep long notes"
+
+
+def test_an_idea_model_the_project_may_not_use_is_shown_and_never_swapped(client, project):
+    """#171: an idea model the project has no subscription for: no other model sorts instead; the ideas say
+    which one can't be used, stay unsorted, and are sorted once the project may use it."""
+    pid = project["id"]
+    claude = next(a for a in client.get("/api/accounts").json() if a["provider"] == "claude_code")
+    codex = client.post("/api/accounts", json={"provider": "codex", "label": "Team", "auth_mode": "api_key", "secret": "sk-o"}).json()
+    assert client.put(f"/api/projects/{pid}/accounts", json={"account_ids": [claude["id"]]}).status_code == 200
+    client.patch(f"/api/projects/{pid}", json={"idea_provider": "codex", "idea_model": "gpt-6-luna"})
+    asked = answer(client, sort=[sort_all])
+    add(client, pid, "Dark mode")
+    data = settled(client, pid)
+    (idea,) = data["ideas"]
+    assert idea["sort_state"] == "failed" and asked["sort"] == []
+    assert data["model_blocked"] == {"provider": "codex", "provider_label": "Codex", "model": "gpt-6-luna"}
+    runs = client.get(f"/api/projects/{pid}/runs?limit=5").json()
+    assert any("none of them is for codex" in (r.get("error") or "") for r in runs)
+
+    assert client.put(f"/api/projects/{pid}/accounts", json={"account_ids": [claude["id"], codex["id"]]}).status_code == 200
+    assert ideas_of(client, pid)["model_blocked"] is None
+    wait_for(lambda: ideas_of(client, pid)["ideas"][0]["sort_state"] == "sorted")
+    assert (asked["sort"][0].provider, asked["sort"][0].model) == ("codex", "gpt-6-luna")

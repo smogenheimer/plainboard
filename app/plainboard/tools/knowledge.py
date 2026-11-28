@@ -78,14 +78,14 @@ async def _mark_seen(ctx: ToolContext, before: str) -> None:
     await ctx.session.commit()
 
 
-@tool("remember", "Save to your own notes: always in your prompt, also after a context reset.", RememberArgs)
+@tool("remember", "Save to your own notes: always in your prompt, also after a context reset. When full, your oldest make room.", RememberArgs)
 async def remember(ctx: ToolContext, args: RememberArgs) -> str:
     before = await _own_block(ctx)
     note = await own_note_service.get(ctx.session, args.note_id, ctx.agent.id) if args.note_id else None
-    note = await own_note_service.save(ctx.session, ctx.agent, args.text, note=note, by_agent_id=ctx.agent.id)
+    note, pushed_out = await own_note_service.save(ctx.session, ctx.agent, args.text, note=note, by_agent_id=ctx.agent.id)
     await _mark_seen(ctx, before)
     used = own_note_service.used(await own_note_service.for_agent(ctx.session, ctx.agent.id))
-    return f"Saved as own note {note.id} ({used}/{own_note_service.BUDGET_CHARS} chars)."
+    return f"Saved as own note {note.id} ({used}/{own_note_service.BUDGET_CHARS} chars)." + own_note_service.pushed_out_text(pushed_out)
 
 
 @tool("forget", "Delete own notes that no longer apply.", ForgetArgs)
@@ -135,8 +135,8 @@ async def edit_member_note(ctx: ToolContext, args: EditMemberNoteArgs) -> str:
         return f"Deleted note {note.id} of {member.name}."
     if not args.text:
         raise ToolError("Give the text of the note.")
-    note = await own_note_service.save(ctx.session, member, args.text, note=note, by_agent_id=ctx.agent.id)
-    return f"Saved note {note.id} for {member.name}."
+    note, pushed_out = await own_note_service.save(ctx.session, member, args.text, note=note, by_agent_id=ctx.agent.id)
+    return f"Saved note {note.id} for {member.name}." + own_note_service.pushed_out_text(pushed_out, f"{member.name}'s", "edit_member_note with note_id")
 
 
 @tool("list_notes","List project notes (id, title, age, size). Use get_note to read one.", ListNotesArgs)

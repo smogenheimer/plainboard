@@ -149,6 +149,7 @@ RULES: tuple[Rule, ...] = (
     _project("/blocked-accounts", read=Need.OWNER),  # its owner switches one a member gave it off
     _project("/attachment-retention", read=Need.OWNER),  # what a retention setting would delete (services/retention.py)
     _project("/runner"),
+    _project("/limit-check", write=Need.MEMBER),  # read the limits now (a paused project goes on): who works in it may ask
     _project("/owner", read=Need.OWNER),  # who owns it: an admin, or its owner (services/ownership.py)  # which runner its agents use: its owner chooses
     _project("/public-api-keys", read=Need.OWNER),
     _project("/github", read=Need.OWNER),  # what its own token sees on GitHub (an admin: else the installation's)

@@ -207,15 +207,17 @@ async def caps(session: AsyncSession) -> tuple[dict[int, int], dict[int, int]]:
     return {pid: uid for pid, uid, _ in rows}, {uid: limit for _, uid, limit in rows}
 
 
-async def clean(session: AsyncSession, values: dict) -> dict:
-    """An admin's change of a person's limits (``FIELDS``), checked: the subscriptions and runners named exist."""
+async def clean(session: AsyncSession, values: dict, user: User | None = None) -> dict:
+    """An admin's change of a person's limits (``FIELDS``), checked: the subscriptions and runners named exist.
+    One that is gone but was already among ``user``'s is dropped without a word (#162): only new ones are refused."""
     out = {key: values[key] for key in FIELDS if key in values}
     for key, table, extra in (("account_ids", Account, set()), ("runner_ids", Runner, {BUILTIN})):
         if out.get(key) is None:
             continue
         ids = list(dict.fromkeys(out[key]))
         known = set(await session.scalars(select(table.id).where(table.id.in_(ids)))) | extra
-        if unknown := [i for i in ids if i not in known]:
+        stored = set((getattr(user, key, None) or []) if user is not None else [])
+        if unknown := [i for i in ids if i not in known and i not in stored]:
             raise NotFound(f"Not found: {unknown[0]}")
-        out[key] = ids
+        out[key] = [i for i in ids if i in known]
     return out

@@ -54,3 +54,15 @@ async def take_ideas(ctx: ToolContext, args: TakeIdeasArgs) -> str:
 async def leave_out_ideas(ctx: ToolContext, args: LeaveOutArgs) -> str:
     ideas = await idea_service.leave_out(ctx.session, ctx.project.id, args.ideas, args.reason, args.duplicate_of)
     return f"{len(ideas)} idea(s) left out."
+
+
+class TicketRef(BaseModel):
+    ticket: int = Field(description="Ticket number, in the Backlog")
+
+
+@tool("ticket_to_idea", "Turn a Backlog ticket back into ideas: its ideas reopen (else a new one), files go along, the ticket is archived.", TicketRef, roles=(MANAGER,))
+async def ticket_to_idea(ctx: ToolContext, args: TicketRef) -> str:
+    task = await board_service.get_task_by_number(ctx.session, ctx.project.id, args.ticket)
+    ideas = await idea_service.from_ticket(ctx.session, task, ctx.agent.name, by_manager=True)
+    ctx.runs.ideas.sort_soon(ctx.project.id)
+    return f"#{task.number} archived; back in the ideas as {', '.join(f'i{i.id}' for i in ideas)}."

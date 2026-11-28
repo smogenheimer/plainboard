@@ -109,6 +109,8 @@ export function useAutoGrow(ref: RefObject<HTMLTextAreaElement | null>, value: u
     el.style.height = "auto";
     const border = el.offsetHeight - el.clientHeight;
     el.style.height = `${el.scrollHeight + border}px`;
+    // No scrollbar while the text fits (#169): phones round line heights so that a single line can overflow by a pixel.
+    el.style.overflowY = el.scrollHeight > el.clientHeight + 1 ? "auto" : "hidden";
     for (const [box, top] of kept) box.scrollTop = top;
   };
   useLayoutEffect(() => fit.current(), [value]);
@@ -126,6 +128,12 @@ export function useAutoGrow(ref: RefObject<HTMLTextAreaElement | null>, value: u
   }, [ref]);
 }
 
+/** Whether this key press sends (#169): Enter sends and Shift+Enter is a new line; on touch screens Enter is a
+ * new line and the send button sends. */
+export function sendsOnEnter(e: { key: string; shiftKey: boolean; nativeEvent: { isComposing: boolean } }): boolean {
+  return e.key === "Enter" && !e.shiftKey && !e.nativeEvent.isComposing && !window.matchMedia("(pointer: coarse)").matches;
+}
+
 /** The value once it has not changed for ``ms``. */
 export function useDebounced<T>(value: T, ms: number): T {
   const [out, setOut] = useState(value);
@@ -134,4 +142,25 @@ export function useDebounced<T>(value: T, ms: number): T {
     return () => clearTimeout(id);
   }, [value, ms]);
   return out;
+}
+
+/** A value that a control saves at once, shown changed before the server answers (#188): `[shown, change]`.
+ * `change(next, save)` calls `save(next)`; while the promise it returns runs, `next` is shown, after it the
+ * value again (the saved one, or the old one when it failed). A failure is passed on to the caller. A save that
+ * returns no promise changes local state, which shows at once anyway. */
+export function useOptimistic<T>(value: T) {
+  const [pending, setPending] = useState<{ value: T } | null>(null);
+  const last = useRef(0);
+  const change = async (next: T, save: (next: T) => unknown) => {
+    const result = save(next);
+    if (!(result instanceof Promise)) return;
+    const mine = ++last.current;
+    setPending({ value: next });
+    try {
+      await result;
+    } finally {
+      if (last.current === mine) setPending(null);
+    }
+  };
+  return [pending ? pending.value : value, change] as const;
 }

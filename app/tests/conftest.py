@@ -114,6 +114,8 @@ class FakeRunner:
         self.active: set[int] = set()  # turns streaming right now
         self.forgotten: set[int] = set()  # turns the runner lost although the app still waits for them
         self.jobs: dict[str, JobState] = {}
+        self.strays: list = []  # Leftover: what agents left running outside their jobs; ``leftovers`` with stop takes them away
+        self.leftover_specs: list = []
         self.job_specs: list[JobSpec] = []
         self.ports: dict[str, list] = {}  # job id -> the web servers it has started (JobPort)
         self.listening: dict[str, list[int]] = {}  # job id -> further ports it listens on (no web server)
@@ -270,6 +272,16 @@ class FakeRunner:
     async def stop_job(self, runner_id: str) -> bool:
         job = self.jobs.get(runner_id)
         return bool(job and job.running)
+
+    async def leftovers(self, spec):
+        from plainboard_protocol import LeftoverResult
+
+        self.leftover_specs.append(spec)
+        owners = {o.agent for o in spec.owners}
+        found = [item for item in self.strays if item.agent in owners]
+        if spec.stop:
+            self.strays = [item for item in self.strays if item not in found]
+        return LeftoverResult(found=found)
 
     async def branch_head(self, credentials, remote, branch: str) -> str | None:
         return self.branches.get(branch)
@@ -473,6 +485,13 @@ class FakeRunner:
             commits = commits[: shas.index(spec.since)]
         return GitLogResult(branch=spec.base or "main", head=head, total=total, commits=commits[: spec.limit])
 
+    async def git_tags(self, spec):
+        """``self.tags`` (newest first, with their changes as the test sets them)."""
+        from plainboard_protocol import GitTagsResult
+
+        self.tag_specs = getattr(self, "tag_specs", []) + [spec]
+        return GitTagsResult(tags=list(getattr(self, "tags", []))[: spec.limit])
+
     async def git_present(self, spec):
         """Every commit asked is on the base branch and every path there, except ``self.gone`` (shas whose files went too)."""
         from plainboard_protocol import GitPresentResult
@@ -525,8 +544,10 @@ class FakeRunner:
         found = {c.path: c for c in getattr(self, "candidates", [])}
         result = CleanupResult()
         for path in spec.paths:
-            c = found[path]
-            if c.safety == "keep" or (c.safety != "safe" and not spec.force):
+            c = found.get(path)
+            if c is None:
+                result.skipped.append(f"{path}: gone already")
+            elif c.safety == "keep" or (c.safety != "safe" and not spec.force):
                 result.skipped.append(f"{path}: {c.safety}")
             else:
                 result.items.append(CleanedItem(path=path, what=c.what, bytes=c.bytes))
@@ -687,6 +708,18 @@ def lands_on_red(monkeypatch):
     monkeypatch.setattr(landings, "RED_HOLD_SECONDS", 0)
 
 
+@pytest.fixture(autouse=True)
+def no_regular_cleanup(request, monkeypatch):
+    """The daily cleanup would run at the first look at the disk: only the tests about it ("regular" in their name) have it."""
+    if "regular" not in request.node.name:
+        from plainboard.orchestration.cleanup import CleanupWatcher
+
+        async def skip(*args, **kwargs):
+            return None
+
+        monkeypatch.setattr(CleanupWatcher, "_regular", skip)
+
+
 @pytest.fixture
 def client(tmp_path, monkeypatch):
     monkeypatch.setenv("PLAINBOARD_DATA_DIR", str(tmp_path / "data"))
@@ -696,6 +729,7 @@ def client(tmp_path, monkeypatch):
     monkeypatch.setenv("PLAINBOARD_JOB_WATCH_INTERVAL_SECONDS", "3600")
     monkeypatch.setenv("PLAINBOARD_LANDING_INTERVAL_SECONDS", "3600")
     monkeypatch.setenv("PLAINBOARD_LANDING_LINGER_SECONDS", "0")
+    monkeypatch.setenv("PLAINBOARD_LANDING_QUICK_SECONDS", "0")  # tests look with app.state.landing.tick / look
     monkeypatch.setenv("PLAINBOARD_SEARCH_INTERVAL_SECONDS", "3600")  # tests index with app.state.search.tick
     monkeypatch.setenv("PLAINBOARD_DOCS_INTERVAL_SECONDS", "3600")  # tests look with app.state.docs_watcher.tick
     monkeypatch.setenv("PLAINBOARD_LIMIT_PAUSE_INTERVAL_SECONDS", "3600")  # tests look with app.state.limit_pause.tick

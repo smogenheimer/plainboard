@@ -143,6 +143,103 @@ def test_interrupted_manager_turn_is_reported_to_itself(client, project):
     assert "interrupted by a restart" in runner(client).specs[-1].prompt and "Plan the release" in runner(client).specs[-1].prompt
 
 
+def test_updates_of_a_manager_turn_cut_off_by_a_restart_come_again(client, project):
+    """#185: a user's decision reached a manager turn that a restart cut off; the next turn only heard
+    "processing updates", and the decision was lost."""
+    from plainboard.db import sessionmaker
+    from plainboard.models import Message, Run
+    from plainboard.services import agents as agent_service
+
+    pid = project["id"]
+    manager = agents_by_slug(client, pid)["manager"]
+    decided = 'User decided on ticket #7 ("Which variant?"): a2'
+
+    async def interrupt_and_restart():
+        async with sessionmaker()() as s:
+            run = Run(project_id=pid, agent_id=manager["id"], trigger="wake", input_text="", status="running")
+            s.add(run)
+            await s.commit()
+            conv = await agent_service.conversation_for(s, manager["id"])
+            s.add(Message(conversation_id=conv.id, role="user", kind="text", content="Process the updates above", meta={"inbox": [decided]}, run_id=run.id))
+            await s.commit()
+        await client.app_ref.state.runs._recover_interrupted()
+
+    client.portal.call(interrupt_and_restart)
+    wait_for(lambda: idle(client, pid))
+    prompt = runner(client).specs[-1].prompt
+    assert "interrupted by a restart" in prompt and decided in prompt and "Check whether it is already done" in prompt
+
+
+def test_an_interrupted_chat_turn_of_a_member_is_answered_after_the_restart(client, project):
+    from plainboard.db import sessionmaker
+    from plainboard.models import Run
+
+    pid = project["id"]
+    dev = make_dev(client, pid)
+    long_text = "Please check the release notes. " * 40
+
+    async def interrupt_and_restart():
+        async with sessionmaker()() as s:
+            s.add(Run(project_id=pid, agent_id=dev["id"], trigger="chat", input_text=long_text, status="running"))
+            await s.commit()
+        await client.app_ref.state.runs._recover_interrupted()
+
+    client.portal.call(interrupt_and_restart)
+    wait_for(lambda: idle(client, pid))
+    spec = runner(client).specs[-1]
+    assert "interrupted by a restart" in spec.prompt and long_text.strip() in spec.prompt  # the whole message, not cut off
+
+
+def test_a_chat_message_sent_again_with_its_key_is_taken_once(client, project):
+    pid = project["id"]
+    client.put("/api/settings", json={"values": {"max_parallel_runs": 0}})
+    dev = make_dev(client, pid)
+    body = {"text": "SAY once", "client_key": "k-1"}
+    first = client.post(f"/api/agents/{dev['id']}/messages", json=body).json()
+    again = client.post(f"/api/agents/{dev['id']}/messages", json=body).json()
+    assert again["id"] == first["id"] and again["input_text"] == "SAY once"
+    other = client.post(f"/api/agents/{dev['id']}/messages", json={"text": "SAY twice", "client_key": "k-2"}).json()
+    assert other["input_text"] == "SAY once\n\nSAY twice"
+    client.put("/api/settings", json={"values": {"max_parallel_runs": 3}})
+    client.app_ref.state.runs._wake.set()
+    wait_for(lambda: idle(client, pid))
+    # Also after its turn: the answer to the first try was lost, the second try finds it.
+    assert client.post(f"/api/agents/{dev['id']}/messages", json=body).json()["id"] == first["id"]
+    assert len(runs_of(client, pid, agent_id=dev["id"])) == 1
+
+
+def test_the_same_chat_message_sent_twice_at_once_is_taken_once_and_shows_its_key(client, project):
+    """A retry (or a second tab) while the first request is still on its way (#179)."""
+    import asyncio
+
+    from plainboard.db import sessionmaker
+    from plainboard.models import Agent
+
+    pid = project["id"]
+    client.put("/api/settings", json={"values": {"max_parallel_runs": 0}})
+    dev = make_dev(client, pid)
+    runs = client.app_ref.state.runs
+
+    async def both() -> list[tuple[int, bool]]:
+        async with sessionmaker()() as a, sessionmaker()() as b:
+            sent = await asyncio.gather(
+                runs.chat_once(a, await a.get(Agent, dev["id"]), "SAY once", key="k-1"),
+                runs.chat_once(b, await b.get(Agent, dev["id"]), "SAY once", key="k-1"),
+            )
+            return [(run.id, new) for run, new in sent]
+
+    (first, new_first), (second, new_second) = client.portal.call(both)
+    assert first == second and sorted([new_first, new_second]) == [False, True]
+    [run] = runs_of(client, pid, agent_id=dev["id"])
+    assert [p["key"] for p in run["parts"]] == ["k-1"] and run["input_text"] == "SAY once"  # the outbox finds it by its key
+    client.put("/api/settings", json={"values": {"max_parallel_runs": 3}})
+    runs._wake.set()
+    wait_for(lambda: idle(client, pid))
+    assert runner(client).specs[-1].prompt.count("SAY once") == 1
+    said = [m for m in client.get(f"/api/agents/{dev['id']}/conversation").json()["messages"] if m["role"] == "user"]
+    assert [p["key"] for m in said for p in m["meta"]["parts"]] == ["k-1"]  # and in the chat after its turn
+
+
 def test_delegating_moves_the_ticket_and_the_manager_is_reminded_when_work_ends(client, project):
     pid = project["id"]
     dev = make_dev(client, pid)

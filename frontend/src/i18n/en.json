@@ -1,4 +1,9 @@
 {
+  "app": {
+    "crashed": "Something went wrong while showing this page",
+    "updated": "PlainBoard was updated: reload to get the new version",
+    "reload": "Reload"
+  },
   "common": {
     "cancel": "Cancel",
     "copy": "Copy",
@@ -205,7 +210,10 @@
     "resume": "Resume",
     "limitPause": "Pause before the subscriptions run out",
     "limitPauseHint": "When every subscription this project may use is nearly used up, no new turn starts, running ones wrap up and open work waits. It goes on by itself as soon as one has room again. Not with an API key or an endpoint, which have no plan limit.",
-    "limitPaused": "Paused by PlainBoard: every subscription of this project is nearly used up. It goes on by itself around {{when}}; open work stays open.",
+    "limitPaused": "Paused by PlainBoard: every subscription of this project is nearly used up. It should go on by itself {{when}}; open work stays open.",
+    "limitCheck": "Check again",
+    "limitChecking": "Checking…",
+    "limitStill": "Checked just now: still nearly used up.",
     "limitPausedUnknown": "Paused by PlainBoard: every subscription of this project is nearly used up. It goes on by itself as soon as one has room again; open work stays open.",
     "parallelHint": "How many members of this project work at once. Empty: the number from the PlainBoard settings ({{count}}). 0 pauses them; the manager still answers.",
     "reviewDays": "Hand review tickets to the manager after (days)",
@@ -279,7 +287,12 @@
     "askEffortDefault": "Effort: high (default)",
     "askModelSmall": "{{model}} (default)",
     "ideaModel": "Ideas",
-    "ideaModelHint": "What reads, sorts and rearranges the ideas of this project. A small model is enough. Empty: the provider's small model."
+    "ideaModelHint": "What reads, sorts and rearranges the ideas of this project. A small model is enough. Empty: the provider's small model.",
+    "cleanupModel": "Disk cleanup",
+    "cleanupModelHint": "When the disk runs short, this model decides on its own what of this project can be deleted (only what is safe by the rules), and the manager hears what went. It never blocks the manager's chat. Empty: the small model of the manager's provider.",
+    "cleanupProvider": "Cleanup runs on",
+    "cleanupProviderManager": "{{provider}} (manager's)",
+    "cleanupBlocked": "This project may use no {{provider}} subscription: cleanup runs can't run, and the manager cleans up itself. Choose another provider or allow a subscription."
   },
   "board": {
     "filter": "Search tickets…",
@@ -385,6 +398,8 @@
     "upload": "Upload",
     "dropFiles": "Drop files here or paste images",
     "noFiles": "No files",
+    "allFiles": "Show all {{count}} files",
+    "fewerFiles": "Show fewer files",
     "assignments": "Assignments",
     "state": "Where it stands",
     "stateHint": "Kept by PlainBoard from the reports of the assignments: what is done, open, decided, and what was tried and dropped. Agents get it with every assignment on this ticket, so nothing is done twice.",
@@ -401,6 +416,8 @@
     "agent": "Agent",
     "system": "System",
     "confirmDelete": "Delete ticket #{{number}}?",
+    "toIdea": "Back to ideas",
+    "toIdeaHint": "Turns the ticket back into an idea: the ideas it came from open again, its text and files go with it. The ticket is archived.",
     "effort": "effort {{effort}}",
     "forReview": "For your review",
     "filePurged": "File deleted on {{date}} (retention {{days}} days)",
@@ -442,6 +459,10 @@
     "membersOff": "Direct messages to members are off. Talk to the manager, or enable it in Settings.",
     "membersOffSettings": "Open settings",
     "send": "Send",
+    "waitingForServer": "The server can't be reached right now. Your message goes out as soon as it is back.",
+    "takeBack": "Take back into the field",
+    "filesOnly_one": "{{count}} file",
+    "filesOnly_other": "{{count}} files",
     "attachFiles": "Attach files",
     "removeFile": "Remove {{name}}",
     "viewFile": "Show {{name}} large",
@@ -466,7 +487,8 @@
       "seven_day": "Weekly limit",
       "seven_day_opus": "Weekly limit (Opus)",
       "seven_day_sonnet": "Weekly limit (Sonnet)",
-      "seven_day_overage_included": "Weekly limit (included models)",
+      "seven_day_overage_included": "Weekly limit (Fable)",
+      "modelWeek": "Weekly limit ({{model}})",
       "codex_five_hour": "5-hour limit",
       "codex_seven_day": "Weekly limit",
       "antigravity_gemini_five_hour": "Gemini · 5-hour limit",
@@ -483,6 +505,12 @@
       "antigravity_gpt_quota": "GPT · Quota",
       "antigravity_gpt_seven_day": "GPT · Weekly limit",
       "antigravity_quota": "Antigravity quota",
+      "days_one": "Daily limit",
+      "days_other": "{{count}}-day limit",
+      "hours_one": "1-hour limit",
+      "hours_other": "{{count}}-hour limit",
+      "minutes_one": "1-minute limit",
+      "minutes_other": "{{count}}-minute limit",
       "resets": "Resets {{when}}",
       "updated": "Last updated {{when}}",
       "slowDown": "slow down to make it to the reset",
@@ -1564,7 +1592,7 @@
     "growing": "growing {{rate}}/h",
     "notGrowing": "not growing",
     "trendUnknown": "trend not known yet",
-    "eta": "{{what}} in about {{time}}",
+    "eta": "{{what}} in about {{time}} ({{at}})",
     "full": "full",
     "notices": "Notices to managers",
     "notice": {
@@ -1576,7 +1604,9 @@
     "summary": {
       "manager": "{{when}}: {{by}} ({{project}}) deleted {{freed}}.",
       "emergency": "{{when}}: near full, PlainBoard deleted {{freed}} by itself ({{free}} were free).",
-      "trim": "{{when}}: above the target, PlainBoard trimmed shared tool caches by {{freed}} ({{free}} were free)."
+      "trim": "{{when}}: above the target, PlainBoard trimmed shared tool caches by {{freed}} ({{free}} were free).",
+      "routine": "{{when}}: regular cleanup, PlainBoard deleted {{freed}} of what is made again when needed ({{free}} were free).",
+      "after": "{{when}}: after an assignment of {{by}} ({{project}}), PlainBoard deleted its extra work folders without own work, {{freed}}."
     },
     "lastServers": "Servers stopped last",
     "stoppedSummary_one": "{{when}}: {{count}} server stopped, memory was short.",
@@ -1585,8 +1615,10 @@
       "build": "Build output",
       "cache": "Cache",
       "folder": "Folder of a removed agent",
+      "workdir": "Extra work folder of an agent",
       "home": "Folder in the shared home",
       "logs": "Job logs",
+      "tmp": "Leftover in the temp folder",
       "server": "Server"
     },
     "retention": "Attachments",
@@ -1828,11 +1860,22 @@
     "topics_one": "{{count}} topic",
     "topics_other": "{{count}} topics",
     "rearrange": "Rearrange",
-    "placeholder": "Add an idea, or add to one: one sentence is enough",
-    "placeholderFirst": "What comes to mind? One sentence is enough, the AI sorts it in.",
+    "sortFailed": "The AI could not sort the ideas: {{error}}",
+    "placeholder": "Add an idea…",
+    "placeholderFirst": "What comes to mind?",
+    "attach": "Add pictures or files",
     "add": "Add",
+    "tooLong": "An idea holds at most {{max}} characters: the rest of what you pasted was cut off.",
     "readingInput": "the AI reads it…",
-    "filesNoIdea": "The files were not attached: the input made no idea.",
+    "readingInputs_one": "The AI reads {{count}} input…",
+    "readingInputs_other": "The AI reads {{count}} inputs one after the other…",
+    "beingRead": "The AI reads it…",
+    "sendFailed": "Not saved: {{error}}",
+    "modelBlocked": "Ideas aren't sorted: the idea model {{provider}} {{model}} can't be used, because this project may use no {{provider}} subscription. They are sorted once that is changed.",
+    "modelBlockedAskOwner": "A project owner can change it.",
+    "modelBlockedChange": "Change idea model",
+    "retry": "Try again",
+    "discard": "Discard",
     "sorting": "The AI sorts ideas into topics…",
     "reading": "Being sorted in…",
     "unsorted": "Not in a topic",
@@ -1848,6 +1891,7 @@
     "managerHint": "Tickets from these ideas? Write to the manager, e.g. “turn the ideas into tickets”.",
     "writeManager": "Write to the manager",
     "notice": {
+      "unchanged": "Rearranged: the topics already fit, nothing moved",
       "new": "New idea “{{title}}”",
       "newSimilar": "New idea “{{title}}”, similar to others",
       "kept": "Kept as a new idea",
@@ -1909,6 +1953,21 @@
       "must": "It must be able to ",
       "special": "What makes it special: ",
       "annoys": "What annoys people today: "
+    },
+    "handOver": {
+      "all": "All to {{name}}",
+      "placeholder": "Note for {{name}} (optional)",
+      "send": "Hand to {{name}}",
+      "sent_one": "Handed to {{name}}: the ticket follows.",
+      "sent_other": "{{count}} ideas handed to {{name}}: tickets follow.",
+      "openChat": "Open chat",
+      "handed": "With {{name}}",
+      "add": "For {{name}}",
+      "selected": "Selected",
+      "remove": "Remove",
+      "barTitle_one": "1 idea for {{name}}",
+      "barTitle_other": "{{count}} ideas for {{name}}",
+      "barEmpty": "Pick ideas on the board."
     }
   },
   "docsSite": {
@@ -2071,6 +2130,7 @@
     "empty": "No doc sites yet",
     "emptyHint": "Tell the manager in the chat what documentation you want: it talks it through with you, writes the doc rules and sets the site up. Or create one here.",
     "askManager": "Ask the manager",
+    "askManagerText": "Please set up documentation for this project: suggest what it should cover and who it is for, then create the doc site.",
     "namePlaceholder": "Developer docs",
     "newHint": "A site gets its own doc agent, which alone writes its pages. Start as a draft: nobody sees it until you publish it.",
     "pagesCount_one": "{{count}} page",
@@ -2112,6 +2172,7 @@
       "agent": "the doc agent",
       "hint": "What goes into this documentation, what stays out and how it is written. {{agent}} follows these rules with every page it writes and every update after a change lands.",
       "withManager": "Work them out with the manager in the chat",
+      "askManagerText": "Please help me write the doc rules for the doc site “{{name}}”: what it covers, for whom, and how it is written.",
       "none": "No doc rules yet",
       "noneHint": "Without rules the doc agent decides by itself what to document. Write them here or let the manager write them with you.",
       "newHint": "Optional. What it should cover, for whom, what not, and how it is written. You can change them any time.",
@@ -2158,7 +2219,7 @@
       "history_one": "History ({{count}} edit)",
       "history_other": "History ({{count}} edits)",
       "onSite": "Show on the site",
-      "settings": "Address and code paths",
+      "settings": "Page settings",
       "mode": "View",
       "write": "Write",
       "split": "Side by side",
@@ -2181,7 +2242,9 @@
       "paths": "Code paths",
       "pathsHint": "Files or folders this page describes, one per line. When a change lands there, the doc agent looks at this page.",
       "areaHint": "The part of the site it is in: its switcher shows the pages of one area at a time.",
-      "groupHint": "The heading it stands under in the navigation."
+      "groupHint": "The heading it stands under in the navigation.",
+      "humanOnly": "Written by people only",
+      "humanOnlyHint": "The doc agent may read and link this page but never changes it. Translations still follow."
     },
     "state": {
       "current": "current",
@@ -2242,6 +2305,16 @@
       "attachLight": "Pictures for light mode only",
       "attachDark": "Pictures for dark mode only"
     },
+    "translationModel": {
+      "uses": "Translates with:",
+      "cannot": "Translations can't run:",
+      "from": {
+        "site_site": "Provider and model as set here.",
+        "site_small": "Provider as set here, its small model.",
+        "agent_site": "Provider of the doc agent, model as set here.",
+        "agent_small": "Provider of the doc agent, its small model."
+      }
+    },
     "translator": {
       "none": "None",
       "llm": "AI model",
@@ -2271,9 +2344,9 @@
       "code": "Language code",
       "addCode": "Add this code",
       "translator": "Translated by",
-      "translateProviderHint": "Empty: the project's.",
+      "translateProviderHint": "Empty: the doc agent's.",
       "translateModelHint": "Empty: the provider's small model.",
-      "projectDefault": "The project's",
+      "agentsProvider": "The doc agent's",
       "deeplKey": "DeepL API key",
       "googleKey": "Google Translate API key",
       "keyHint": "Stored encrypted; it is never shown again.",
@@ -2288,6 +2361,8 @@
       "agentPaused": "paused",
       "restructure": "Propose restructurings",
       "restructureHint": "Now and then, as the site grows, the doc agent checks whether a larger restructuring would help (a new outline, merging or splitting pages) and proposes it as a ticket. You decide; it never restructures without your approval.",
+      "checkBudget": "Daily check (tokens)",
+      "checkBudgetHint": "Each day the doc agent re-reads the pages most likely outdated (longest unchecked, with code changes and releases since), up to this much page text. 0: no daily check. Changes and new releases are always followed up.",
       "domain": "Own domain",
       "domainHint": "Serve the site at a domain of its own, e.g. docs.example.com. Nothing else of PlainBoard answers there.",
       "delete": "Delete",
@@ -2326,7 +2401,8 @@
       "expect": "Expects",
       "check": "Check now",
       "checkOk": "Verified: the site answers at its domain.",
-      "checkFailed": "Not reachable yet. DNS can take a while; try again in a few minutes."
+      "checkFailed": "Not reachable yet. DNS can take a while; try again in a few minutes.",
+      "whatToDo": "What to do:"
     },
     "look": {
       "section": "Appearance",

@@ -61,9 +61,18 @@ async def last_turns(session: AsyncSession) -> dict[int, datetime]:
     return {agent_id: at for agent_id, at in rows.all() if at is not None}
 
 
-def folders(projects: list[Project], agents: list[Agent], busy: set[int], turns: dict[int, datetime], measured: list[FolderUsage], root: str) -> list[CleanupFolder]:
+def folders(
+    projects: list[Project],
+    agents: list[Agent],
+    busy: set[int],
+    turns: dict[int, datetime],
+    measured: list[FolderUsage],
+    root: str,
+    clones: dict[int, list[str]] | None = None,
+) -> list[CleanupFolder]:
     """The agent folders the runner may look at, busy ones marked. Projects with a folder of their own
-    (the user's) never; a folder below a project's that no agent has any more is an orphan (deleted, or renamed)."""
+    (the user's) never; a folder below a project's that no agent has any more is an orphan (deleted, or renamed).
+    ``clones`` (project → its repositories' names): the runner also offers the other folders in an agent's folder."""
     root = root.rstrip("/")
     out: list[CleanupFolder] = []
     by_slug = {p.slug: p for p in projects if not p.workspace_path}
@@ -74,7 +83,8 @@ def folders(projects: list[Project], agents: list[Agent], busy: set[int], turns:
             mine[f"{root}/{project.slug}/{agent.slug}"] = agent
     for path, agent in mine.items():
         since = turns.get(agent.id) or agent.created_at
-        out.append(CleanupFolder(path=path, idle_since=_unix(since) if since else 0, busy=agent.id in busy))
+        names = clones.get(agent.project_id, []) if clones is not None else None
+        out.append(CleanupFolder(path=path, idle_since=_unix(since) if since else 0, busy=agent.id in busy, clones=names))
     for f in measured:
         if f.kind != "workspace" or f.path in mine:
             continue
