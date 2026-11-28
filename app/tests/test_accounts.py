@@ -780,3 +780,11 @@ def test_an_assignment_cut_off_by_limits_too_often_fails(client, project, monkey
     chat(client, manager["id"], "TOOL delegate " + json.dumps(args))
     wait_for(lambda: [a["status"] for a in client.get(f"/api/projects/{pid}/assignments").json()] == ["failed"])
     assert "given up" in client.get(f"/api/projects/{pid}/assignments").json()[0]["result"]
+
+
+def test_only_an_overloaded_provider_counts_as_overload():
+    from plainboard.orchestration.run_manager import _overloaded
+
+    assert _overloaded('API Error: 529 {"type":"error","error":{"type":"overloaded_error"}}')
+    assert _overloaded("503 Service Unavailable") and _overloaded("The model is overloaded, try again later")
+    assert not _overloaded("Traceback, line 5291: KeyError") and not _overloaded("You've hit your limit") and not _overloaded(None)

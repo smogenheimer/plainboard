@@ -22,6 +22,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+import re
 import secrets
 import time
 from collections.abc import AsyncIterator, Callable
@@ -120,12 +121,12 @@ EMPTY_TURN = "The turn ended without a single step (no answer, no tool call), al
 SWITCH_TRIES = 3  # a turn turned away by a used-up plan limit runs again on another account, this often at most
 RUNNER_TRIES, RUNNER_RETRY_SECONDS = 12, 5.0  # how long a turn waits for a runner that is not up yet (about a minute, plus connect timeouts)
 LOST = "The turn broke off: the runner no longer had it"
-LOST_AFTER_SECONDS = 60
+LOST_AFTER_SECONDS = 60  # a turn the runner does not list for this long is over (check_turns)
 # An assignment turn that a used-up plan limit or an overloaded provider ended is not a failure of the work:
 # the assignment stays open and goes on with the same order when the limit resets (the scheduler holds the
 # turn until then, _hold_used_up), this often at most before it goes to the manager as failed.
 MAX_LIMIT_RESUMES = 3
-OVERLOADED = ("overloaded", "529", "503 service unavailable")  # a turn the runner does not list for this long is over (check_turns)
+OVERLOADED = re.compile(r"overloaded|\b529\b|\b503\b.*unavailable", re.IGNORECASE)  # the provider's message, not a limit of the account
 
 
 @dataclass
@@ -2412,8 +2413,7 @@ class RunManager:
 
 def _overloaded(error: str | None) -> bool:
     """The provider turned the turn away because it was overloaded (not a limit of the account)."""
-    text = (error or "").lower()
-    return any(mark in text for mark in OVERLOADED)
+    return bool(OVERLOADED.search(error or ""))
 
 
 def _session_lost(error: str | None) -> bool:
