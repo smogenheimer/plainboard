@@ -120,7 +120,12 @@ EMPTY_TURN = "The turn ended without a single step (no answer, no tool call), al
 SWITCH_TRIES = 3  # a turn turned away by a used-up plan limit runs again on another account, this often at most
 RUNNER_TRIES, RUNNER_RETRY_SECONDS = 12, 5.0  # how long a turn waits for a runner that is not up yet (about a minute, plus connect timeouts)
 LOST = "The turn broke off: the runner no longer had it"
-LOST_AFTER_SECONDS = 60  # a turn the runner does not list for this long is over (check_turns)
+LOST_AFTER_SECONDS = 60
+# An assignment turn that a used-up plan limit or an overloaded provider ended is not a failure of the work:
+# the assignment stays open and goes on with the same order when the limit resets (the scheduler holds the
+# turn until then, _hold_used_up), this often at most before it goes to the manager as failed.
+MAX_LIMIT_RESUMES = 3
+OVERLOADED = ("overloaded", "529", "503 service unavailable")  # a turn the runner does not list for this long is over (check_turns)
 
 
 @dataclass
@@ -256,6 +261,7 @@ class RunManager:
         # turn that ends while one of them still waits stays open, and goes on after it (_settle).
         self._interrupts: dict[int, set[int]] = {}
         self._resumed: set[int] = set()  # assignments whose next turn goes on after such an interruption
+        self._limited: set[int] = set()  # failed turns that a used-up plan limit or an overload ended (see MAX_LIMIT_RESUMES)
         # agent -> what changes its waiting chat run (a message joining, one withdrawn): read and write back
         # the parts one after the other, so no message overwrites another. The app runs as one process.
         self._chat_locks: dict[int, asyncio.Lock] = {}
@@ -2056,6 +2062,8 @@ class RunManager:
             elif outcome.error or res is None or res.is_error:
                 run.status = RunStatus.FAILED
                 run.error = outcome.error or (res.error if res else None) or "Run ended without a result"
+                if outcome.limited or _overloaded(run.error):
+                    self._limited.add(run_id)
             else:
                 run.status = RunStatus.SUCCEEDED
             run.result_text = (res.text if res and res.text else None) or outcome.last_text
@@ -2176,6 +2184,16 @@ class RunManager:
             # Paused, not finished: the assignment stays open and goes on when the agent is enabled again.
             bus.publish(project.id, "assignment.upserted", AssignmentOut.model_validate(assignment))
             return
+        if run.id in self._limited:
+            self._limited.discard(run.id)
+            # Failed turns of an assignment that is still open were all ended this way: any other failure closes it.
+            earlier = await s.scalar(select(func.count(Run.id)).where(Run.assignment_id == assignment.id, Run.status == RunStatus.FAILED))
+            if earlier <= MAX_LIMIT_RESUMES:
+                await inbox.push(s, agent.id, "\n".join(filter(None, (prompts.LIMIT_NOTE, scratchpad_service.delivered(assignment.scratchpad)))))
+                bus.publish(project.id, "assignment.upserted", AssignmentOut.model_validate(assignment))
+                await self._settle(s, agent.id)  # its turn waits in the queue until the limit resets
+                return
+            run.error = f"{run.error} (limit or overload {earlier} times in a row, given up)"
         if run.error == LOST:
             # Not a failure of the work, like a restart: the agent goes on in its session with its next
             # turn (_settle), or when it is enabled again. Only one that keeps breaking off goes to the manager.
@@ -2390,6 +2408,12 @@ class RunManager:
                 return ToolCallResult(text="Agent no longer exists", is_error=True)
             tool_ctx = registry.ToolContext(session=s, project=project, agent=agent, run=ctx, runs=self)
             return await registry.execute(name, tool_ctx, args)
+
+
+def _overloaded(error: str | None) -> bool:
+    """The provider turned the turn away because it was overloaded (not a limit of the account)."""
+    text = (error or "").lower()
+    return any(mark in text for mark in OVERLOADED)
 
 
 def _session_lost(error: str | None) -> bool:
