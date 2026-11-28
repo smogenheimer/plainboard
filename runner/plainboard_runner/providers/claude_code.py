@@ -100,6 +100,44 @@ SYNTHETIC_MODEL = "<synthetic>"
 SESSION_TAIL_BYTES = 256 * 1024
 # One CLI message holds a whole tool result; a screenshot the agent reads easily exceeds the SDK's 1 MB default.
 MAX_MESSAGE_BYTES = 64 * 1024 * 1024
+# Linux caps one command-line argument at 128 KiB (MAX_ARG_STRLEN): a system prompt passed inline as
+# --system-prompt above that fails the start with "[Errno 7] Argument list too long". Longer ones go
+# to Claude Code as a file.
+INLINE_PROMPT_BYTES = 100 * 1024
+PROMPT_FILE_KEEP_SECONDS = 24 * 3600  # Claude Code reads the file when it starts: older ones are left over
+
+
+def prompt_file(text: str) -> Path:
+    """The system prompt in a file, named by its content: the same prompt is written once."""
+    folder = Path(tempfile.gettempdir()) / "plainboard-prompts"
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f"{hashlib.sha256(text.encode()).hexdigest()[:32]}.md"
+    # Every change of a long prompt (a note, a member) writes a new file: the old ones go after a day.
+    old = time.time() - PROMPT_FILE_KEEP_SECONDS
+    for left in folder.iterdir():
+        with contextlib.suppress(OSError):
+            if left != path and left.stat().st_mtime < old:
+                left.unlink()
+    if not path.exists():
+        part = path.with_suffix(f".{os.getpid()}.part")
+        part.write_text(text, encoding="utf-8")
+        part.replace(path)
+    else:
+        os.utime(path)  # in use again: no other turn's clean-up may take it now
+    return path
+
+
+def system_prompt_option(text: str, preset: bool) -> tuple[Any, dict[str, str | None]]:
+    """``system_prompt`` for ClaudeAgentOptions and the extra CLI arguments it needs: inline while it
+    fits in one argument, else from a file (--system-prompt-file, --append-system-prompt-file)."""
+    if len(text.encode()) <= INLINE_PROMPT_BYTES:
+        return ({"type": "preset", "preset": "claude_code", "append": text} if preset else text), {}
+    path = str(prompt_file(text))
+    if preset:
+        return {"type": "preset", "preset": "claude_code"}, {"append-system-prompt-file": path}
+    return {"type": "file", "path": path}, {}
+
+
 NOTICE_GRACE_SECONDS = 60
 NOTICE_CHECK_SECONDS = 5
 # Background work of Claude Code that reports back when it is done. A shell or a monitor may never end.
@@ -911,16 +949,20 @@ class ClaudeCodeProvider(Provider):
         )
         if spec.effort:
             common["effort"] = spec.effort
-        if spec.toolset == "full":
+        full = spec.toolset == "full"
+        system_prompt, extra_args = system_prompt_option(spec.system_prompt, preset=full)
+        if extra_args:
+            common["extra_args"] = extra_args
+        if full:
             return ClaudeAgentOptions(
                 tools={"type": "preset", "preset": "claude_code"},
-                system_prompt={"type": "preset", "preset": "claude_code", "append": spec.system_prompt},
+                system_prompt=system_prompt,
                 setting_sources=["project"],
                 **common,
             )
         return ClaudeAgentOptions(
             tools=[] if spec.toolset == "none" else READ_TOOLSET_BUILTINS if spec.toolset == "read" else BOARD_TOOLSET_BUILTINS,
-            system_prompt=spec.system_prompt,
+            system_prompt=system_prompt,
             setting_sources=[],
             **common,
         )
