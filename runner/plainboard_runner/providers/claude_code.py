@@ -104,6 +104,7 @@ MAX_MESSAGE_BYTES = 64 * 1024 * 1024
 # --system-prompt above that fails the start with "[Errno 7] Argument list too long". Longer ones go
 # to Claude Code as a file.
 INLINE_PROMPT_BYTES = 100 * 1024
+PROMPT_FILE_KEEP_SECONDS = 24 * 3600  # Claude Code reads the file when it starts: older ones are left over
 
 
 def prompt_file(text: str) -> Path:
@@ -111,10 +112,18 @@ def prompt_file(text: str) -> Path:
     folder = Path(tempfile.gettempdir()) / "plainboard-prompts"
     folder.mkdir(parents=True, exist_ok=True)
     path = folder / f"{hashlib.sha256(text.encode()).hexdigest()[:32]}.md"
+    # Every change of a long prompt (a note, a member) writes a new file: the old ones go after a day.
+    old = time.time() - PROMPT_FILE_KEEP_SECONDS
+    for left in folder.iterdir():
+        with contextlib.suppress(OSError):
+            if left != path and left.stat().st_mtime < old:
+                left.unlink()
     if not path.exists():
         part = path.with_suffix(f".{os.getpid()}.part")
         part.write_text(text, encoding="utf-8")
         part.replace(path)
+    else:
+        os.utime(path)  # in use again: no other turn's clean-up may take it now
     return path
 
 
@@ -127,6 +136,8 @@ def system_prompt_option(text: str, preset: bool) -> tuple[Any, dict[str, str | 
     if preset:
         return {"type": "preset", "preset": "claude_code"}, {"append-system-prompt-file": path}
     return {"type": "file", "path": path}, {}
+
+
 NOTICE_GRACE_SECONDS = 60
 NOTICE_CHECK_SECONDS = 5
 # Background work of Claude Code that reports back when it is done. A shell or a monitor may never end.
