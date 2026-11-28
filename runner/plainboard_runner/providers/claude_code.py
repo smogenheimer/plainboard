@@ -258,7 +258,10 @@ def auth_env(creds: Credentials, home: Path | None = None) -> dict[str, str]:
     # Turns of one agent are often more than five minutes apart (a job, a teammate, a free slot). With
     # the short cache lifetime, the default with an API key, each of them would write the whole context
     # to the cache again instead of reading it.
-    env = {"DISABLE_AUTOUPDATER": "1", "CLAUDE_AGENT_SDK_CLIENT_APP": "plainboard/0.1", "ENABLE_PROMPT_CACHING_1H": "1"}
+    # A claude.ai login brings the account's claude.ai connectors (mail, calendar, trackers ...) into every
+    # session: nobody configured them for the project, and without tool search their full schemas go with
+    # every call. Off unless a project or agent secret ENABLE_CLAUDEAI_MCP_SERVERS=true turns them on.
+    env = {"DISABLE_AUTOUPDATER": "1", "CLAUDE_AGENT_SDK_CLIENT_APP": "plainboard/0.1", "ENABLE_PROMPT_CACHING_1H": "1", "ENABLE_CLAUDEAI_MCP_SERVERS": "false"}
     if creds.claude_auth_mode == "oauth_token":
         if not creds.claude_oauth_token:
             raise RuntimeError("Claude OAuth token is not configured (Settings → Claude).")
