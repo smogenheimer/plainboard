@@ -756,6 +756,20 @@ async def test_send_files_uploads_workspace_files_and_forwards_attachment_ids(tm
     assert (await bridge.call("send_files", {"paths": ["missing.png"]})).is_error
 
 
+def test_a_long_system_prompt_goes_to_claude_code_as_a_file():
+    # Production 2026-11-28: a manager's prompt over 128 KiB failed every start with "[Errno 7] Argument list too long".
+    from plainboard_runner.providers.claude_code import INLINE_PROMPT_BYTES, system_prompt_option
+
+    short = "You are the manager."
+    assert system_prompt_option(short, preset=False) == (short, {})
+    assert system_prompt_option(short, preset=True) == ({"type": "preset", "preset": "claude_code", "append": short}, {})
+    long = "x" * (INLINE_PROMPT_BYTES + 1)
+    option, extra = system_prompt_option(long, preset=False)
+    assert option["type"] == "file" and extra == {} and open(option["path"], encoding="utf-8").read() == long
+    option, extra = system_prompt_option(long, preset=True)
+    assert option == {"type": "preset", "preset": "claude_code"} and open(extra["append-system-prompt-file"], encoding="utf-8").read() == long
+
+
 def test_claude_asks_for_the_long_cache_lifetime():
     # Turns of an agent are often more than five minutes apart; the short lifetime would rewrite the whole context each time.
     for creds in (Credentials(claude_auth_mode="api_key", anthropic_api_key="key"), Credentials(claude_auth_mode="oauth_token", claude_oauth_token="tok")):
