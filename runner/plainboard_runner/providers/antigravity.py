@@ -1800,7 +1800,7 @@ class AntigravityProvider(Provider):
                         )
                     except AntigravityError as exc:
                         text = str(exc).lower()
-                        if "not found" in text or "no session" in text or "no conversation" in text or getattr(exc, "rpc_code", None) in (-32002, -32602):
+                        if "not found" in text or "no session" in text or "no conversation" in text or "failed to read session" in text or getattr(exc, "rpc_code", None) in (-32002, -32602):
                             raise AntigravityError(f"Antigravity session not found: {spec.resume_session_id}") from exc
                         raise
                     session_id = str((opened or {}).get("sessionId") or spec.resume_session_id)
