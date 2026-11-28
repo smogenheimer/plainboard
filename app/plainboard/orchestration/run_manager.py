@@ -2414,7 +2414,7 @@ def _overloaded(error: str | None) -> bool:
 
 def _session_lost(error: str | None) -> bool:
     text = (error or "").lower()
-    return "no conversation found" in text or ("session" in text and "not found" in text) or "session can no longer be resumed" in text
+    return "no conversation found" in text or ("session" in text and "not found" in text) or "session can no longer be resumed" in text or "failed to read session" in text
 
 
 async def _features(s: AsyncSession, project: Project) -> frozenset[str]:
