@@ -110,6 +110,16 @@ comparing file names by hand.
 
 - A normal agent in a hidden system project (excluded from project lists and `transfer`), run through the runner
   like every agent, so the app stays provider-agnostic. Model configurable, default a fast and cheap one.
+- **System level, never held by a project's or the installation's state.** Its moments are exactly the ones
+  where nothing else runs ("why is nothing running?"), so:
+  - "Pause everything", the project pause and the limit pause never hold its turns (the dispatcher exempts the
+    system project);
+  - it takes none of a project's or owner's parallel slots and is never stopped by `pause_team`;
+  - **reserved room on the subscriptions**: the limit pause stops projects before the subscriptions are full;
+    that last share is kept for the supervisor (a small, cheap model by default). An admin can pin it to its own
+    account;
+  - when no subscription has room at all, it still answers without a model: the health check, the live status
+    and the open requests are plain data, with a note when the model is back.
 - Reads across all projects (board, requests, runs, health) with admin rights.
 - Never writes on its own. Every change (ticket, comment, answer to an agent, pause/resume) is a proposal with
   buttons first; only a press performs it.
