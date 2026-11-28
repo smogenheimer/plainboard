@@ -741,3 +741,50 @@ def test_a_deleted_subscription_leaves_no_mention_and_never_blocks_saving(client
     assert client.put(f"/api/projects/{pid}/accounts", json={"account_ids": [gone["id"], stays["id"]]}).json()["account_ids"] == [stays["id"]]
     assert client.put(f"/api/projects/{pid}/accounts", json={"account_ids": [gone["id"], stays["id"]]}).status_code == 404
     assert client.patch(f"/api/users/{person['id']}", json={"account_ids": [gone["id"]]}).status_code == 404
+
+
+def test_an_assignment_cut_off_by_a_limit_goes_on_after_the_reset(client, project):
+    """Issue #5: a turn that a used-up limit ended mid-work failed its assignment, and someone had to type
+    "continue". Now the assignment stays open, and the same assignment goes on when the limit resets."""
+    pid = project["id"]
+    first = accounts(client)["Claude"]
+    client.patch(f"/api/accounts/{first['id']}", json={"auth_mode": "oauth_token", "secret": "tok-a"})
+    make_dev(client, pid)
+    manager = agents_by_slug(client, pid)["manager"]
+
+    args = {"agent": "dev", "title": "Implement endpoints", "instructions": "REJECT tok-a five_hour 3600"}
+    chat(client, manager["id"], "TOOL delegate " + json.dumps(args))
+    wait_for(lambda: any(r["status"] == "failed" and r["assignment_id"] for r in client.get(f"/api/projects/{pid}/runs").json()))
+    (assignment,) = client.get(f"/api/projects/{pid}/assignments").json()
+    wait_for(lambda: any(r["status"] == "queued" and r["agent_id"] == assignment["agent_id"] for r in client.get(f"/api/projects/{pid}/runs").json()))
+    assert client.get(f"/api/projects/{pid}/assignments").json()[0]["status"] not in ("failed", "cancelled", "done")
+
+    # The limit resets: the held turn goes on with the same assignment and finishes it.
+    report_limits(client, Claude=(0.1, "allowed"))
+    client.portal.call(client.app_ref.state.runs._wake.set)
+    wait_for(lambda: client.get(f"/api/projects/{pid}/assignments").json()[0]["status"] == "done")
+    resumed = runner(client).specs[-1]
+    assert f"Go on with assignment #{assignment['id']}" in resumed.prompt and "usage limit" in resumed.prompt
+
+
+def test_an_assignment_cut_off_by_limits_too_often_fails(client, project, monkeypatch):
+    from plainboard.orchestration import run_manager
+
+    monkeypatch.setattr(run_manager, "MAX_LIMIT_RESUMES", 0)
+    pid = project["id"]
+    first = accounts(client)["Claude"]
+    client.patch(f"/api/accounts/{first['id']}", json={"auth_mode": "oauth_token", "secret": "tok-a"})
+    make_dev(client, pid)
+    manager = agents_by_slug(client, pid)["manager"]
+    args = {"agent": "dev", "title": "Implement endpoints", "instructions": "REJECT tok-a five_hour 3600"}
+    chat(client, manager["id"], "TOOL delegate " + json.dumps(args))
+    wait_for(lambda: [a["status"] for a in client.get(f"/api/projects/{pid}/assignments").json()] == ["failed"])
+    assert "given up" in client.get(f"/api/projects/{pid}/assignments").json()[0]["result"]
+
+
+def test_only_an_overloaded_provider_counts_as_overload():
+    from plainboard.orchestration.run_manager import _overloaded
+
+    assert _overloaded('API Error: 529 {"type":"error","error":{"type":"overloaded_error"}}')
+    assert _overloaded("503 Service Unavailable") and _overloaded("The model is overloaded, try again later")
+    assert not _overloaded("Traceback, line 5291: KeyError") and not _overloaded("You've hit your limit") and not _overloaded(None)
