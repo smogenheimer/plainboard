@@ -209,9 +209,12 @@ def _windows(stored: dict, now: float) -> list[LimitWindow]:
 
 def applies(window: LimitWindow, model: str | None) -> bool:
     """Whether a turn on ``model`` counts against the window: one for certain models ("Fable", by the first
-    word of its name in the model's id) only for those. With no model known, every window counts."""
-    family = re.search(r"[a-z]+", (window.model or "").lower())
-    return model is None or family is None or family[0] in model.lower()
+    word of its name in the model's id) only for those. A window for several families separates them with
+    "|" ("claude|gpt"). With no model known, every window counts."""
+    if model is None:
+        return True
+    families = [found[0] for part in (window.model or "").lower().split("|") if (found := re.search(r"[a-z]+", part))]
+    return not families or any(family in model.lower() for family in families)
 
 
 def fullest(windows: list[LimitWindow], model: str | None = None) -> float:

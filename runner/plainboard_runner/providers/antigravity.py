@@ -675,6 +675,25 @@ def _summary_reset_ts(bucket: dict[str, Any], window_seconds: int | None, reques
     return reset_ts
 
 
+def _bucket_model(bucket_id: str) -> str | None:
+    """The model families a bucket limits (``LimitWindow.model``): Gemini buckets only Gemini turns, the
+    third-party bucket (``3p-``) the Claude and GPT models Antigravity serves. A full one stops no other turn."""
+    if bucket_id.startswith("gemini-"):
+        return "gemini"
+    if bucket_id.startswith("3p-"):
+        return "claude|gpt"
+    return None
+
+
+def model_family(model: str | None) -> str | None:
+    """The family of a model id as the windows name it (see ``_bucket_model``)."""
+    name = (model or "").lower()
+    for family in ("gemini", "claude", "gpt"):
+        if family in name:
+            return family
+    return None
+
+
 def _bucket_window_name(bucket_id: str, window_kind: str) -> str:
     suffix = "seven_day" if window_kind == "weekly" else "five_hour" if window_kind == "5h" else (window_kind or "quota")
     if bucket_id.startswith("gemini-argon-"):
@@ -726,6 +745,7 @@ def parse_summary_windows(response: dict[str, Any], requested_at: float) -> list
                 utilization=used,
                 resets_at=resets_at,
                 status="rejected" if used >= 1.0 else None,
+                model=_bucket_model(bucket_id),
             )
     return sorted(windows.values(), key=_summary_window_sort_key)
 
@@ -778,6 +798,7 @@ def parse_model_quota_windows(response: dict[str, Any]) -> list[LimitWindow]:
                 utilization=used,
                 resets_at=parse_iso_timestamp(quota.get("resetTime")),
                 status="rejected" if used >= 1.0 else None,
+                model=family,
             )
             prev = windows.get(name)
             if prev is None or win.utilization > prev.utilization:
@@ -1469,6 +1490,7 @@ class TurnRunner:
                                 utilization=1.0,
                                 resets_at=failure.reset_at,
                                 status="rejected",
+                                model=model_family(self.spec.model),  # it turned this turn's model away, not the others
                             )
                         ]
                     )

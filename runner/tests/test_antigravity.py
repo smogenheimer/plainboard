@@ -265,6 +265,9 @@ def test_quota_summary_and_model_fallback_parsing():
     assert windows["antigravity_gemini_seven_day"].utilization == 1.0 and windows["antigravity_gemini_seven_day"].status == "rejected"
     assert windows["antigravity_carbon_five_hour"].resets_at is None  # untouched rolling window omitted
     assert windows["antigravity_shared_seven_day"].utilization == 0.25
+    # Each window names the model families it limits: a full third-party bucket must not stop a Gemini turn.
+    assert windows["antigravity_gemini_seven_day"].model == "gemini" and windows["antigravity_carbon_five_hour"].model == "gemini"
+    assert windows["antigravity_shared_seven_day"].model == "claude|gpt"
     assert "antigravity/hub/2.24.0" in quota_user_agent()
 
     # Plan tier detection from loadCodeAssist (paidTier wins over currentTier).
