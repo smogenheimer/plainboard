@@ -776,6 +776,12 @@ def test_claude_asks_for_the_long_cache_lifetime():
         assert auth_env(creds)["ENABLE_PROMPT_CACHING_1H"] == "1"
 
 
+def test_claude_ai_connectors_are_off_unless_a_secret_turns_them_on():
+    # The account's claude.ai connectors would reach the owner's services and cost their schemas on every call.
+    for creds in (Credentials(claude_auth_mode="api_key", anthropic_api_key="key"), Credentials(claude_auth_mode="oauth_token", claude_oauth_token="tok")):
+        assert auth_env(creds)["ENABLE_CLAUDEAI_MCP_SERVERS"] == "false"
+
+
 async def test_a_slow_tool_call_is_told_how_long_it_took(monkeypatch):
     from plainboard_runner.providers import claude_code
     from plainboard_runner.providers.claude_code import ToolTimer, notice_hook
