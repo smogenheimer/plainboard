@@ -5,8 +5,9 @@ from __future__ import annotations
 from fastapi import APIRouter, File, Request, UploadFile
 from sqlalchemy import select
 
-from ..models import Project, Run, RunStatus
+from ..models import Agent, Project, Run, RunStatus, RunTrigger
 from ..schemas import AttachmentOut, ChatMessageIn, ConversationOut, MessageOut, RunOut
+from ..services import accounts as account_service
 from ..services import agents as agent_service
 from ..services import board as board_service
 from ..services import mentions as mention_service
@@ -95,7 +96,15 @@ async def list_runs(project_id: int, session: Session, agent_id: int | None = No
     if active:
         q = q.where(Run.status.in_((RunStatus.QUEUED, RunStatus.RUNNING)))
     rows = (await session.scalars(q.order_by(Run.id.desc()).limit(min(limit, 200)))).all()
-    return [RunOut.model_validate(r) for r in rows]
+    out = [RunOut.model_validate(r) for r in rows]
+    waits: dict[int, dict | None] = {}
+    for run in out:
+        if run.status == RunStatus.QUEUED and run.trigger != RunTrigger.CHAT and run.parent_run_id is None:
+            if run.agent_id not in waits:
+                agent = await session.get(Agent, run.agent_id)
+                waits[run.agent_id] = await account_service.limit_wait(session, agent) if agent else None
+            run.limit_wait = waits[run.agent_id]
+    return out
 
 
 @router.post("/runs/{run_id}/cancel")
